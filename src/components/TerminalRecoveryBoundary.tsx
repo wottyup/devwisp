@@ -33,6 +33,7 @@ export class TerminalRecoveryBoundary extends Component<TerminalRecoveryBoundary
     if (this.state.error) {
       return (
         <ChatOverlayPanel
+          layoutKey="terminal"
           ariaLabel={ui("本机终端")}
           backdropLabel={ui("关闭本机终端")}
           onClose={this.props.onClose}

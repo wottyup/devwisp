@@ -21,7 +21,7 @@ from devwisp.codex_history import CodexHistoryStore  # noqa: E402
 
 ACTIVE_STATUSES = {"active", "inProgress", "running", "started"}
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
-CLAUDE_DATABASE = CODEX_HOME / "devwisp" / "claude-code.sqlite3"
+CLAUDE_DATABASES = tuple(CODEX_HOME / directory / "claude-code.sqlite3" for directory in ("devwisp", "codex-remote"))
 
 
 def service_pid(unit: str) -> int:
@@ -42,8 +42,8 @@ def active_turns() -> list[str]:
         status = thread.get("status") if isinstance(thread, dict) else None
         if isinstance(status, dict) and status.get("type") in ACTIVE_STATUSES:
             active.append(thread_id)
-    if CLAUDE_DATABASE.is_file():
-        with sqlite3.connect(f"file:{CLAUDE_DATABASE.as_posix()}?mode=ro", uri=True, timeout=5) as database:
+    for path in dict.fromkeys(path.resolve() for path in CLAUDE_DATABASES if path.is_file()):
+        with sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True, timeout=5) as database:
             active.extend(row[0] for row in database.execute(
                 "SELECT thread_id FROM claude_threads WHERE running_turn_id IS NOT NULL AND running_turn_id != ''"
             ))

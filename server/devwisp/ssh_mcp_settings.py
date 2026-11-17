@@ -127,12 +127,6 @@ class SshMcpSettingsStore:
                     if not password:
                         raise SshMcpSettingsError("请填写 SSH 登录密码。")
                     next_credentials[name] = password
-                    safe_profile.update({
-                        "group": "dev",
-                        "role": "admin",
-                        "readOnly": False,
-                        "approvalPolicy": "auto",
-                    })
                 safe_profiles.append(safe_profile)
 
             try:
@@ -160,6 +154,14 @@ class SshMcpSettingsStore:
                     pass
                 raise SshMcpSettingsError("无法保存 SSH MCP 配置。") from error
             return self.status()
+
+    def remove(self, name: str) -> dict[str, Any]:
+        with self._lock:
+            profiles = self.list_profiles()
+            remaining = [profile for profile in profiles if profile.get("name") != name]
+            if len(remaining) == len(profiles):
+                return self.status()
+            return self.save(remaining)
 
     def _read_credentials(self) -> dict[str, str]:
         if self.directory.is_symlink() or self.credentials_path.is_symlink():

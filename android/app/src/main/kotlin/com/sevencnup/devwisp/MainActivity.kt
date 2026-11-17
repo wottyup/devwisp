@@ -73,6 +73,7 @@ import android.view.WindowInsets
 import android.view.WindowInsetsAnimation
 import android.view.Window
 import android.view.WindowManager
+import android.view.accessibility.AccessibilityNodeInfo
 import android.view.animation.DecelerateInterpolator
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
@@ -1040,6 +1041,9 @@ class MainActivity : Activity() {
     private var claudePermissionUiDirty = false
     private val resendActionButtons = java.util.WeakHashMap<ImageView, Unit>()
     private var terminalOverlay: LinearLayout? = null
+    private var terminalPreferredHeightDp = 0
+    private var terminalAvailableHeightPx = 0
+    private var terminalMinimumHeightPx = 0
     private var terminalPositionListener: View.OnLayoutChangeListener? = null
     @Volatile private var terminalSocket: WebSocket? = null
     private var terminalOutput: TerminalOutputView? = null
@@ -9851,6 +9855,17 @@ class MainActivity : Activity() {
                         if (composerPreferenceMenu !== menu || menu.section != section ||
                             menu.displayedChoices.none { it.first == value }) return@setOnClickListener
                         if (selectedComposerPreference(section) != value) applyComposerPreference(section, value)
+                        val nextSection = when (section) {
+                            ComposerPreferenceSection.MODEL -> ComposerPreferenceSection.EFFORT
+                            ComposerPreferenceSection.EFFORT -> ComposerPreferenceSection.PERMISSION
+                            ComposerPreferenceSection.PERMISSION -> null
+                        }
+                        if (nextSection != null && composerPreferenceChoices(nextSection).isNotEmpty()) {
+                            menu.section = nextSection
+                            refreshComposerPreferenceMenu()
+                        } else if (section == ComposerPreferenceSection.PERMISSION) {
+                            dismissComposerPreferences()
+                        }
                     }
                 }
                 row.addView(label(name, 12, SUBTLE).apply {
@@ -12950,7 +12965,7 @@ class MainActivity : Activity() {
         (getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager)
             ?.hideSoftInputFromWindow(composerInput.windowToken, 0)
         composerInput.clearFocus()
-        composerDock.visibility = View.GONE
+        terminalPreferredHeightDp = prefs.getInt(KEY_TERMINAL_HEIGHT_DP, 0).coerceAtLeast(0)
         root.requestFocus()
         terminalThreadId = if (isolated) null else activeThreadId
         terminalScreenKey = terminalThreadId?.let { "$endpoint\u0000$token\u0000$it" }
@@ -13084,6 +13099,7 @@ class MainActivity : Activity() {
         terminalKeyboardButton = smallButton("键盘") { focusTerminalInput() }
         transferRow.addView(terminalKeyboardButton, LinearLayout.LayoutParams(dp(50), dp(36)))
         shell.addView(transferRow, LinearLayout.LayoutParams(MATCH, dp(36)))
+        shell.addView(createTerminalResizeHandle(shell), LinearLayout.LayoutParams(MATCH, dp(28)))
         terminalInputSink = TerminalInputSink(this, ::sendTerminalInput).apply {
             importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
         }
@@ -13101,6 +13117,8 @@ class MainActivity : Activity() {
         terminalPositionListener?.let { listener ->
             root.addOnLayoutChangeListener(listener)
             page.addOnLayoutChangeListener(listener)
+            shell.addOnLayoutChangeListener(listener)
+            composerDock.addOnLayoutChangeListener(listener)
         }
         positionTerminalOverlay()
         shell.post {
@@ -13246,6 +13264,88 @@ class MainActivity : Activity() {
         })
     }
 
+    private fun createTerminalResizeHandle(shell: LinearLayout): View {
+        val handle = FrameLayout(this).apply {
+            contentDescription = tr("拖动调整终端高度")
+            isFocusable = true
+            isClickable = true
+            addView(View(this@MainActivity).apply {
+                background = rounded(colorWithAlpha(SUBTLE, .7f), dp(2))
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            }, FrameLayout.LayoutParams(dp(44), dp(4), Gravity.CENTER))
+        }
+        var startY = 0f
+        var startHeight = 0
+        var previousPreference = 0
+        var dragging = false
+        val touchSlop = ViewConfiguration.get(this).scaledTouchSlop
+        handle.setOnTouchListener { view, event ->
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    if (terminalOverlay !== shell) return@setOnTouchListener false
+                    startY = event.rawY
+                    startHeight = shell.height
+                    previousPreference = terminalPreferredHeightDp
+                    dragging = false
+                    view.isPressed = true
+                    view.parent?.requestDisallowInterceptTouchEvent(true)
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val delta = event.rawY - startY
+                    if (abs(delta) > touchSlop) dragging = true
+                    if (dragging) setTerminalHeight((startHeight + delta).roundToInt())
+                }
+                MotionEvent.ACTION_UP -> {
+                    if (dragging) {
+                        setTerminalHeight((startHeight + event.rawY - startY).roundToInt(), save = true)
+                    } else view.performClick()
+                    view.isPressed = false
+                    view.parent?.requestDisallowInterceptTouchEvent(false)
+                    dragging = false
+                }
+                MotionEvent.ACTION_CANCEL -> {
+                    terminalPreferredHeightDp = previousPreference
+                    positionTerminalOverlay()
+                    view.isPressed = false
+                    view.parent?.requestDisallowInterceptTouchEvent(false)
+                    dragging = false
+                }
+                else -> return@setOnTouchListener false
+            }
+            true
+        }
+        handle.accessibilityDelegate = object : View.AccessibilityDelegate() {
+            override fun onInitializeAccessibilityNodeInfo(host: View, info: AccessibilityNodeInfo) {
+                super.onInitializeAccessibilityNodeInfo(host, info)
+                info.addAction(AccessibilityNodeInfo.AccessibilityAction(
+                    AccessibilityNodeInfo.ACTION_SCROLL_FORWARD, tr("增大终端高度"),
+                ))
+                info.addAction(AccessibilityNodeInfo.AccessibilityAction(
+                    AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD, tr("减小终端高度"),
+                ))
+            }
+
+            override fun performAccessibilityAction(host: View, action: Int, args: Bundle?): Boolean {
+                val delta = when (action) {
+                    AccessibilityNodeInfo.ACTION_SCROLL_FORWARD -> dp(64)
+                    AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD -> -dp(64)
+                    else -> return super.performAccessibilityAction(host, action, args)
+                }
+                setTerminalHeight(shell.height + delta, save = true)
+                return true
+            }
+        }
+        return handle
+    }
+
+    private fun setTerminalHeight(heightPx: Int, save: Boolean = false) {
+        if (terminalOverlay == null || terminalAvailableHeightPx <= 0) return
+        val height = heightPx.coerceIn(terminalMinimumHeightPx, terminalAvailableHeightPx)
+        terminalPreferredHeightDp = (height / resources.displayMetrics.density).roundToInt().coerceAtLeast(1)
+        positionTerminalOverlay()
+        if (save) prefs.edit().putInt(KEY_TERMINAL_HEIGHT_DP, terminalPreferredHeightDp).apply()
+    }
+
     private fun positionTerminalOverlay() {
         val shell = terminalOverlay ?: return
         if (!::root.isInitialized || !::page.isInitialized || root.height <= 0) return
@@ -13253,8 +13353,14 @@ class MainActivity : Activity() {
         val pageLocation = IntArray(2)
         root.getLocationOnScreen(rootLocation)
         page.getLocationOnScreen(pageLocation)
-        val measuredBottom = (pageLocation[1] - rootLocation[1] + page.height - page.paddingBottom)
+        var measuredBottom = (pageLocation[1] - rootLocation[1] + page.height - page.paddingBottom)
             .coerceIn(0, root.height)
+        if (composerInput.hasFocus()) {
+            val composerLocation = IntArray(2)
+            composerDock.getLocationOnScreen(composerLocation)
+            val composerTop = (composerLocation[1] - rootLocation[1] - dp(8)).coerceAtLeast(0)
+            measuredBottom = minOf(measuredBottom, composerTop)
+        }
         val contentBottom = if (terminalInputSink?.hasFocus() == true &&
             (terminalImeVisible || imeInsetVisible || terminalLockedContentBottom > 0)
         ) {
@@ -13262,10 +13368,17 @@ class MainActivity : Activity() {
                 else minOf(terminalLockedContentBottom, measuredBottom)
             terminalLockedContentBottom
         } else measuredBottom
+        terminalAvailableHeightPx = contentBottom
+        val viewport = terminalOutputScroll?.parent as? View
+        val chromeHeight = if (viewport != null && shell.height > 0) shell.height - viewport.height else 0
+        val rowsHeight = ceil((terminalOutput?.paint?.fontSpacing ?: dp(16).toFloat()) * 5).toInt() + dp(24)
+        terminalMinimumHeightPx = max(systemInsetTop + dp(240), chromeHeight + rowsHeight).coerceAtMost(contentBottom)
+        val preferredHeight = if (terminalPreferredHeightDp == 0) contentBottom else dp(terminalPreferredHeightDp)
+        val height = preferredHeight.coerceIn(terminalMinimumHeightPx, contentBottom)
         (shell.layoutParams as? FrameLayout.LayoutParams)?.let { params ->
-            if (params.height != contentBottom || params.width != MATCH) {
+            if (params.height != height || params.width != MATCH) {
                 params.width = MATCH
-                params.height = contentBottom
+                params.height = height
                 params.gravity = Gravity.TOP
                 shell.layoutParams = params
             }
@@ -13331,6 +13444,8 @@ class MainActivity : Activity() {
         terminalPositionListener?.let { listener ->
             if (::root.isInitialized) root.removeOnLayoutChangeListener(listener)
             if (::page.isInitialized) page.removeOnLayoutChangeListener(listener)
+            shell.removeOnLayoutChangeListener(listener)
+            composerDock.removeOnLayoutChangeListener(listener)
         }
         terminalPositionListener = null
         terminalResizeRunnable?.let(handler::removeCallbacks)
@@ -13351,6 +13466,8 @@ class MainActivity : Activity() {
         terminalSocket?.close(1000, "closed")
         terminalSocket = null
         terminalOverlay = null
+        terminalAvailableHeightPx = 0
+        terminalMinimumHeightPx = 0
         terminalInputSink = null
         terminalOutput = null
         terminalOutputScroll = null
@@ -15145,7 +15262,8 @@ class MainActivity : Activity() {
     }
 
     companion object {
-        private const val PREFS = "devwisp_mobile"
+        // Preserve the existing user's settings when the display brand changes.
+        private const val PREFS = "codex_remote_mobile"
         private val TRANSLATION_PROVIDERS = listOf("codex", "claude", "responses", "chat", "anthropic", "deepl", "microsoft", "google")
         private const val KEY_ENDPOINT = "endpoint"
         private const val KEY_TOKEN = "token"
@@ -15191,6 +15309,7 @@ class MainActivity : Activity() {
         private const val KEY_WORKSPACE_EXPLORER_ROOT = "native_workspace_explorer_root"
         private const val KEY_WEB_PREVIEW_WIDTH_RATIO = "native_web_preview_width_ratio"
         private const val KEY_WEB_PREVIEW_HEIGHT_RATIO = "native_web_preview_height_ratio"
+        private const val KEY_TERMINAL_HEIGHT_DP = "native_terminal_height_dp"
         private const val TAG_INSET_CONTENT = "inset_content"
         private const val TAG_MESSAGE_TURN_PREFIX = "message_turn:"
         private const val TAG_MESSAGE_DYNAMIC = "message_dynamic"

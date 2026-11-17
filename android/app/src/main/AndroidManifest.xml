@@ -17,7 +17,7 @@
         android:enableOnBackInvokedCallback="true">
         <!-- The launcher keeps its calibrated scale independently of the package installer icon. -->
         <activity
-            android:name=".MainActivity"
+            android:name="com.sevencnup.devwisp.MainActivity"
             android:icon="@mipmap/ic_launcher"
             android:launchMode="singleTop"
             android:configChanges="keyboard|keyboardHidden|orientation|screenLayout|screenSize|smallestScreenSize"

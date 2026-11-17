@@ -246,6 +246,23 @@ button:focus-visible, textarea:focus-visible, input:focus-visible { outline: 2px
 .chat-overlay-panel__resize-handle::before { width: 36px; height: 3px; border-radius: 999px; background: rgba(166, 175, 195, .58); content: ''; transition: background .15s ease, width .15s ease; }
 .chat-overlay-panel__resize-handle:hover::before, .chat-overlay-panel__resize-handle:focus-visible::before { width: 48px; background: #aabaff; }
 .chat-overlay-panel__loading { display: flex; min-width: 0; min-height: 0; align-items: center; justify-content: center; gap: 9px; color: #e3e6ed; font-size: calc(13px + var(--mobile-font-offset)); }
+.chat-overlay-backdrop--floating { pointer-events: none; background: transparent; }
+.chat-overlay-backdrop--floating > .chat-overlay-backdrop__dismiss { display: none; }
+.chat-overlay-panel--floating { right: auto; border-radius: 10px; pointer-events: auto; }
+.chat-overlay-panel--floating > .chat-overlay-panel__header { cursor: move; touch-action: none; user-select: none; }
+.chat-overlay-panel--maximized { border-radius: 0; }
+.chat-overlay-panel--maximized > .chat-overlay-panel__header { cursor: default; }
+.chat-overlay-panel__window-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 3px; }
+.chat-overlay-panel__move { display: grid; width: 24px; height: 28px; flex: 0 0 auto; place-items: center; padding: 0; border: 0; border-radius: 4px; background: transparent; color: inherit; cursor: move; opacity: .65; }
+.chat-overlay-panel__move:hover:not(:disabled), .chat-overlay-panel__resize-corner:hover { opacity: 1; }
+.chat-overlay-panel__move:disabled { cursor: default; opacity: .3; }
+.chat-overlay-panel__resize-corner { position: absolute; z-index: 3; right: 1px; bottom: 0; display: grid; width: 24px; height: 20px; place-items: center; padding: 0; border: 0; background: transparent; color: inherit; cursor: nwse-resize; touch-action: none; opacity: .65; }
+.chat-overlay-panel__move:focus-visible, .chat-overlay-panel__resize-corner:focus-visible { outline: 2px solid currentColor; outline-offset: -2px; }
+.chat-overlay-panel--maximized > .chat-overlay-panel__resize-handle { cursor: default; }
+.chat-overlay-backdrop--move, .chat-overlay-backdrop--move * { cursor: move !important; user-select: none !important; }
+.chat-overlay-backdrop--move > .chat-overlay-panel { will-change: transform; }
+.chat-overlay-backdrop--size, .chat-overlay-backdrop--size * { cursor: nwse-resize !important; user-select: none !important; }
+.chat-overlay-backdrop--height, .chat-overlay-backdrop--height * { cursor: ns-resize !important; user-select: none !important; }
 .terminal-dialog { background: #111317; }
 .terminal-dialog__title { display: flex; min-width: 0; align-items: center; gap: 8px; }
 .terminal-dialog__title > svg { flex: 0 0 auto; color: #aabaff; }
@@ -1102,7 +1119,7 @@ button:focus-visible, textarea:focus-visible, input:focus-visible { outline: 2px
 .composer-preferences { display: flex; min-width: 0; align-items: center; gap: 10px; }
 .composer-preferences__controls { display: flex; min-width: 0; align-items: center; gap: 10px; }
 .composer-preferences--mobile { position: relative; flex: 0 0 auto; gap: 0; }
-.composer-preferences--mobile .composer-settings-toggle { width: 36px; height: 36px; flex-basis: 36px; touch-action: manipulation; }
+.composer-preferences--mobile .composer-settings-toggle { width: 32px; height: 32px; flex-basis: 32px; touch-action: manipulation; }
 .composer-preferences__mobile-panel { display: grid; width: min(300px, calc(100vw - 24px)); min-width: min(260px, calc(100vw - 24px)); max-height: min(340px, 50vh); gap: 8px; padding: 9px; }
 .composer-preferences__mobile-panel .composer-preferences__controls { display: grid; min-width: 0; grid-template-columns: repeat(3, minmax(0, 1fr)); align-items: stretch; gap: 6px; }
 .composer-preferences__mobile-panel .composer-menu { min-width: 0; }
@@ -4085,9 +4102,9 @@ button:focus-visible, textarea:focus-visible, input:focus-visible { outline: 2px
 
 @media (max-width: 700px), (pointer: coarse) {
   .remote-shell:not(.remote-shell--theme-retro):not(.remote-shell--theme-pixel) .message-composer__footer .attach-button.attach-button--native {
-    width: 36px;
-    min-width: 36px;
-    height: 36px;
+    width: 32px;
+    min-width: 32px;
+    height: 32px;
     padding: 0;
     border: 1px solid color-mix(in srgb, currentColor 30%, transparent);
     border-radius: 9px;
@@ -4287,6 +4304,7 @@ html[lang="en"] .remote-shell--theme-retro .workspace-explorer__header-actions .
 .native-config__group > h3 { margin: 0; font-size: calc(16px + var(--mobile-font-offset)); font-weight: 650; line-height: 1.4; }
 .native-config__columns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
 .ssh-mcp-profile .native-config__columns { align-items: start; }
+.ssh-mcp-profile__name { grid-column: 1 / -1; }
 .ssh-mcp-profile input[type="number"] { appearance: textfield; -moz-appearance: textfield; }
 .ssh-mcp-profile input[type="number"]::-webkit-inner-spin-button,
 .ssh-mcp-profile input[type="number"]::-webkit-outer-spin-button { margin: 0; -webkit-appearance: none; }
@@ -4524,12 +4542,12 @@ html[lang="en"] .remote-shell--theme-retro .workspace-explorer__header-actions .
 .remote-shell.remote-shell--theme-light .message-composer:focus-within {
   box-shadow: 0 20px 44px rgba(49, 66, 103, .22), 0 4px 12px rgba(49, 66, 103, .12);
 }
-.remote-shell:is(.remote-shell--theme-dark, .remote-shell--theme-light, .remote-shell--theme-warm, .remote-shell--theme-custom) .message-composer__footer { gap: 8px; margin-top: 6px; }
+.remote-shell:is(.remote-shell--theme-dark, .remote-shell--theme-light, .remote-shell--theme-warm, .remote-shell--theme-custom) .message-composer__footer { gap: 8px; margin-top: 4px; }
 .remote-shell:is(.remote-shell--theme-dark, .remote-shell--theme-light, .remote-shell--theme-warm, .remote-shell--theme-custom) .message-composer__footer :is(.composer-new-thread-button, .attach-button--native, .send-button:not(.send-button--arrow), .stop-button) {
-  width: 36px;
-  min-width: 36px;
-  height: 36px;
-  flex: 0 0 36px;
+  width: 28px;
+  min-width: 28px;
+  height: 28px;
+  flex: 0 0 28px;
   padding: 0;
   border: 1px solid var(--composer-control-edge);
   border-radius: 50%;
@@ -4538,7 +4556,7 @@ html[lang="en"] .remote-shell--theme-retro .workspace-explorer__header-actions .
   box-shadow: inset 0 1px 0 var(--composer-glass-glint), 0 2px 7px rgba(0, 0, 0, .06);
 }
 .remote-shell:is(.remote-shell--theme-dark, .remote-shell--theme-light, .remote-shell--theme-warm, .remote-shell--theme-custom) .message-composer__footer .composer-menu__trigger {
-  height: 36px;
+  height: 28px;
   max-width: 205px;
   padding: 0 12px;
   border: 1px solid var(--composer-control-edge);
@@ -4551,10 +4569,10 @@ html[lang="en"] .remote-shell--theme-retro .workspace-explorer__header-actions .
 .remote-shell:is(.remote-shell--theme-dark, .remote-shell--theme-light, .remote-shell--theme-warm, .remote-shell--theme-custom) .message-composer__footer .composer-menu__trigger:hover:not(:disabled),
 .remote-shell:is(.remote-shell--theme-dark, .remote-shell--theme-light, .remote-shell--theme-warm, .remote-shell--theme-custom) .message-composer__footer .composer-menu--open .composer-menu__trigger { background: var(--composer-control-hover); }
 .remote-shell:is(.remote-shell--theme-dark, .remote-shell--theme-light, .remote-shell--theme-warm, .remote-shell--theme-custom) .message-composer__footer .send-button--arrow {
-  width: 36px;
-  min-width: 36px;
-  height: 36px;
-  flex: 0 0 36px;
+  width: 28px;
+  min-width: 28px;
+  height: 28px;
+  flex: 0 0 28px;
   box-shadow: 0 2px 8px rgba(0, 0, 0, .13);
 }
 .remote-shell:is(.remote-shell--theme-dark, .remote-shell--theme-light, .remote-shell--theme-warm, .remote-shell--theme-custom) .message-composer__footer :is(.composer-new-thread-button, .attach-button--native, .send-button, .stop-button):disabled,
@@ -4562,9 +4580,9 @@ html[lang="en"] .remote-shell--theme-retro .workspace-explorer__header-actions .
 
 @media (max-width: 700px), (pointer: coarse) {
   .remote-shell:is(.remote-shell--theme-dark, .remote-shell--theme-light, .remote-shell--theme-warm, .remote-shell--theme-custom) .message-composer { padding: 11px 12px 10px; border-radius: 27px; }
-  .remote-shell:is(.remote-shell--theme-dark, .remote-shell--theme-light, .remote-shell--theme-warm, .remote-shell--theme-custom) .message-composer__footer :is(.composer-new-thread-button, .send-button, .stop-button) { width: 40px; min-width: 40px; height: 40px; flex-basis: 40px; }
-  .remote-shell:is(.remote-shell--theme-dark, .remote-shell--theme-light, .remote-shell--theme-warm, .remote-shell--theme-custom):not(.remote-shell--theme-retro) .message-composer__footer .attach-button.attach-button--native { width: 40px; min-width: 40px; height: 40px; flex-basis: 40px; border-radius: 50%; }
-  .remote-shell:is(.remote-shell--theme-dark, .remote-shell--theme-light, .remote-shell--theme-warm, .remote-shell--theme-custom) .message-composer__footer .composer-menu__trigger { height: 40px; max-width: 145px; padding-inline: 11px; }
+  .remote-shell:is(.remote-shell--theme-dark, .remote-shell--theme-light, .remote-shell--theme-warm, .remote-shell--theme-custom) .message-composer__footer :is(.composer-new-thread-button, .send-button:not(.send-button--arrow), .send-button--arrow, .stop-button) { width: 32px; min-width: 32px; height: 32px; flex-basis: 32px; }
+  .remote-shell:is(.remote-shell--theme-dark, .remote-shell--theme-light, .remote-shell--theme-warm, .remote-shell--theme-custom):not(.remote-shell--theme-retro) .message-composer__footer .attach-button.attach-button--native { width: 32px; min-width: 32px; height: 32px; flex-basis: 32px; border-radius: 50%; }
+  .remote-shell:is(.remote-shell--theme-dark, .remote-shell--theme-light, .remote-shell--theme-warm, .remote-shell--theme-custom) .message-composer__footer .composer-menu__trigger { height: 32px; max-width: 145px; padding-inline: 11px; }
 }
 @media (pointer: coarse) {
   :root[data-keyboard-transition="true"] .remote-shell:is(.remote-shell--theme-dark, .remote-shell--theme-light, .remote-shell--theme-warm, .remote-shell--theme-custom) .message-composer { backdrop-filter: none; -webkit-backdrop-filter: none; }

@@ -174,6 +174,8 @@ internal object UiEnglish {
         "已绑定当前聊天的工作路径" to "Workspace bound to this chat",
         "绑定当前聊天到此目录" to "Bind this directory to the chat",
         "本机终端" to "Local terminal", "打开终端" to "Open terminal", "关闭终端" to "Close terminal",
+        "拖动调整终端高度" to "Drag to resize terminal height",
+        "增大终端高度" to "Increase terminal height", "减小终端高度" to "Decrease terminal height",
         "正在查询…" to "Checking…", "正在切换…" to "Switching…",
         "交给 AI" to "Hand to AI", "收回控制" to "Take back", "AI 接管不可用" to "AI unavailable",
         "AI 控制中。遇到密码或确认提示，可直接在终端输入；手动输入时 AI 暂缓，按回车后继续。" to "AI controls this terminal. Type passwords or confirmations here; AI resumes after Enter.",

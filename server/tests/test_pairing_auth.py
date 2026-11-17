@@ -4,6 +4,7 @@ import tempfile
 import unittest
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from devwisp.app import PairingAuth
@@ -12,7 +13,7 @@ from devwisp.app import PairingAuth
 class PairingAuthTests(unittest.TestCase):
     def test_windows_default_state_uses_local_app_data_or_configured_home(self) -> None:
         with (
-            patch("devwisp.app.os.name", "nt"),
+            patch("devwisp.app.os", SimpleNamespace(name="nt", environ=os.environ)),
             patch.dict(os.environ, {"LOCALAPPDATA": "C:/Users/test/AppData/Local"}, clear=False),
             patch.dict(os.environ, {"DEVWISP_HOME": "", "DEVWISP_AUTH_FILE": ""}, clear=False),
         ):
@@ -21,7 +22,7 @@ class PairingAuthTests(unittest.TestCase):
                 PairingAuth._default_state_path(),
             )
         with (
-            patch("devwisp.app.os.name", "nt"),
+            patch("devwisp.app.os", SimpleNamespace(name="nt", environ=os.environ)),
             patch.dict(os.environ, {"DEVWISP_HOME": "C:/UserWritable/RemoteData", "DEVWISP_AUTH_FILE": ""}, clear=False),
         ):
             self.assertEqual(

@@ -7,12 +7,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from devwisp.claude_code import CLAUDE_ROOT_BYPASS_ERROR, ClaudeCodeServer
+from devwisp.claude_code import CLAUDE_PERMISSION_SERVICE_ERROR, CLAUDE_ROOT_BYPASS_ERROR, ClaudeCodeServer
+from devwisp.permission_prompt import MCP_SERVER_NAME, PermissionPromptBroker
 
 
 @unittest.skipUnless(os.name == "posix", "requires an executable fake Claude CLI")
 class ClaudeStartupTests(unittest.IsolatedAsyncioTestCase):
-    async def run_cli(self, body: str, *, prompt: str = "hello") -> tuple[dict, list, list]:
+    async def run_cli(self, body: str, *, prompt: str = "hello", permission_service: bool = False) -> tuple[dict, list, list]:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
             cli = workspace / "fake-claude"
@@ -27,6 +28,8 @@ class ClaudeStartupTests(unittest.IsolatedAsyncioTestCase):
                 events.append(event)
 
             server = ClaudeCodeServer(str(cli), workspace, workspace / "claude.sqlite3", emit)
+            if permission_service:
+                server.enable_permission_prompt(PermissionPromptBroker(workspace / "permission.sock", emit))
             try:
                 thread = await server.create_thread()
                 await server.start_turn(thread["id"], prompt, permission_mode="bypassPermissions")
@@ -35,6 +38,26 @@ class ClaudeStartupTests(unittest.IsolatedAsyncioTestCase):
                 return history, events, json.loads((workspace / "args.json").read_text())
             finally:
                 await server.close()
+
+    async def test_failed_required_permission_service_reports_actionable_error(self) -> None:
+        history, events, _ = await self.run_cli(
+            "sys.stdin.readline()\n"
+            f"print(json.dumps({{'type':'system','subtype':'init','mcp_servers':[{{'name':{MCP_SERVER_NAME!r},'status':'failed'}}]}}),flush=True)\n"
+            "sys.stdin.read()\n",
+            permission_service=True,
+        )
+        self.assertEqual(history["turns"][-1]["status"], "failed")
+        self.assertEqual([item["text"] for item in history["turns"][-1]["items"] if item["type"] == "agentMessage"], [CLAUDE_PERMISSION_SERVICE_ERROR])
+
+    async def test_optional_mcp_failure_does_not_interrupt_healthy_permission_service(self) -> None:
+        history, _, _ = await self.run_cli(
+            "sys.stdin.readline()\n"
+            f"print(json.dumps({{'type':'system','subtype':'init','mcp_servers':[{{'name':{MCP_SERVER_NAME!r},'status':'connected'}},{{'name':'optional','status':'failed'}}]}}),flush=True)\n"
+            "print(json.dumps({'type':'result','result':'OK','is_error':False}),flush=True)\n"
+            "sys.stdin.read()\n",
+            permission_service=True,
+        )
+        self.assertEqual(history["turns"][-1]["status"], "completed")
 
     async def test_root_bypass_failure_ends_turn_and_explains_native_restriction(self) -> None:
         history, events, args = await self.run_cli(

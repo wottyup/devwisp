@@ -33,6 +33,7 @@ export type SshMcpRole = 'viewer' | 'operator' | 'admin'
 export type SshMcpApprovalPolicy = 'auto' | 'ask-all' | 'ask-destructive' | 'deny'
 export interface SshMcpProfile {
   name: string
+  displayName?: string
   host: string
   port: number
   user: string
@@ -1013,6 +1014,9 @@ export const devwispClient = {
     return request<SshMcpSettings>(token, '/api/v1/ssh-mcp/settings', {
       method: 'PUT', body: JSON.stringify({ profiles }),
     })
+  },
+  removeSshMcpProfile(token: string, name: string) {
+    return request<SshMcpSettings>(token, `/api/v1/ssh-mcp/profiles/${encodeURIComponent(name)}`, { method: 'DELETE' })
   },
   revokeMCPApproval(token: string, grantId: string) {
     return request<{ deleted: boolean }>(token, `/api/v1/mcp/approvals/${encodeURIComponent(grantId)}`, { method: 'DELETE' })

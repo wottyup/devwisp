@@ -187,7 +187,7 @@ export const TerminalDialog = memo(function TerminalDialog({ token, engine, visi
         setHandoffStatusLoaded(true)
         setHandoffUnavailableReason(result.reason ?? '')
         setHandoffEnabled(result.enabled)
-        setHandoffError('')
+        setHandoffError(result.supported ? result.reason ?? '' : '')
       }).catch((reason: unknown) => {
         if (!cancelled) setHandoffError(reason instanceof Error ? reason.message : '无法查询终端接管状态')
       })
@@ -205,6 +205,7 @@ export const TerminalDialog = memo(function TerminalDialog({ token, engine, visi
       const result = await devwispClient.setTerminalHandoff(token, threadId, !handoffEnabled)
       setHandoffEnabled(result.enabled)
       setHandoffSupported(result.supported)
+      setHandoffError(result.supported ? result.reason ?? '' : '')
     } catch (reason) {
       setHandoffError(reason instanceof Error ? reason.message : '切换终端接管失败')
     } finally {
@@ -860,6 +861,7 @@ export const TerminalDialog = memo(function TerminalDialog({ token, engine, visi
 
   return (
     <ChatOverlayPanel
+      layoutKey="terminal"
       ariaLabel={ui("本机终端")}
       backdropLabel={ui("关闭本机终端")}
       onClose={onClose}

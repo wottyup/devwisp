@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import socket
@@ -21,6 +22,8 @@ MAX_SCREEN_LENGTH = 16_000
 MAX_WAIT_MS = 5_000
 MANUAL_INPUT_SETTLE_SECONDS = 3
 MANUAL_TOOL_WAIT_SECONDS = 15
+logger = logging.getLogger(__name__)
+TERMINAL_PROBE_PAUSED = "暂时无法读取终端状态，接管授权已保留，连接恢复后可继续。"
 PASSIVE_TERMINAL_REPORT = re.compile(
     r"(?:"
     r"\x1b\[<\d+;\d+;\d+[Mm]"  # SGR mouse press, release and wheel
@@ -62,12 +65,18 @@ class TerminalHandoffError(RuntimeError):
     pass
 
 
+class _TerminalSessionEnded(TerminalHandoffError):
+    pass
+
+
 class TerminalHandoffBroker:
     def __init__(self, socket_path: Path) -> None:
         self.socket_path = socket_path
         self._server: asyncio.AbstractServer | None = None
         self._contexts: dict[str, str] = {}
         self._enabled: set[str] = set()
+        self._pane_bindings: dict[str, tuple[str, int]] = {}
+        self._probe_paused: set[str] = set()
         self._locks: dict[str, asyncio.Lock] = {}
         self._input_locks: dict[str, asyncio.Lock] = {}
         self._manual_input_until: dict[str, float] = {}
@@ -90,6 +99,8 @@ class TerminalHandoffBroker:
 
     async def close(self) -> None:
         self._enabled.clear()
+        self._pane_bindings.clear()
+        self._probe_paused.clear()
         self._manual_input_until.clear()
         if self._server is not None:
             self._server.close()
@@ -115,15 +126,32 @@ class TerminalHandoffBroker:
     async def status(self, thread_id: str) -> dict[str, Any]:
         if os.name == "nt":
             return {"supported": False, "enabled": False, "reason": "Windows 终端暂不支持交给 AI 接管。"}
-        if thread_id not in self._enabled:
-            return {"supported": True, "enabled": False}
-        try:
-            await self._ssh_session_name(thread_id)
-        except (TerminalHandoffError, RuntimeError, OSError):
-            self._enabled.discard(thread_id)
-            self._manual_input_until.pop(thread_id, None)
-            return {"supported": True, "enabled": False}
-        return {"supported": True, "enabled": True}
+        async with self._locks.setdefault(thread_id, asyncio.Lock()):
+            if thread_id not in self._enabled:
+                return {"supported": True, "enabled": False}
+            try:
+                await self._ssh_session_target(thread_id)
+            except _TerminalSessionEnded as error:
+                self._revoke(thread_id)
+                logger.info("Terminal handoff ended for thread %s: %s", thread_id, error)
+                return {"supported": True, "enabled": False, "reason": str(error)}
+            except (TerminalHandoffError, RuntimeError, OSError) as error:
+                # A failed status query is not a user revocation. Each actual
+                # tool call still revalidates the SSH process and pane binding.
+                if thread_id not in self._probe_paused:
+                    logger.warning("Terminal handoff probe paused for thread %s (%s)", thread_id, type(error).__name__)
+                    self._probe_paused.add(thread_id)
+                return {"supported": True, "enabled": True, "reason": TERMINAL_PROBE_PAUSED}
+            if thread_id in self._probe_paused:
+                logger.info("Terminal handoff probe recovered for thread %s", thread_id)
+                self._probe_paused.discard(thread_id)
+            return {"supported": True, "enabled": True}
+
+    def _revoke(self, thread_id: str) -> None:
+        self._enabled.discard(thread_id)
+        self._pane_bindings.pop(thread_id, None)
+        self._probe_paused.discard(thread_id)
+        self._manual_input_until.pop(thread_id, None)
 
     async def set_enabled(self, thread_id: str, enabled: bool) -> dict[str, Any]:
         if not thread_id or len(thread_id) > 512:
@@ -132,13 +160,14 @@ class TerminalHandoffBroker:
             if enabled:
                 if os.name == "nt":
                     raise TerminalHandoffError("Windows 终端暂不支持交给 AI 接管。")
-                session_name = await self._ssh_session_name(thread_id)
-                await self._show_live_terminal(session_name)
+                binding = await self._ssh_session_target(thread_id, new_handoff=True)
+                await self._show_live_terminal(binding[0])
                 self._manual_input_until.pop(thread_id, None)
+                self._pane_bindings[thread_id] = binding
+                self._probe_paused.discard(thread_id)
                 self._enabled.add(thread_id)
             else:
-                self._enabled.discard(thread_id)
-                self._manual_input_until.pop(thread_id, None)
+                self._revoke(thread_id)
         return await self.status(thread_id)
 
     def _manual_input_active(self, thread_id: str) -> bool:
@@ -184,15 +213,25 @@ class TerminalHandoffBroker:
             if submitted:
                 self._manual_input_until[thread_id] = time.monotonic() + MANUAL_INPUT_SETTLE_SECONDS
 
-    async def _ssh_session_name(self, thread_id: str) -> str:
+    async def _ssh_session_target(self, thread_id: str, *, new_handoff: bool = False) -> tuple[str, int]:
         name = tmux_session_name_for_thread(thread_id)
         try:
-            foreground = (await _run_tmux("display-message", "-p", "-t", name, "#{pane_current_command}")).strip().lower()
+            snapshot = (await _run_tmux(
+                "display-message", "-p", "-t", name,
+                "#{pane_id}\t#{pane_pid}\t#{pane_current_command}",
+            )).strip()
         except (OSError, RuntimeError) as error:
-            raise TerminalHandoffError("当前聊天的终端会话不存在，请先打开终端并登录 SSH。") from error
-        if foreground not in {"ssh", "ssh.exe"}:
-            raise TerminalHandoffError("请先在当前终端完成 SSH 登录，并停在远端命令提示符处。")
-        return name
+            raise TerminalHandoffError("暂时无法读取终端状态，请稍后重试。") from error
+        fields = snapshot.split("\t")
+        if len(fields) != 3 or not re.fullmatch(r"%\d+", fields[0]) or not fields[1].isdigit() or int(fields[1]) <= 0:
+            raise TerminalHandoffError("暂时无法读取终端状态，请稍后重试。")
+        pane, pid, foreground = fields
+        binding = (pane, int(pid))
+        if not new_handoff and self._pane_bindings.get(thread_id) != binding:
+            raise _TerminalSessionEnded("终端会话已更换，请确认 SSH 连接后重新交给 AI。")
+        if foreground.lower() not in {"ssh", "ssh.exe"}:
+            raise _TerminalSessionEnded("SSH 连接已结束或已离开 SSH，请重新登录后再交给 AI。")
+        return binding
 
     async def _screen(self, session_name: str) -> str:
         screen = await _run_tmux("capture-pane", "-p", "-S", "-100", "-t", session_name)
@@ -225,7 +264,7 @@ class TerminalHandoffBroker:
         async with self._locks.setdefault(thread_id, asyncio.Lock()):
             if thread_id not in self._enabled:
                 raise TerminalHandoffError("用户已收回终端控制权，本次操作未执行。")
-            session_name = await self._ssh_session_name(thread_id)
+            session_name, _pid = await self._ssh_session_target(thread_id)
             if action == "read_terminal":
                 async with self._input_locks.setdefault(thread_id, asyncio.Lock()):
                     self._require_manual_input_finished(thread_id)

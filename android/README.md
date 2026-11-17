@@ -4,7 +4,7 @@ Android 客户端使用 Kotlin 和原生 Android View 绘制，不通过 WebView
 
 首次启动时填写电脑网页地址，例如 `http://192.168.15.22:4173`，以及服务启动时显示的配对码。APP 会直接请求网页服务转发的 `/api/v1/pair` 接口；4173 网页端口不提供 `/health` 路径。
 
-Dev Wisp 使用新的 Android application ID：`com.sevencnup.devwisp`。旧版 `com.sevencnup.codexremote` 安装包不能原地升级到这个 ID；安装新版后需要重新配对，旧版应用数据不会自动转移。
+Dev Wisp 保持原 Android application ID：`com.sevencnup.codexremote`，显示名称与源码 namespace 可以随品牌更新。使用相同签名安装即可覆盖旧版，并继续使用原来的连接配置、主题和聊天选择，无需重新配对。
 
 ## 构建
 

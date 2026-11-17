@@ -44,6 +44,7 @@ from .claude_code import (
     is_claude_thread_id,
 )
 from .permission_prompt import PermissionPromptBroker, PermissionPromptError, remove_legacy_permission_hook
+from .state_migration import migrate_legacy_state_directory
 from .codex_app_server import (
     ApprovalPolicy,
     CodexAppServer,
@@ -365,6 +366,7 @@ class SshMcpProfileRequest(BaseModel):
     model_config = {"extra": "forbid"}
 
     name: str = Field(min_length=1, max_length=64)
+    displayName: str | None = Field(default=None, max_length=80)
     host: str = Field(min_length=1, max_length=255)
     port: int = Field(default=22, ge=1, le=65535)
     user: str = Field(min_length=1, max_length=128)
@@ -393,6 +395,15 @@ class SshMcpProfileRequest(BaseModel):
         if not value or any(character.isspace() or ord(character) < 32 for character in value):
             raise ValueError("主机地址和用户名不能包含空白字符。")
         return value
+
+    @field_validator("displayName")
+    @classmethod
+    def normalize_display_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if any(unicodedata.category(character) == "Cc" for character in value):
+            raise ValueError("服务器名称不能包含控制字符。")
+        return value.strip() or None
 
     @field_validator("keyRef", "trustedHostKey", "workdir")
     @classmethod
@@ -1787,6 +1798,7 @@ def create_app(
     codex_executable = codex_command or os.environ.get("DEVWISP_COMMAND", "codex")
     claude_executable = os.environ.get("DEVWISP_CLAUDE_COMMAND", "claude")
     app_server = CodexAppServer(codex_executable, configured_workspace)
+    migrate_legacy_state_directory(PairingAuth._default_state_path().parent)
     auth = PairingAuth()
     try:
         auth.state_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -2312,6 +2324,13 @@ def create_app(
             raise HTTPException(status_code=422, detail="使用私钥认证时，请填写 DevWisp 主机上的私钥文件路径。")
         try:
             return ssh_mcp_settings.save(profiles, passwords)
+        except SshMcpSettingsError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.delete("/api/v1/ssh-mcp/profiles/{profile_name}")
+    async def remove_ssh_mcp_profile(profile_name: str) -> dict[str, Any]:
+        try:
+            return ssh_mcp_settings.remove(profile_name)
         except SshMcpSettingsError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
 

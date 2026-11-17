@@ -35,7 +35,10 @@ class ControlledOutput:
 class FakeProcess:
     def __init__(self) -> None:
         self.stdout = ControlledOutput()
-        self.stdin = None
+        self.stdin = Mock()
+        self.stdin.is_closing.return_value = False
+        self.stdin.drain = AsyncMock()
+        self.stdin.wait_closed = AsyncMock()
         self.returncode = None
         self.exited = asyncio.Event()
 

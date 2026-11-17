@@ -3,7 +3,7 @@
 <p align="center"><img src="public/devwisp-robot.svg" alt="DevWisp robot logo" width="96"></p>
 
 <p align="center">
-  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/web%20version-0.128.0--dev.1-orange?style=flat-square" alt="Web version 0.128.0-dev.1"></a>
+  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/web%20version-0.129.4--dev.1-orange?style=flat-square" alt="Web version 0.129.4-dev.1"></a>
   <a href="https://github.com/wottyup/devwisp/stargazers"><img src="https://img.shields.io/github/stars/wottyup/devwisp?style=flat-square" alt="GitHub stars"></a>
   <a href="https://github.com/wottyup/devwisp/forks"><img src="https://img.shields.io/github/forks/wottyup/devwisp?style=flat-square" alt="GitHub forks"></a>
   <a href="https://github.com/wottyup/devwisp/issues"><img src="https://img.shields.io/github/issues/wottyup/devwisp?style=flat-square" alt="Open issues"></a>

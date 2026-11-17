@@ -35,6 +35,9 @@ CLAUDE_PERMISSION_MODES = {
 CLAUDE_DRAIN_GRACE_SECONDS = 3.0
 CLAUDE_EXIT_POLL_SECONDS = 0.1
 CLAUDE_STREAM_LINE_LIMIT = 64 * 1024 * 1024
+CLAUDE_PERMISSION_SERVICE_ERROR = (
+    "Claude Code 权限服务连接失败，请重启 Dev Wisp 后台以加载当前工具配置后重试。"
+)
 CLAUDE_ROOT_BYPASS_ERROR = (
     "当前 Claude Code 以 root/sudo 身份运行，CLI 不允许在此环境使用“绕过全部权限检查”。"
     "请选择“本机默认权限”或“自动接受编辑”；如需绕过检查，请用普通用户运行 DevWisp 和 Claude。"
@@ -167,6 +170,14 @@ class ClaudeCodeServer:
             self._connection.execute("ALTER TABLE claude_threads ADD COLUMN native_source TEXT")
         if "native_mtime_ns" not in columns:
             self._connection.execute("ALTER TABLE claude_threads ADD COLUMN native_mtime_ns INTEGER")
+        project_root = Path(__file__).resolve().parents[2]
+        if project_root.name == "devwisp":
+            old_project_root = project_root.with_name("code-remote")
+            if not old_project_root.exists():
+                self._connection.execute(
+                    "UPDATE claude_threads SET cwd = ? WHERE cwd = ?",
+                    (str(project_root), str(old_project_root)),
+                )
         self._connection.execute(
             "CREATE TABLE IF NOT EXISTS claude_native_hidden (session_id TEXT PRIMARY KEY)",
         )
@@ -1018,6 +1029,16 @@ class ClaudeCodeServer:
                         self._connection.execute(
                             "UPDATE claude_threads SET started = 1 WHERE thread_id = ?", (thread_id,),
                         )
+                    mcp_servers = record.get("mcp_servers")
+                    if self._permission_broker is not None and isinstance(mcp_servers, list) and any(
+                        isinstance(server, dict) and server.get("name") == MCP_SERVER_NAME
+                        and server.get("status") == "failed"
+                        for server in mcp_servers
+                    ):
+                        result_error = CLAUDE_PERMISSION_SERVICE_ERROR
+                        logger.warning("Claude Code permission MCP failed for turn %s", turn_id)
+                        await self._terminate_process(process)
+                        break
                 elif record_type == "assistant":
                     message = record.get("message")
                     content = message.get("content") if isinstance(message, dict) else None

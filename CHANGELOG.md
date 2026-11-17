@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.129.4-dev.1] - Make desktop floating windows follow dragging smoothly while preserving saved positions and sizes
+
+## [0.129.3-dev.1] - Remember separate desktop file-preview and terminal window positions and sizes with movable, resizable panels
+
+## Android [0.128.0-dev.2] - Add a resizable terminal window with remembered height and keyboard-aware bounds
+
+## [0.129.2-dev.1] - Persist SSH server removal immediately and keep deleted servers from reappearing after refresh
+
+## [0.129.1-dev.1] - Let SSH server titles use editable names, including Chinese names, while preserving saved connections
+
+## [0.129.0-dev.1] - Configure operation permissions and approval policies separately for each SSH MCP server
+
+## [0.128.2-dev.1] - Keep AI terminal handoff through temporary status-query failures and verify the authorized terminal pane before each operation
+
+## Android [0.127.4-dev.1] - Close the composer settings popup after completing preference selection
+
+## Android [0.127.3-dev.1] - Advance through model, reasoning, and permission choices in sequence
+
+## [0.128.1-dev.1] - Preserve local data and repair Claude workspace and permission-service failures after the DevWisp rename
+
+## Android [0.127.2-dev.1] - Restore in-place upgrades and existing settings after renaming; use a white installer icon background
+
 ## [0.128.0-dev.1] - Let Replace All cover complete workspace scans beyond the result preview cap
 
 ## [0.127.0-dev.1] - Migrate remaining project identifiers, source paths, and Android identity to DevWisp

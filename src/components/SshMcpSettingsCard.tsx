@@ -1,6 +1,7 @@
 import { useEffect, useState, type FormEvent } from 'react'
 import { ChevronDown, LoaderCircle, Plus, Save, Trash2 } from 'lucide-react'
-import { ui, uiMessage, useUiLanguage } from '../lib/uiLanguage'
+import { ui, uiFormat, uiMessage, useUiLanguage } from '../lib/uiLanguage'
+import { TranslationSelect } from './TranslationSelect'
 import {
   devwispClient,
   type SshMcpProfile,
@@ -16,7 +17,39 @@ interface ProfileDraft {
 
 let nextDraftId = 1
 
-function newProfile(id: number, name: string): SshMcpProfile {
+const permissionPresets = {
+  viewer: { group: 'dev', role: 'viewer', readOnly: true },
+  operator: { group: 'dev', role: 'operator', readOnly: false },
+  admin: { group: 'dev', role: 'admin', readOnly: false },
+} satisfies Record<string, Pick<SshMcpProfile, 'group' | 'role' | 'readOnly'>>
+
+function permissionLevel(profile: SshMcpProfile): keyof typeof permissionPresets | 'custom' {
+  if (profile.readOnly) return 'viewer'
+  if ((profile.group === 'dev' || profile.group === 'staging') && (profile.role === 'operator' || profile.role === 'admin')) return profile.role
+  return 'custom'
+}
+
+function permissionLabel(profile: SshMcpProfile): string {
+  const level = permissionLevel(profile)
+  return ui(level === 'viewer' ? '只读' : level === 'operator' ? '运维' : level === 'admin' ? '管理员' : '保留现有权限')
+}
+
+function permissionDescription(profile: SshMcpProfile): string {
+  const level = permissionLevel(profile)
+  if (level === 'viewer') return ui('查看文件、日志和状态；不允许修改。')
+  if (level === 'operator') return ui('允许修改文件、删除和重启等运维操作；不允许 sudo 提权。')
+  if (level === 'admin') return ui('允许修改和提权操作；实际权限由 SSH 登录账号决定。')
+  return uiFormat('保留现有设置：分组 {0}，角色 {1}。选择其他级别会应用对应权限。', profile.group, profile.role)
+}
+
+function approvalDescription(policy: SshMcpProfile['approvalPolicy']): string {
+  if (policy === 'auto') return ui('在所选操作权限内自动批准，不再逐次询问。')
+  if (policy === 'ask-all') return ui('每次操作都在 Codex 对话中请求批准，包括只读操作。')
+  if (policy === 'deny') return ui('拒绝被判定为高风险的操作；其余操作按所选权限执行。')
+  return ui('仅对被判定为高风险的操作询问，例如递归删除目录或提权。')
+}
+
+function newProfile(name: string): SshMcpProfile {
   return {
     name, host: '', port: 22, user: '', auth: 'password', group: 'dev', role: 'admin',
     readOnly: false, approvalPolicy: 'auto',
@@ -25,11 +58,6 @@ function newProfile(id: number, name: string): SshMcpProfile {
 
 function draftsFor(profiles: SshMcpProfile[]): ProfileDraft[] {
   return profiles.map((value) => ({ id: nextDraftId++, value: { ...value }, persisted: true, collapsed: true }))
-}
-
-function emptyDraft(): ProfileDraft {
-  const id = nextDraftId++
-  return { id, value: newProfile(id, `ssh-server-${id}`), persisted: false, collapsed: false }
 }
 
 function errorMessage(reason: unknown): string {
@@ -42,8 +70,9 @@ export function SshMcpSettingsCard({ token }: { token: string }) {
   const [profiles, setProfiles] = useState<ProfileDraft[]>([])
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
+  const [removingId, setRemovingId] = useState<number | null>(null)
   const [message, setMessage] = useState<{ text: string; error: boolean } | null>(null)
-  const disabled = loading || saving
+  const disabled = loading || saving || removingId !== null
   const saveDisabled = disabled || settings === null
 
   useEffect(() => {
@@ -53,7 +82,7 @@ export function SshMcpSettingsCard({ token }: { token: string }) {
     void devwispClient.sshMcpSettings(token).then((result) => {
       if (cancelled) return
       setSettings(result)
-      setProfiles(result.profiles.length ? draftsFor(result.profiles) : [emptyDraft()])
+      setProfiles(draftsFor(result.profiles))
     }).catch((reason: unknown) => {
       if (!cancelled) setMessage({ text: errorMessage(reason), error: true })
     }).finally(() => { if (!cancelled) setLoading(false) })
@@ -74,7 +103,7 @@ export function SshMcpSettingsCard({ token }: { token: string }) {
       let name = `ssh-server-${id}`
       let suffix = 1
       while (names.has(name.toLowerCase())) name = `ssh-server-${id}-${suffix++}`
-      return [...current, { id, value: newProfile(id, name), persisted: false, collapsed: false }]
+      return [...current, { id, value: newProfile(name), persisted: false, collapsed: false }]
     })
     setMessage(null)
   }
@@ -85,9 +114,26 @@ export function SshMcpSettingsCard({ token }: { token: string }) {
       : draft))
   }
 
-  function removeProfile(id: number) {
-    setProfiles((current) => current.filter((draft) => draft.id !== id))
+  async function removeProfile(id: number) {
+    if (disabled) return
+    const draft = profiles.find((profile) => profile.id === id)
+    if (!draft) return
     setMessage(null)
+    if (!draft.persisted) {
+      setProfiles((current) => current.filter((profile) => profile.id !== id))
+      return
+    }
+    setRemovingId(id)
+    try {
+      const result = await devwispClient.removeSshMcpProfile(token, draft.value.name)
+      setSettings(result)
+      setProfiles((current) => current.filter((profile) => profile.id !== id))
+      setMessage({ text: 'SSH 服务器已移除。', error: false })
+    } catch (reason) {
+      setMessage({ text: errorMessage(reason), error: true })
+    } finally {
+      setRemovingId(null)
+    }
   }
 
   async function save(event: FormEvent<HTMLFormElement>) {
@@ -101,6 +147,7 @@ export function SshMcpSettingsCard({ token }: { token: string }) {
         delete profile.hasPassword
         return {
           ...profile,
+          displayName: profile.displayName?.trim() || undefined,
           keyRef: profile.auth === 'key' ? profile.keyRef?.trim() || undefined : undefined,
           trustedHostKey: profile.trustedHostKey?.trim() || undefined,
           workdir: profile.workdir?.trim() || undefined,
@@ -120,7 +167,7 @@ export function SshMcpSettingsCard({ token }: { token: string }) {
     <div className="theme-settings-card__heading">
       <div>
         <h2><span className="ssh-mcp-shield" aria-hidden="true">SSH</span>{ui('SSH MCP 服务器')}</h2>
-        <p>{ui('填写 IP、端口、用户名和密码即可添加 SSH 服务器。')}</p>
+        <p>{ui('添加 SSH 服务器，并分别设置 AI 的操作权限和审批方式。')}</p>
       </div>
       <span className="theme-settings-card__badge">{ui('仅 Codex')}</span>
     </div>
@@ -133,8 +180,9 @@ export function SshMcpSettingsCard({ token }: { token: string }) {
       <form className="native-config__form" onSubmit={(event) => { void save(event) }}>
         {profiles.map(({ id, value, persisted, collapsed }, index) => {
           const fieldsId = `ssh-mcp-profile-fields-${id}`
-          const title = `${ui('服务器')} ${index + 1}`
-          const summary = [value.host ? `${value.host}:${value.port}` : '', value.user].filter(Boolean).join(' · ')
+          const title = value.displayName?.trim() || value.name || `${ui('服务器')} ${index + 1}`
+          const level = permissionLevel(value)
+          const summary = [value.host ? `${value.host}:${value.port}` : '', value.user, permissionLabel(value)].filter(Boolean).join(' · ')
           return <section className="native-config__group ssh-mcp-profile" key={id} aria-label={ui('SSH MCP 服务器配置')}>
           <div className="ssh-mcp-profile__heading">
             <div className="ssh-mcp-profile__heading-info">
@@ -150,16 +198,39 @@ export function SshMcpSettingsCard({ token }: { token: string }) {
               }}><ChevronDown size={16} aria-hidden="true" />{title}</button> : title}</h3>
               {collapsed && summary ? <small className="ssh-mcp-profile__summary">{summary}</small> : null}
             </div>
-            <button className="theme-notification-toggle ssh-mcp-profile__remove" type="button" disabled={disabled} onClick={() => removeProfile(id)}>
-              <Trash2 size={15} />{ui('移除')}
+            <button className="theme-notification-toggle ssh-mcp-profile__remove" type="button" disabled={disabled} onClick={() => { void removeProfile(id) }}>
+              {removingId === id ? <LoaderCircle size={15} className="ssh-mcp-spin" /> : <Trash2 size={15} />}{removingId === id ? ui('移除中…') : ui('移除')}
             </button>
           </div>
           <fieldset id={fieldsId} className="ssh-mcp-profile__fields" disabled={disabled || collapsed} hidden={collapsed}>
           <div className="native-config__columns">
+            <label className="native-config__field ssh-mcp-profile__name"><span>{ui('服务器名称')}</span><input value={value.displayName ?? ''} onChange={(event) => update(id, { displayName: event.target.value })} placeholder={value.name} maxLength={80} autoComplete="off" disabled={disabled} /><small>{ui('支持中文和空格；留空使用默认名称。')}</small></label>
             <label className="native-config__field"><span>{ui('IP 地址 / 主机名')}</span><input value={value.host} onChange={(event) => update(id, { host: event.target.value })} placeholder="192.168.1.10" maxLength={255} autoCapitalize="none" autoCorrect="off" spellCheck={false} required disabled={disabled} /></label>
             <label className="native-config__field"><span>{ui('端口')}</span><input type="number" min={1} max={65535} value={value.port} onChange={(event) => update(id, { port: Number(event.target.value) })} required disabled={disabled} /></label>
             <label className="native-config__field"><span>{ui('用户名')}</span><input value={value.user} onChange={(event) => update(id, { user: event.target.value })} maxLength={128} autoCapitalize="none" autoCorrect="off" spellCheck={false} required disabled={disabled} /></label>
             <label className="native-config__field"><span>{ui('密码')}</span><input type="password" autoComplete="new-password" maxLength={4096} value={value.password ?? ''} onChange={(event) => update(id, { password: event.target.value, ...(event.target.value ? { auth: 'password' } : {}) })} placeholder={value.hasPassword ? ui('已保存，留空则保持不变') : ui('输入 SSH 登录密码')} required={value.auth === 'password' && !value.hasPassword} disabled={disabled} /><small>{value.hasPassword ? ui('密码已保存；留空会继续使用。') : ui('密码保存在 Dev Wisp 主机，不会在设置中显示。')}</small></label>
+            <div className="native-config__field">
+              <TranslationSelect label={ui('操作权限')} value={level} options={[
+                ...(level === 'custom' ? [{ value: 'custom', label: ui('保留现有权限'), disabled: true }] : []),
+                { value: 'viewer', label: ui('只读') },
+                { value: 'operator', label: ui('运维') },
+                { value: 'admin', label: ui('管理员') },
+              ]} disabled={disabled || collapsed} onChange={(next) => {
+                if (next === 'viewer' || next === 'operator' || next === 'admin') update(id, permissionPresets[next])
+              }} />
+              <small>{permissionDescription(value)}</small>
+            </div>
+            <div className="native-config__field">
+              <TranslationSelect label={ui('审批方式')} value={value.approvalPolicy} options={[
+                { value: 'auto', label: ui('自动批准') },
+                { value: 'ask-all', label: ui('每次操作都询问') },
+                { value: 'ask-destructive', label: ui('仅高风险操作询问') },
+                { value: 'deny', label: ui('拒绝高风险操作') },
+              ]} disabled={disabled || collapsed} onChange={(next) => {
+                if (next === 'auto' || next === 'ask-all' || next === 'ask-destructive' || next === 'deny') update(id, { approvalPolicy: next })
+              }} />
+              <small>{approvalDescription(value.approvalPolicy)}</small>
+            </div>
           </div>
           </fieldset>
         </section>
