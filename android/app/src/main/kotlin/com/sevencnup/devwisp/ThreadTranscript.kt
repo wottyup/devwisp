@@ -38,7 +38,7 @@ internal object ThreadTranscript {
 
     fun create(thread: JSONObject, generatedAt: String = Instant.now().toString()): String {
         val title = title(thread)
-        val assistantLabel = if (thread.optString("engine") == "claude-code" || thread.optString("id").startsWith("claude:")) "Claude Code" else "Codex"
+        val assistantLabel = ChatEngines.label(thread.optString("engine").ifBlank { ChatEngines.fromThreadId(thread.optString("id")) })
         val lines = mutableListOf(
             "# 对话记录", "", "> 来源对话：${title.replace(Regex("[\\r\\n]+"), " ").replace(Regex("^\\s*#+\\s*"), "").trim()}", "",
             "## 对话信息", "", "- 对话名称：${inlineCode(title)}", "- 对话 ID：${inlineCode(thread.optString("id"))}",

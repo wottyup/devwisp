@@ -132,6 +132,103 @@ class SharedQueueServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.send.await_count, 2)
         self.assertEqual(self.store.queue("thread"), [])
 
+    async def test_live_completed_turn_advances_when_rollout_history_stays_in_progress(self) -> None:
+        codex = CodexAppServer("codex", Path(self.directory.name))
+        codex._initialized = True
+        codex._process = Mock(returncode=None)
+        codex._history.read_thread = Mock(return_value={
+            "id": "thread",
+            "status": {"type": "inProgress"},
+            "turns": [{"id": "original", "status": "inProgress"}],
+        })
+
+        async def runtime_read(_method: str, params: dict[str, object]) -> dict[str, object]:
+            thread: dict[str, object] = {"id": "thread", "status": {"type": "idle"}}
+            if params["includeTurns"]:
+                thread["turns"] = [{"id": "original", "status": "completed"}]
+            return {"thread": thread}
+
+        codex.request = AsyncMock(side_effect=runtime_read)
+        self.store.enqueue("thread", message("queued-next", "send after completion"))
+        self.store.set_barrier("thread", "original")
+        service = SharedQueueService(self.store, codex, self.send)
+
+        await service.advance("thread")
+
+        self.send.assert_awaited_once_with("thread", message("queued-next", "send after completion"), False)
+        self.assertEqual(self.store.queue("thread"), [])
+        codex._history.read_thread.assert_called_once()
+
+        await service.advance("thread")
+        self.send.assert_awaited_once()
+
+    async def test_live_idle_without_confirmed_completed_turn_keeps_queue_pending(self) -> None:
+        codex = CodexAppServer("codex", Path(self.directory.name))
+        codex._initialized = True
+        codex._process = Mock(returncode=None)
+        codex._history.read_thread = Mock(return_value={
+            "id": "thread",
+            "status": {"type": "inProgress"},
+            "turns": [{"id": "original", "status": "inProgress"}],
+        })
+        codex.request = AsyncMock(return_value={"thread": {
+            "id": "thread", "status": {"type": "idle"},
+            "turns": [{"id": "original", "status": "inProgress"}],
+        }})
+        self.store.enqueue("thread", message("queued-next", "wait for completion"))
+        self.store.set_barrier("thread", "original")
+        service = SharedQueueService(self.store, codex, self.send)
+
+        await service.advance("thread")
+
+        self.send.assert_not_awaited()
+        self.assertEqual([item["id"] for item in self.store.queue("thread")], ["queued-next"])
+
+    async def test_runtime_turn_read_failure_does_not_fall_back_to_disk_completion(self) -> None:
+        codex = CodexAppServer("codex", Path(self.directory.name))
+        codex._initialized = True
+        codex._process = Mock(returncode=None)
+        codex._history.read_thread = Mock(return_value={
+            "id": "thread", "status": {"type": "idle"},
+            "turns": [{"id": "original", "status": "completed"}],
+        })
+
+        async def runtime_read(_method: str, params: dict[str, object]) -> dict[str, object]:
+            if params["includeTurns"]:
+                raise CodexRuntimeError("runtime disconnected")
+            return {"thread": {"id": "thread", "status": {"type": "idle"}}}
+
+        codex.request = AsyncMock(side_effect=runtime_read)
+        self.store.enqueue("thread", message("queued-next", "wait for runtime"))
+        self.store.set_barrier("thread", "original")
+        service = SharedQueueService(self.store, codex, self.send)
+
+        with self.assertRaises(CodexRuntimeError):
+            await service.advance("thread")
+
+        self.send.assert_not_awaited()
+        self.assertEqual([item["id"] for item in self.store.queue("thread")], ["queued-next"])
+
+    async def test_not_loaded_runtime_must_resume_before_automatic_delivery(self) -> None:
+        codex = CodexAppServer("codex", Path(self.directory.name))
+        codex._initialized = True
+        codex._process = Mock(returncode=None)
+        codex._history.read_thread = Mock(return_value={
+            "id": "thread", "status": {"type": "completed"},
+            "turns": [{"id": "original", "status": "completed"}],
+        })
+        codex.request = AsyncMock(return_value={"thread": {"id": "thread", "status": {"type": "notLoaded"}}})
+        codex.resume_thread = AsyncMock(side_effect=CodexRuntimeError("runtime unavailable"))
+        self.store.enqueue("thread", message("queued-next", "wait for runtime"))
+        service = SharedQueueService(self.store, codex, self.send)
+
+        with self.assertRaises(CodexRuntimeError):
+            await service.advance("thread")
+
+        codex.resume_thread.assert_awaited_once_with("thread")
+        self.send.assert_not_awaited()
+        self.assertEqual([item["id"] for item in self.store.queue("thread")], ["queued-next"])
+
     async def test_interrupted_turn_and_active_edit_pause_queue(self) -> None:
         self.store.enqueue("thread", message("queued-first", "first"))
         self.codex.read_thread.return_value = {"turns": [{"id": "original", "status": "interrupted"}]}
@@ -385,6 +482,53 @@ class SharedQueueServiceTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await self.service.close()
 
+    async def test_background_worker_survives_idle_timeout_then_sends_on_completion(self) -> None:
+        self.store.enqueue("thread", message("queued-first", "first"))
+        self.store.set_barrier("thread", "original")
+        events = asyncio.Queue()
+        self.codex.subscribe = AsyncMock(return_value=events)
+        self.codex.unsubscribe = Mock()
+        real_wait_for = asyncio.wait_for
+        idle_timeout = asyncio.Event()
+        delivered = asyncio.Event()
+
+        async def wait_with_one_idle_timeout(awaitable, timeout):
+            if not idle_timeout.is_set():
+                try:
+                    return await real_wait_for(awaitable, timeout=0.01)
+                except asyncio.TimeoutError:
+                    idle_timeout.set()
+                    raise
+            return await real_wait_for(awaitable, timeout=timeout)
+
+        async def send(_thread, _payload, _steer):
+            delivered.set()
+            return "turn-one"
+
+        self.service.send = AsyncMock(side_effect=send)
+        with patch("devwisp.shared_state.asyncio.wait_for", side_effect=wait_with_one_idle_timeout):
+            self.service.start()
+            try:
+                await real_wait_for(idle_timeout.wait(), timeout=1)
+                await asyncio.sleep(0)
+                self.assertFalse(self.service._runner.done(), "The queue worker died on its periodic idle timeout")
+                self.service.send.assert_not_awaited()
+                self.codex.read_thread.return_value = {
+                    "status": {"type": "idle"},
+                    "turns": [{"id": "original", "status": "completed"}],
+                }
+                await events.put({
+                    "type": "notification", "method": "turn/completed",
+                    "params": {"threadId": "thread", "turn": {"id": "original", "status": "completed"}},
+                })
+                await real_wait_for(delivered.wait(), timeout=1)
+                self.service.send.assert_awaited_once_with("thread", message("queued-first", "first"), False)
+                self.assertEqual(self.store.queue("thread"), [])
+            finally:
+                await self.service.close()
+        self.assertTrue(self.service._runner.done())
+        self.assertTrue(self.service._listener.done())
+
 
 class SharedQueueEndpointTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
@@ -398,6 +542,7 @@ class SharedQueueEndpointTests(unittest.IsolatedAsyncioTestCase):
             self.app = create_app(root)
         self.addCleanup(self.app.state.shared_state.close)
         self.addAsyncCleanup(self.app.state.claude_code.close)
+        self.addAsyncCleanup(self.app.state.deepseek.close)
         self.app.state.codex.read_thread = AsyncMock(return_value={"status": {"type": "idle"}})
 
     def endpoint(self, path: str):
@@ -420,8 +565,8 @@ class SharedQueueEndpointTests(unittest.IsolatedAsyncioTestCase):
         store.enqueue("thread", message("queued-last", "last"))
         body = QueueMessageIdRequest(message_id="queued-urgent")
 
-        first = await send_now("thread", body)
-        retry = await send_now("thread", body)
+        first = await asyncio.wait_for(send_now("thread", body), timeout=2)
+        retry = await asyncio.wait_for(send_now("thread", body), timeout=2)
 
         self.assertTrue(first["sent"])
         self.assertEqual(retry, first)
@@ -445,7 +590,9 @@ class SharedQueueEndpointTests(unittest.IsolatedAsyncioTestCase):
         })
         store.enqueue("thread", message("queued-last", "last"))
 
-        result = await send_idle("thread", QueueMessageIdRequest(message_id="queued-selected"))
+        result = await asyncio.wait_for(
+            send_idle("thread", QueueMessageIdRequest(message_id="queued-selected")), timeout=2,
+        )
 
         self.assertTrue(result["sent"])
         self.assertEqual([item["id"] for item in result["queue"]], ["queued-first", "queued-last"])
@@ -541,6 +688,43 @@ class SharedQueueEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(retry, first)
         self.app.state.shared_queue.send.assert_awaited_once()
         self.assertFalse(self.app.state.shared_queue.send.await_args.args[2])
+
+    async def test_idle_submit_uses_codex_adapter_without_reacquiring_delivery_lock(self) -> None:
+        submit = self.endpoint("/api/v1/codex/queue/{thread_id}/submit")
+        codex = self.app.state.codex
+        codex._active_turn_id = AsyncMock(return_value=None)
+
+        async def start(*args, **kwargs):
+            self.assertTrue(self.app.state.shared_queue.delivery_lock("thread").locked())
+            return {"turn": {"id": "new-turn"}}
+
+        codex.start_turn = AsyncMock(side_effect=start)
+        body = QueuedMessageRequest(**message("queued-adapter", "send through the real adapter"))
+        first = await asyncio.wait_for(submit("thread", body), timeout=2)
+        retry = await asyncio.wait_for(submit("thread", body), timeout=2)
+
+        self.assertEqual(first, {"sent": True, "queue": []})
+        self.assertEqual(retry, first)
+        codex.start_turn.assert_awaited_once()
+        self.assertTrue(self.app.state.shared_state.was_delivered("thread", body.id))
+        self.assertFalse(self.app.state.shared_queue.delivery_lock("thread").locked())
+
+    async def test_background_advance_uses_codex_adapter_without_reacquiring_delivery_lock(self) -> None:
+        codex = self.app.state.codex
+        codex._active_turn_id = AsyncMock(return_value=None)
+        codex.read_thread.return_value = {
+            "status": {"type": "idle"}, "turns": [{"id": "previous", "status": "completed"}],
+        }
+        codex.start_turn = AsyncMock(return_value={"turn": {"id": "new-turn"}})
+        store = self.app.state.shared_state
+        store.enqueue("thread", message("queued-background", "send after the previous reply"))
+
+        await asyncio.wait_for(self.app.state.shared_queue.advance("thread"), timeout=2)
+
+        self.assertEqual(store.queue("thread"), [])
+        self.assertTrue(store.was_delivered("thread", "queued-background"))
+        codex.start_turn.assert_awaited_once()
+        self.assertFalse(self.app.state.shared_queue.delivery_lock("thread").locked())
 
     async def test_paused_idle_claude_new_submit_clears_pause_and_sends(self) -> None:
         submit = self.endpoint("/api/v1/codex/queue/{thread_id}/submit")

@@ -16,6 +16,15 @@ from devwisp.browser_payload import browser_event, browser_item, browser_thread,
 
 
 class BrowserPayloadTests(unittest.TestCase):
+    def test_usage_updates_reach_global_dashboard_without_exporting_extra_fields(self):
+        event = {'type': 'notification', 'method': 'usage/local/updated', 'params': {
+            'threadId': 'owned-thread', 'engine': 'claude-code', 'revision': 12,
+            'totals': {'turns': 1, 'totalTokens': 50, 'private': 'never-export'}, 'private': 'never-export',
+        }}
+        projected = browser_event(event, thread_id='another-thread', filter_thread=True)
+        self.assertEqual(projected['params'], {'threadId': 'owned-thread', 'engine': 'claude-code', 'revision': 12,
+                                               'totals': {'turns': 1, 'totalTokens': 50}})
+
     def test_async_questions_survive_history_and_live_projection(self) -> None:
         questions = [
             {"title": "希望使用哪个主题？", "options": ["像素", "旧经典"]},

@@ -1,6 +1,7 @@
+import { UsageTrendChart } from './UsageTrendChart'
 import { getUiLanguage, ui, uiFormat, uiMessage, useUiLanguage } from '../lib/uiLanguage'
-import { useEffect, useMemo, useState } from 'react'
-import { Activity, ChartColumnIncreasing, Database, DollarSign, Filter, RefreshCw, Settings2, X } from 'lucide-react'
+import { useEffect, useMemo, useState, type ReactNode } from 'react'
+import { Activity, ChartLine, Database, DollarSign, Filter, RefreshCw, Settings2, X } from 'lucide-react'
 import {
   fetchCodexProxyUsageAnalytics,
   fetchCodexProxyClientKeys,
@@ -42,7 +43,7 @@ function accountLabel(account: CPAUsageAccountStat) {
 }
 
 function timelineTokens(point: CPAUsageTimelinePoint) {
-  return point.total_tokens ?? point.tokens ?? 0
+  return point.total_tokens ?? point.tokens ?? null
 }
 
 function clientKeyLastUsed(value: string | null) {
@@ -53,24 +54,12 @@ function clientKeyLastUsed(value: string | null) {
 
 function UsageTimeline({ points }: { points: CPAUsageTimelinePoint[] }) {
   useUiLanguage()
-  const maxTokens = Math.max(1, ...points.map(timelineTokens))
-  if (!points.length) return <div className="cpa-usage-empty">{ui("所选时间段暂无趋势数据。")}</div>
-
-  return (
-    <div className="cpa-usage-timeline" role="img" aria-label={ui("Token 用量趋势图")}>
-      {points.map((point, index) => {
-        const tokens = timelineTokens(point)
-        const ratio = Math.max(tokens > 0 ? 3 : 0, (tokens / maxTokens) * 100)
-        const label = point.label || dateTimeFormatters[getUiLanguage()].format(new Date(point.bucket_ms))
-        return (
-          <div className="cpa-usage-timeline__item" key={`${point.bucket_ms}-${index}`} title={`${label}：${count(tokens)} tokens`}>
-            <div className="cpa-usage-timeline__bar-wrap"><span className="cpa-usage-timeline__bar" style={{ height: `${ratio}%` }} /></div>
-            <small>{label}</small>
-          </div>
-        )
-      })}
-    </div>
-  )
+  return <UsageTrendChart points={points.map((point, index) => ({
+    id: `${point.bucket_ms}-${index}`, time: point.bucket_ms,
+    label: dateTimeFormatters[getUiLanguage()].format(new Date(point.bucket_ms)),
+    shortLabel: point.label || dateTimeFormatters[getUiLanguage()].format(new Date(point.bucket_ms)),
+    totalTokens: timelineTokens(point), inputTokens: point.input_tokens, outputTokens: point.output_tokens,
+  }))} />
 }
 
 export function CPAUsageStatsPanel({
@@ -79,12 +68,14 @@ export function CPAUsageStatsPanel({
   onSourceChange,
   onOpenSettings,
   onClose,
+  navigation,
 }: {
   settings: CPAUsageSettings
   token: string
   onSourceChange: (source: CPAUsageSource) => void
   onOpenSettings: () => void
   onClose: () => void
+  navigation?: ReactNode
 }) {
   useUiLanguage()
   const [range, setRange] = useState<CPAUsageRange>('today')
@@ -232,6 +223,7 @@ export function CPAUsageStatsPanel({
         </div>
       </header>
       <div className="theme-settings-panel__content cpa-usage-panel__content">
+        {navigation}
         <div className="cpa-usage-range-tabs cpa-usage-source-tabs cpa-usage-panel__sources" role="group" aria-label={ui("Token 用量数据源")}>
           <button type="button" className={isCPAMP ? 'cpa-usage-range-tabs__active' : ''} aria-pressed={isCPAMP} onClick={() => onSourceChange('cpamp')}>CPA-Manager-Plus</button>
           <button type="button" className={isCodexProxy ? 'cpa-usage-range-tabs__active' : ''} aria-pressed={isCodexProxy} onClick={() => onSourceChange('codex-proxy')}>Codex Proxy</button>
@@ -301,7 +293,7 @@ export function CPAUsageStatsPanel({
                   </> : null}
                 </section>
                 <section className="theme-settings-card cpa-usage-section">
-                  <div className="theme-settings-card__heading"><div><h2><ChartColumnIncreasing size={16} />{ui("Token 趋势")}</h2><p>{ui("按小时或天汇总，时间范围使用当前设备时区。")}</p></div></div>
+                  <div className="theme-settings-card__heading"><div><h2><ChartLine size={16} />{ui("Token 趋势")}</h2><p>{ui("按小时或天汇总，时间范围使用当前设备时区。")}</p></div></div>
                   <div className="cpa-usage-section__body"><UsageTimeline points={data?.timeline ?? []} /></div>
                 </section>
                 {!isCodexProxy ? <div className={'cpa-usage-breakdown-grid' + (isNewAPI ? ' cpa-usage-breakdown-grid--single' : '')}>

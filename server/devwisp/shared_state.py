@@ -17,6 +17,7 @@ from typing import Any
 
 from .codex_app_server import CodexAppServer, CodexRuntimeError
 from .claude_code import ClaudeCodeServer, is_claude_thread_id
+from .deepseek_harness import is_deepseek_thread_id
 
 logger = logging.getLogger(__name__)
 EDIT_LEASE_SECONDS = 600
@@ -593,7 +594,10 @@ class SharedQueueService:
         send: Callable[[str, dict[str, Any], bool], Awaitable[str | None]],
         claude: ClaudeCodeServer | None = None,
         translate: Callable[[str, str, str, str, str, str | None], Awaitable[str]] | None = None,
+        *, deepseek: ClaudeCodeServer | None = None,
     ) -> None:
+        self.deepseek = deepseek
+        self.collaboration_engine = None
         self.store = store
         self.codex = codex
         self.send = send
@@ -605,6 +609,13 @@ class SharedQueueService:
         self._runner: asyncio.Task[None] | None = None
         self._listener: asyncio.Task[None] | None = None
         self._closed = False
+
+    def _local_engine(self, thread_id: str) -> ClaudeCodeServer | None:
+        if thread_id.startswith('collaboration:') and self.collaboration_engine is not None:
+            return self.collaboration_engine
+        if is_deepseek_thread_id(thread_id):
+            return self.deepseek
+        return self.claude if is_claude_thread_id(thread_id) else None
 
     def _lock(self, thread_id: str) -> asyncio.Lock:
         return self._locks.setdefault(thread_id, asyncio.Lock())
@@ -625,8 +636,8 @@ class SharedQueueService:
 
     async def delete_thread(self, thread_id: str) -> None:
         async with self._lock(thread_id):
-            if is_claude_thread_id(thread_id) and self.claude is not None:
-                await self.claude.delete_thread(thread_id)
+            if self._local_engine(thread_id) is not None:
+                await self._local_engine(thread_id).delete_thread(thread_id)
             else:
                 await self.codex.delete_thread(thread_id)
             self.store.delete_thread(thread_id)
@@ -635,19 +646,22 @@ class SharedQueueService:
     async def _read_thread(
         self, thread_id: str, *, include_turns: bool = True, tail_turns: int | None = None,
     ) -> dict[str, Any]:
-        if is_claude_thread_id(thread_id) and self.claude is not None:
+        if self._local_engine(thread_id) is not None:
             if include_turns and tail_turns == 1:
-                return await self.claude.queue_turn_snapshot(thread_id)
-            return await self.claude.read_thread(thread_id, include_turns=include_turns, tail_turns=tail_turns)
-        return await self.codex.read_thread(thread_id, include_turns=include_turns, tail_turns=tail_turns)
+                return await self._local_engine(thread_id).queue_turn_snapshot(thread_id)
+            return await self._local_engine(thread_id).read_thread(thread_id, include_turns=include_turns, tail_turns=tail_turns)
+        options: dict[str, Any] = {"include_turns": include_turns, "tail_turns": tail_turns}
+        if include_turns and tail_turns is not None:
+            options["prefer_runtime"] = True
+        return await self.codex.read_thread(thread_id, **options)
 
     async def _active_turn_id(self, thread_id: str) -> str | None:
-        if is_claude_thread_id(thread_id) and self.claude is not None:
-            return await self.claude.active_turn_id(thread_id)
+        if self._local_engine(thread_id) is not None:
+            return await self._local_engine(thread_id).active_turn_id(thread_id)
         return await self.codex._active_turn_id(thread_id)
 
     async def _resume_thread(self, thread_id: str) -> None:
-        if not (is_claude_thread_id(thread_id) and self.claude is not None):
+        if not (self._local_engine(thread_id) is not None):
             await self.codex.resume_thread(thread_id)
 
     async def _block(self, thread_id: str, reason: str | None) -> None:
@@ -659,8 +673,8 @@ class SharedQueueService:
             self.store.set_paused(thread_id, True)
             stale = False
             try:
-                if is_claude_thread_id(thread_id) and self.claude is not None:
-                    interrupted = await self.claude.interrupt(thread_id, turn_id)
+                if self._local_engine(thread_id) is not None:
+                    interrupted = await self._local_engine(thread_id).interrupt(thread_id, turn_id)
                 else:
                     try:
                         await self.codex.interrupt(thread_id, turn_id)
@@ -758,7 +772,7 @@ class SharedQueueService:
             if await self._active_turn_id(thread_id):
                 raise QueueConflictError("上一条回复仍在停止中，请稍后再继续。")
             await self._resume_thread(thread_id)
-            if is_claude_thread_id(thread_id) and self.claude is not None:
+            if self._local_engine(thread_id) is not None:
                 if not payload or not payload.get("requestText", "").strip():
                     raise QueueConflictError("Claude 续接需要提供内容。")
                 turn_id = await self.send(thread_id, payload, False)
@@ -781,8 +795,8 @@ class SharedQueueService:
         async with self._lock(thread_id):
             active_turn = await self._active_turn_id(thread_id)
             if active_turn:
-                if is_claude_thread_id(thread_id) and self.claude is not None:
-                    await self.claude.interrupt(thread_id, active_turn)
+                if self._local_engine(thread_id) is not None:
+                    await self._local_engine(thread_id).interrupt(thread_id, active_turn)
                 else:
                     await self.codex.interrupt(thread_id, active_turn)
             self.store.set_paused(thread_id, False)
@@ -837,13 +851,13 @@ class SharedQueueService:
                 if scheduled_delay is not None:
                     timeout = min(timeout, max(0.05, scheduled_delay))
                 await asyncio.wait_for(self._wake.wait(), timeout=timeout)
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 pass
 
     async def advance(self, thread_id: str) -> None:
         async with self._lock(thread_id):
             queue = self.store.queue(thread_id)
-            is_claude = is_claude_thread_id(thread_id) and self.claude is not None
+            is_claude = self._local_engine(thread_id) is not None
             if not queue or self.store.is_paused(thread_id) or queue[0].get("editing") or queue[0].get("sendAttempt") or (self.codex.handed_off and not is_claude):
                 return
             if queue[0].get("translationStatus") in {"pending", "failed"}:
@@ -857,6 +871,16 @@ class SharedQueueService:
             summary_status = summary.get("status")
             if isinstance(summary_status, dict) and summary_status.get("type") in {"active", "inProgress", "running", "started"}:
                 return
+            if not is_claude and isinstance(summary_status, dict) and summary_status.get("type") == "notLoaded":
+                # A disk snapshot cannot prove that a queued turn finished.
+                # Load it into the runtime before checking its final state.
+                await self._resume_thread(thread_id)
+                summary = await self._read_thread(thread_id, include_turns=False)
+                if await self._active_turn_id(thread_id):
+                    return
+                summary_status = summary.get("status")
+                if not isinstance(summary_status, dict) or summary_status.get("type") != "idle":
+                    return
             # Recovery of an existing queue still checks the last turn and
             # barrier; an explicit new submission may release a stopped turn.
             thread = await self._read_thread(thread_id, tail_turns=1)
@@ -891,6 +915,11 @@ class SharedQueueService:
             if await self._active_turn_id(thread_id):
                 return
             await self._block(thread_id, None)
+            if thread_id.startswith('collaboration:') and self.collaboration_engine:
+                reason = self.collaboration_engine.delivery_block_reason(thread_id, queue[0])
+                if reason:
+                    await self._block(thread_id, reason)
+                    return
             # Resume before claiming. A failed resume cannot create a delivery
             # ambiguity and leaves the item safely pending.
             if not isinstance(summary_status, dict) or summary_status.get("type") != "idle":
@@ -939,14 +968,14 @@ class SharedQueueService:
                 if scheduled is not None and scheduled > datetime.now(timezone.utc):
                     return False
                 if self.store.is_paused(thread_id):
-                    is_claude = is_claude_thread_id(thread_id) and self.claude is not None
+                    is_claude = self._local_engine(thread_id) is not None
                     if not is_claude or await self._active_turn_id(thread_id):
                         return False
                     # A stopped Claude turn is no longer active. Treat a new
                     # user prompt as an explicit fresh-send intent instead of
                     # leaving it stuck behind the previous pause marker.
                     self.store.set_paused(thread_id, False)
-                if self.codex.handed_off and not (is_claude_thread_id(thread_id) and self.claude is not None):
+                if self.codex.handed_off and not (self._local_engine(thread_id) is not None):
                     return False
                 return await self._send_now(thread_id, payload["id"], allow_steer=False, require_head=True)
             except CodexRuntimeError:
@@ -974,7 +1003,7 @@ class SharedQueueService:
 
         # Do not load a whole long conversation just to ask whether it is busy.
         # read_thread also reconciles a cached active ID against this snapshot.
-        is_claude = is_claude_thread_id(thread_id) and self.claude is not None
+        is_claude = self._local_engine(thread_id) is not None
         thread = await self._read_thread(thread_id, include_turns=False)
         status = thread.get("status")
         status_type = status.get("type") if isinstance(status, dict) else None
@@ -1008,13 +1037,20 @@ class SharedQueueService:
                 ):
                     await self._block(thread_id, "等待确认 Codex 的回复状态，暂不自动发送")
                     return False
-        if (active_turn or busy) and not allow_steer:
+        # Claude queues explicit sends while busy; Harness and group adapters
+        # retain their own steering and round-boundary checks below.
+        if (active_turn or busy) and (not allow_steer or is_claude_thread_id(thread_id)):
             return False
         if busy and not active_turn:
             await self._block(thread_id, "正在确认当前回复，暂时无法立即发送；确认后可重试")
             return False
         if not active_turn and status_type != "idle":
             await self._resume_thread(thread_id)
+        if thread_id.startswith('collaboration:') and self.collaboration_engine:
+            reason = self.collaboration_engine.delivery_block_reason(thread_id, candidate, bool(active_turn))
+            if reason:
+                await self._block(thread_id, reason)
+                return False
         payload = self.store.claim(thread_id, message_id)
         if not payload:
             raise QueueConflictError("这条排队消息正在编辑、发送或等待核对。")

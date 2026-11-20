@@ -16,9 +16,10 @@ interface TranslationSelectProps {
   disabled?: boolean
   hideLabel?: boolean
   className?: string
+  menuWidth?: number
 }
 
-export function TranslationSelect({ label, value, options, onChange, disabled = false, hideLabel = false, className = '' }: TranslationSelectProps) {
+export function TranslationSelect({ label, value, options, onChange, disabled = false, hideLabel = false, className = '', menuWidth }: TranslationSelectProps) {
   useUiLanguage()
   const labelId = useId()
   const valueId = useId()
@@ -43,7 +44,7 @@ export function TranslationSelect({ label, value, options, onChange, disabled = 
       menu.hidePopover()
       return
     }
-    const width = Math.min(rect.width, window.innerWidth - edge * 2)
+    const width = Math.min(Math.max(rect.width, menuWidth ?? rect.width), window.innerWidth - edge * 2)
     menu.style.width = `${width}px`
     menu.style.left = `${Math.max(edge, Math.min(rect.left, window.innerWidth - width - edge))}px`
     const below = window.innerHeight - rect.bottom - gap - edge
@@ -54,7 +55,7 @@ export function TranslationSelect({ label, value, options, onChange, disabled = 
     const height = Math.min(menu.scrollHeight, maxHeight)
     const top = openAbove ? rect.top - gap - height : rect.bottom + gap
     menu.style.top = `${Math.max(edge, Math.min(top, window.innerHeight - height - edge))}px`
-  }, [])
+  }, [menuWidth])
 
   useEffect(() => {
     if (!open) return
@@ -65,7 +66,7 @@ export function TranslationSelect({ label, value, options, onChange, disabled = 
       window.removeEventListener('resize', positionMenu)
       document.removeEventListener('scroll', positionMenu, true)
     }
-  }, [open, positionMenu, options.length])
+  }, [open, positionMenu, options.length, menuWidth])
 
   useEffect(() => {
     const menu = menuRef.current

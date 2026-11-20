@@ -4,6 +4,7 @@ export type SettingsSectionId =
   | 'translation'
   | 'codex-config'
   | 'claude-config'
+  | 'deepseek-config'
   | 'chat-shortcuts'
   | 'cpa-manager'
   | 'ssh-mcp'
@@ -13,7 +14,7 @@ export type SettingsSectionId =
 
 const storageKey = 'devwisp.settings-active-section.v1'
 const sections: readonly SettingsSectionId[] = [
-  'theme', 'display', 'translation', 'codex-config', 'claude-config', 'chat-shortcuts',
+  'theme', 'display', 'translation', 'codex-config', 'claude-config', 'deepseek-config', 'chat-shortcuts',
   'cpa-manager', 'ssh-mcp', 'mcp-approvals', 'system-notifications', 'about',
 ]
 

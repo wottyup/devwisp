@@ -23,7 +23,7 @@ class ClaudeExitRecoveryTests(unittest.IsolatedAsyncioTestCase):
             child_pid = workspace / "child-pid"
             cli.write_text('''#!/usr/bin/env python3
 import json, subprocess, sys
-sys.stdin.read()
+sys.stdin.readline()
 child = """import pathlib, sys, time
 stop, done, start, wrote = map(pathlib.Path, sys.argv[1:])
 deadline = time.monotonic() + 5

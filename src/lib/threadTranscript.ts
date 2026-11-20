@@ -60,7 +60,7 @@ export function createThreadTranscript(
     ? options.generatedAt.toISOString()
     : displayTime(options.generatedAt) || new Date().toISOString()
   const title = threadTitle(thread)
-  const assistantLabel = thread.engine === 'claude-code' || thread.id.startsWith('claude:') ? 'Claude Code' : 'Codex'
+  const assistantLabel = thread.engine === 'deepseek-harness' || thread.id.startsWith('deepseek:') ? 'DeepSeek Harness' : thread.engine === 'claude-code' || thread.id.startsWith('claude:') ? 'Claude Code' : 'Codex'
   const lines = [
     `# ${options.heading ?? '对话记录'}`,
     '',

@@ -24,7 +24,7 @@ type TerminalModifier = 'ctrl' | 'alt'
 
 interface TerminalDialogProps {
   token: string
-  engine: 'codex' | 'claude-code'
+  engine: 'codex' | 'claude-code' | 'deepseek-harness'
   visible: boolean
   threadId?: string
   cwd?: string
@@ -140,7 +140,7 @@ export const TerminalDialog = memo(function TerminalDialog({ token, engine, visi
   visibleRef.current = visible
   const updateVisibility = useRef<(open: boolean) => void>(() => {})
   const [status, setStatus] = useState<TerminalStatus>('connecting')
-  const [persistent, setPersistent] = useState(false)
+  const [handoffAvailable, setHandoffAvailable] = useState(false)
   const [handoffSupported, setHandoffSupported] = useState(false)
   const [handoffStatusLoaded, setHandoffStatusLoaded] = useState(false)
   const [handoffUnavailableReason, setHandoffUnavailableReason] = useState('')
@@ -722,7 +722,7 @@ export const TerminalDialog = memo(function TerminalDialog({ token, engine, visi
         else if (event.data instanceof Blob) void event.data.arrayBuffer().then((data) => writeOutput(new Uint8Array(data)))
         return
       }
-      let payload: { type?: string; cwd?: string; shell?: string; persistent?: boolean; message?: string }
+      let payload: { type?: string; cwd?: string; shell?: string; persistent?: boolean; handoffAvailable?: boolean; message?: string }
       try {
         payload = JSON.parse(event.data) as typeof payload
       } catch {
@@ -731,7 +731,7 @@ export const TerminalDialog = memo(function TerminalDialog({ token, engine, visi
       if (payload.type === 'ready') {
         ready = true
         setStatus('connected')
-        setPersistent(payload.persistent === true)
+        setHandoffAvailable(payload.handoffAvailable ?? payload.persistent === true)
         setShellName(payload.shell ?? '')
         if (payload.cwd) setWorkingDirectory(payload.cwd)
         for (const data of pendingInput.splice(0)) send({ type: 'input', data })
@@ -985,8 +985,8 @@ export const TerminalDialog = memo(function TerminalDialog({ token, engine, visi
               className={`terminal-dialog__handoff${handoffEnabled ? ' terminal-dialog__handoff--active' : ''}`}
               type="button"
               aria-pressed={handoffEnabled}
-              title={!handoffSupported ? handoffUnavailableReason : handoffEnabled ? ui('收回终端控制权，AI 将无法继续操作此终端') : ui('先手动登录 SSH，再交给 AI；随后在聊天中发送任务')}
-              disabled={handoffBusy || !handoffSupported || !handoffEnabled && (status !== 'connected' || !persistent)}
+              title={!handoffSupported ? handoffUnavailableReason : handoffEnabled ? ui('收回终端控制权，AI 将无法继续操作此终端') : ui('将当前终端交给 AI；可操作本机 Windows 或已登录的 SSH，随后在聊天中发送任务')}
+              disabled={handoffBusy || !handoffSupported || !handoffEnabled && (status !== 'connected' || !handoffAvailable)}
               onClick={() => void toggleHandoff()}
             >
               {handoffBusy ? <LoaderCircle className="spin" size={12} /> : null}

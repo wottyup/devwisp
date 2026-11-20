@@ -1,3 +1,17 @@
+import { UsersRound } from 'lucide-react'
+import type { CollaborationTask } from '../lib/devwispClient'
+import { collaborationId } from '../lib/collaborationId'
+import { isCollaborationPrompt } from '../lib/collaborationPrompt'
+import { composerMentionQuery, insertComposerMention } from '../lib/composerMentions'
+import { CollaborationPage, type CollaborationHandle } from './CollaborationPage'
+import { CollaborationComposer } from './CollaborationComposer'
+import { CollaborationModelIcons } from './CollaborationModelIcons'
+import { mergeSidebarConversations, type SidebarConversation } from '../lib/sidebarConversations.mjs'
+import { QuestionFields } from './QuestionFields'
+import { ComposerTokenUsage } from './ComposerTokenUsage'
+import { QuestionAnswerImages, useQuestionAnswerImages } from './QuestionAnswerImages'
+import { HarnessTurnDetails } from './HarnessTurnDetails'
+import { HarnessQuestionCard } from './HarnessQuestionCard'
 import { getUiLanguage, setUiLanguage, ui, uiFormat, uiMessage, useUiLanguage, type UiLanguage } from '../lib/uiLanguage'
 import { Fragment, forwardRef, lazy, memo, Suspense, useCallback, useEffect, useId, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState, type ButtonHTMLAttributes, type ChangeEvent, type ClipboardEvent, type CSSProperties, type FormEvent, type KeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type RefObject, type ReactNode, type TouchEvent as ReactTouchEvent, type WheelEvent as ReactWheelEvent } from 'react'
 import { createPortal } from 'react-dom'
@@ -34,6 +48,7 @@ import {
   Link2,
   LoaderCircle,
   LogOut,
+  Lock,
   Menu,
   Monitor,
   MessageSquarePlus,
@@ -62,11 +77,12 @@ import {
 } from 'lucide-react'
 import { threadIsRunning, useDevWisp, type CodexActivity, type CodexActivityTimelineEntry, type CodexFileChange, type CodexOperation, type DevWispController, type CodexThreadCompletion, type QueuedMessageSendMode, type QueuedTurnMessage, type SelectThreadOptions } from '../hooks/useDevWisp'
 import { useStreamingTextReveal } from '../hooks/useStreamingTextReveal'
-import { devwispClient, maxWorkspaceUploadFileSize, messagesFromThread, RemoteApiError, type ClaudeCodePermissionMode, type CodexApprovalPolicy, type CodexDocumentAttachment, type CodexImageAttachment, type CodexMessage, type CodexModel, type CodexThread, type CodexWorkspaceEntry, type CodexWorkspaceFile, type CodexWorkspaceImage, type CodexWorkspaceTree, type MCPApprovalGrant, type QueuedTranslationConfig } from '../lib/devwispClient'
+import { deepSeekAgentPresets, type DeepSeekAgentPreset, deepSeekPermissionModes, type DeepSeekPermissionMode, devwispClient, maxWorkspaceUploadFileSize, messagesFromThread, RemoteApiError, type ClaudeCodePermissionMode, type CodexApprovalPolicy, type CodexDocumentAttachment, type CodexImageAttachment, type CodexMessage, type CodexModel, type CodexThread, type CodexWorkspaceEntry, type CodexWorkspaceFile, type CodexWorkspaceImage, type CodexWorkspaceTree, type MCPApprovalGrant, type QueuedTranslationConfig } from '../lib/devwispClient'
 import { copyTextAndImagesToClipboard, copyTextToClipboard, recoverCopiedMessageTextFromImagePaste, richMessageContentFromClipboardHtml } from '../lib/clipboard'
 import { isRunnableScriptPath } from '../lib/terminalPathCommand'
 import { forgetOpenTerminalThread, isOpenTerminalThread, rememberOpenTerminalThread } from '../lib/terminalScreenMemory'
 import { clipboardTableToMarkdown } from '../lib/clipboardTable'
+import { MessageTable } from './MessageTable'
 import { parseMarkdownTableBlock } from '../lib/markdownTableParser.mjs'
 import { splitMessageInlineLinks } from '../lib/messageInlineLinks'
 import { assistantChoiceStartIndex, formatAssistantChoiceReply, parseAssistantChoiceContent, type MessageChoiceGroup } from '../lib/messageChoices'
@@ -94,7 +110,7 @@ import type { WorkspaceSearchMatch } from '../lib/devwispClient'
 import { ChatOverlayPanel } from './ChatOverlayPanel'
 import { SshMcpSettingsCard } from './SshMcpSettingsCard'
 import { CPAUsageSettingsCard } from './CPAUsageSettingsCard'
-import { CPAUsageStatsPanel } from './CPAUsageStatsPanel'
+import { UsageStatsPanel } from './UsageStatsPanel'
 import { TerminalRecoveryBoundary } from './TerminalRecoveryBoundary'
 import { ImagePreviewButton } from './ImagePreviewButton'
 import { PastedTablePreview } from './PastedTablePreview'
@@ -105,10 +121,24 @@ import { readCPAUsageSettings, saveCPAUsageSettings, type CPAUsageSettings } fro
 import { containsChinese, containsEnglish, readTranslationPreferences, readTranslationPreferencesIfAvailable, saveTranslationPreferences, selectedTranslationProfileId, translationPreferencesStorageKey, type TranslationPreferences } from '../lib/translationPreferences'
 import { TranslationSettingsCard } from './TranslationSettingsCard'
 import { TranslationSelect } from './TranslationSelect'
+import { DeepSeekSettings } from './DeepSeekSettings'
 import { NativeEngineConfigCard } from './NativeEngineConfigCard'
 
 interface Props {
   token: string
+  visible?: boolean
+  collaborationTasks?: CollaborationTask[]
+  collaboration?: {
+    visible: boolean
+    selectedId: string | null
+    listError: string
+    onSelect: (id: string | null) => void
+    onRefresh: () => Promise<void>
+    onDissolved: (id: string) => void
+    onOpenChat: (thread?: CodexThread) => void
+  }
+  memberRequest?: { thread: CodexThread; sequence: number } | null
+  onOpenCollaboration?: (id?: string | null) => void
   onUnauthorized: () => void
   onUnpair: () => void | Promise<void>
   themePreferences: ThemePreferences
@@ -133,6 +163,8 @@ const connectionLabel = {
 
 let replyBreathSyncFrame: number | null = null
 const pendingReplyBreathAnimations = new WeakSet<Animation>()
+let replyBreathVisibilityObserver: IntersectionObserver | null = null
+const observedReplyBreathRows = new Set<HTMLElement>()
 
 function replyBreathAnimation(element: Element | null): Animation | null {
   const matchesReplyBreath = (animation: Animation) => ['composer-fill-breathe', 'thread-row-reply-breathe'].includes((animation as CSSAnimation).animationName)
@@ -158,7 +190,7 @@ function syncReplyBreatheWhenReady(animation: Animation) {
 
 function syncReplyBreathe() {
   replyBreathSyncFrame = null
-  const rows = Array.from(document.querySelectorAll<HTMLElement>('.thread-row--replying'))
+  const rows = Array.from(document.querySelectorAll<HTMLElement>('.thread-row--replying:not([data-reply-breath-offscreen])'))
   const rowAnimations = rows.map(replyBreathAnimation).filter((animation): animation is Animation => animation !== null)
   const borderAnimation = paneBorderBreathAnimation()
   const syncedAnimations = borderAnimation ? [...rowAnimations, borderAnimation] : rowAnimations
@@ -191,7 +223,33 @@ function scheduleReplyBreatheSync() {
 }
 
 function syncReplyBreatheOnMount(element: HTMLElement | null) {
-  if (element) scheduleReplyBreatheSync()
+  if (!element) return
+  scheduleReplyBreatheSync()
+  if (!element.matches('.thread-row--replying') || typeof IntersectionObserver === 'undefined') return
+  if (!replyBreathVisibilityObserver) {
+    // A single observer also respects clipping by the list and mobile drawers.
+    replyBreathVisibilityObserver = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        entry.target.toggleAttribute('data-reply-breath-offscreen', !entry.isIntersecting)
+        if (entry.isIntersecting) scheduleReplyBreatheSync()
+      }
+    })
+  }
+  const observer = replyBreathVisibilityObserver
+  element.setAttribute('data-reply-breath-offscreen', '')
+  observedReplyBreathRows.add(element)
+  observer.observe(element)
+  // React 19 calls ref cleanup both when a row disappears and when it stops
+  // replying, without rebuilding observers for every streamed text update.
+  return () => {
+    observer.unobserve(element)
+    observedReplyBreathRows.delete(element)
+    element.removeAttribute('data-reply-breath-offscreen')
+    if (observedReplyBreathRows.size === 0) {
+      observer.disconnect()
+      replyBreathVisibilityObserver = null
+    }
+  }
 }
 
 const TerminalDialog = lazy(() => import('./TerminalDialog').then(({ TerminalDialog: component }) => ({ default: component })))
@@ -201,9 +259,13 @@ function openSettingsSelectMenu() {
   return document.querySelector<HTMLElement>('.theme-settings-panel .translation-select__menu:popover-open')
 }
 
-type ChatEngine = 'codex' | 'claude-code'
+type ChatEngine = 'codex' | 'claude-code' | 'deepseek-harness'
 type ChoiceReplyDelivery = 'sent' | 'queued' | 'unverified'
 type ComposerHeightMemory = Partial<Record<ChatEngine, { height: number; manuallyResized: boolean }>>
+
+function engineLabel(engine: ChatEngine) {
+  return engine === 'deepseek-harness' ? 'DeepSeek Harness' : engine === 'claude-code' ? 'Claude Code' : 'Codex'
+}
 
 function EngineBrandIcon({ engine, size = 16 }: { engine: ChatEngine; size?: number }) {
   return <span className={`engine-brand-icon engine-brand-icon--${engine}`} style={{ width: size, height: size }} aria-hidden="true" />
@@ -460,6 +522,8 @@ function openPanelHistoryEntry(panel: PanelHistoryEntry) {
 interface ComposerPreferences {
   model?: string
   effort?: string
+  deepseekAgentPreset?: DeepSeekAgentPreset
+  deepseekPermissionMode?: DeepSeekPermissionMode
   approvalPolicy?: CodexApprovalPolicy
   claudeModel?: string
   claudeEffort?: string
@@ -647,6 +711,8 @@ function composerPreferencesFrom(value: unknown): ComposerPreferences {
   const preferences: ComposerPreferences = {}
   if (typeof parsed.model === 'string' && parsed.model) preferences.model = parsed.model
   if (typeof parsed.effort === 'string' && parsed.effort) preferences.effort = parsed.effort
+  if (deepSeekAgentPresets.includes(parsed.deepseekAgentPreset as DeepSeekAgentPreset)) preferences.deepseekAgentPreset = parsed.deepseekAgentPreset as DeepSeekAgentPreset
+  if (deepSeekPermissionModes.includes(parsed.deepseekPermissionMode as DeepSeekPermissionMode)) preferences.deepseekPermissionMode = parsed.deepseekPermissionMode as DeepSeekPermissionMode
   const approvalPolicy = approvalPolicyOf(parsed.approvalPolicy)
   if (approvalPolicy) preferences.approvalPolicy = approvalPolicy
   if (typeof parsed.claudeModel === 'string' && parsed.claudeModel) preferences.claudeModel = parsed.claudeModel
@@ -665,6 +731,8 @@ function resolvedComposerPreferences(defaults: ComposerPreferences, threadPrefer
     model: threadPreferences?.model ?? defaults.model,
     effort: threadPreferences?.effort ?? defaults.effort,
     approvalPolicy: threadPreferences?.approvalPolicy ?? defaults.approvalPolicy,
+    deepseekAgentPreset: threadPreferences?.deepseekAgentPreset ?? defaults.deepseekAgentPreset,
+    deepseekPermissionMode: threadPreferences?.deepseekPermissionMode ?? defaults.deepseekPermissionMode,
     claudeModel: threadPreferences?.claudeModel ?? defaults.claudeModel,
     claudeEffort: threadPreferences?.claudeEffort ?? defaults.claudeEffort,
     claudePermissionMode: threadPreferences?.claudePermissionMode ?? defaults.claudePermissionMode,
@@ -839,6 +907,14 @@ function isImageAttachmentFile(file: Pick<File, 'name' | 'type'>) {
   return file.type.startsWith('image/') || imageMediaTypeFor(file) !== null
 }
 
+const deepseekPermissionOptions: Array<{ value: DeepSeekPermissionMode; label: string }> = [
+  { value: 'read-only', label: '只读（可申请写入）' },
+  { value: 'workspace-write', label: '工作区写入（可申请越界）' },
+  { value: 'full-access-ask', label: '完整访问（保留审批）' },
+  { value: 'danger-full-access', label: '完全访问（不询问）' },
+  { value: 'plan', label: '计划模式（审核后执行）' },
+]
+
 const approvalPolicyOptions: Array<{ value: CodexApprovalPolicy; label: string }> = [
   { value: 'on-request', get label() { return ui('请求批准') } },
   { value: 'untrusted', get label() { return ui('帮我批准') } },
@@ -974,6 +1050,7 @@ function scheduledTimeLabel(value?: string) {
 interface ComposerMenuOption {
   value: string
   label: string
+  description?: string
 }
 
 interface ModelReasoningOptions {
@@ -1054,6 +1131,10 @@ function ComposerMenu({
   footer,
   temporary = false,
   compact = false,
+  compactTypography = false,
+  valuePrefix = '',
+  hint,
+  locked = false,
   mobileSettingsOwner,
   portalTheme,
   portalThemeStyle,
@@ -1069,6 +1150,10 @@ function ComposerMenu({
   footer?: ReactNode
   temporary?: boolean
   compact?: boolean
+  compactTypography?: boolean
+  valuePrefix?: string
+  hint?: string
+  locked?: boolean
   mobileSettingsOwner?: string
   portalTheme: AppTheme
   portalThemeStyle: CSSProperties
@@ -1099,13 +1184,14 @@ function ComposerMenu({
   }, [onOpenChange, open])
 
   return (
-    <div className={`composer-menu${open ? ' composer-menu--open' : ''}`} ref={root}>
+    <div className={`composer-menu${open ? ' composer-menu--open' : ''}`} ref={root} title={hint}>
       <button
         className="composer-menu__trigger"
         type="button"
         disabled={disabled}
         aria-label={uiFormat("{0}，当前值：{1}{2}", label, selected?.label ?? emptyLabel, temporary ? ui('，仅本次') : '')}
-        title={`${selected?.label ?? emptyLabel}${temporary ? ui(' · 本次') : ''}`}
+        aria-description={hint}
+        title={hint ?? `${selected?.label ?? emptyLabel}${temporary ? ui(' · 本次') : ''}`}
         aria-haspopup="listbox"
         aria-expanded={open}
         onPointerDown={(event) => {
@@ -1119,13 +1205,14 @@ function ComposerMenu({
         }}
         onClick={() => onOpenChange(!open)}
       >
-        <span className="composer-menu__value">{selected?.label ?? emptyLabel}{temporary ? ui(' · 本次') : ''}</span>
+        {locked ? <Lock size={11} aria-hidden="true" /> : null}
+        <span className="composer-menu__value">{valuePrefix}{selected?.label ?? emptyLabel}{temporary ? ui(' · 本次') : ''}</span>
       </button>
       {open ? createPortal(
         <div className={`composer-portal-theme remote-shell--theme-${portalTheme}`} style={{ ...portalThemeStyle, display: 'contents' }}>
           <div
             ref={popover}
-            className={`composer-menu__popover composer-menu__popover--floating${compact ? ' composer-menu__popover--compact' : ''}`}
+            className={`composer-menu__popover composer-menu__popover--floating${compact ? ' composer-menu__popover--compact' : ''}${compactTypography ? ' composer-menu__popover--compact-typography' : ''}`}
             data-mobile-settings-owner={mobileSettingsOwner}
             style={position ?? { visibility: 'hidden' }}
           >
@@ -1155,6 +1242,7 @@ function ComposerMenu({
                 >
                   <span className="composer-menu__option-copy">
                     <strong>{option.label}</strong>
+                    {option.description ? <small>{option.description}</small> : null}
                   </span>
                   {option.value === value ? <Check size={14} aria-hidden="true" /> : null}
                 </button>
@@ -1170,7 +1258,7 @@ function ComposerMenu({
 
 type RemoteConnection = keyof typeof connectionLabel
 
-interface ComposerSendInput {
+export interface ComposerSendInput {
   prompt: string
   originalText?: string
   translation?: QueuedTranslationConfig
@@ -1182,6 +1270,8 @@ interface ComposerSendInput {
   documents?: CodexDocumentAttachment[]
   model?: string
   effort?: string
+  deepseekAgentPreset?: DeepSeekAgentPreset
+  deepseekPermissionMode?: DeepSeekPermissionMode
   approvalPolicy?: CodexApprovalPolicy
   claudeModel?: string
   claudeEffort?: string
@@ -1192,10 +1282,10 @@ interface ComposerSendInput {
 type QueuedMessageEditPreferences = Pick<ComposerSendInput, 'model' | 'effort' | 'claudeModel' | 'claudeEffort'>
 type QueuedMessageEditInput = Pick<ComposerSendInput, 'prompt' | 'originalText' | 'translation' | 'translationStatus' | 'translationError' | 'images' | 'documents' | 'model' | 'effort' | 'claudeModel' | 'claudeEffort'>
 
-interface ComposerHandle {
+export interface ComposerHandle {
   focusInput(): void
   replaceDraft(value: string): void
-  appendReplyDraft(value: string): boolean
+  appendReplyDraft(value: string, images?: CodexImageAttachment[]): boolean
   appendDraft(value: string, focus?: boolean): void
   insertDraftAtCursor(value: string, focus?: boolean): void
   addDocumentAttachment(document: CodexDocumentAttachment, focus?: boolean): boolean
@@ -1204,8 +1294,10 @@ interface ComposerHandle {
   cancelQueuedEdit(): boolean
 }
 
-interface MessageComposerProps {
+export interface MessageComposerProps {
+  mentionSuggestions?: string[]
   token: string
+  threadId?: string
   translation: TranslationPreferences
   translationRevision: number
   portalTheme: AppTheme
@@ -1221,12 +1313,18 @@ interface MessageComposerProps {
   fileChangeSummaryKey: string | null
   reserveFileChangeSummarySpace: boolean
   stableQueueHeight: boolean
+  composerEngine: ChatEngine
   showCodexPreferences: boolean
   isInterrupting: boolean
   writerConflict: boolean
+  managedTask?: boolean
   modelSupportsImages: boolean
   selectedModel: string
   selectedEffort: string
+  selectedDeepseekAgentPreset: DeepSeekAgentPreset
+  deepseekAgentPresetLocked: boolean
+  deepseekAgentPresetsAvailable: boolean
+  selectedDeepseekPermissionMode: DeepSeekPermissionMode
   selectedApprovalPolicy: CodexApprovalPolicy
   selectedClaudePermissionMode: ClaudeCodePermissionMode
   temporaryPreferences: boolean
@@ -1240,6 +1338,8 @@ interface MessageComposerProps {
   claudePermissionModeOptions: ComposerMenuOption[]
   onModelChange: (model: string) => void
   onEffortChange: (effort: string) => void
+  onDeepseekAgentPresetChange: (preset: DeepSeekAgentPreset) => void
+  onDeepseekPermissionModeChange: (mode: DeepSeekPermissionMode) => void
   onApprovalPolicyChange: (approvalPolicy: CodexApprovalPolicy) => void
   onClaudePermissionModeChange: (mode: ClaudeCodePermissionMode) => void
   approvalPolicyUpdating?: boolean
@@ -1265,6 +1365,7 @@ interface MessageComposerProps {
 
 const MessageComposer = memo(forwardRef<ComposerHandle, MessageComposerProps>(function MessageComposer({
   token,
+  threadId,
   translation,
   translationRevision,
   portalTheme,
@@ -1280,13 +1381,19 @@ const MessageComposer = memo(forwardRef<ComposerHandle, MessageComposerProps>(fu
   fileChangeSummaryKey,
   reserveFileChangeSummarySpace,
   stableQueueHeight,
+  composerEngine,
   showCodexPreferences,
   isInterrupting,
   writerConflict,
+  managedTask = false,
   modelSupportsImages,
   selectedModel,
   selectedEffort,
   selectedApprovalPolicy,
+  selectedDeepseekAgentPreset,
+  deepseekAgentPresetLocked,
+  deepseekAgentPresetsAvailable,
+  selectedDeepseekPermissionMode,
   selectedClaudePermissionMode,
   temporaryPreferences,
   onTemporaryPreferencesChange,
@@ -1300,6 +1407,8 @@ const MessageComposer = memo(forwardRef<ComposerHandle, MessageComposerProps>(fu
   onModelChange,
   onEffortChange,
   onApprovalPolicyChange,
+  onDeepseekAgentPresetChange,
+  onDeepseekPermissionModeChange,
   onClaudePermissionModeChange,
   approvalPolicyUpdating = false,
   onUploadPdf,
@@ -1320,13 +1429,20 @@ const MessageComposer = memo(forwardRef<ComposerHandle, MessageComposerProps>(fu
   onCreateThread,
   createThreadDisabled,
   createThreadTitle,
+  mentionSuggestions,
 }, ref) {
   useUiLanguage()
-  const composerEngine: ChatEngine = showCodexPreferences ? 'codex' : 'claude-code'
   const activeTranslation = readTranslationPreferencesIfAvailable() ?? translation
   const translationProfileId = selectedTranslationProfileId(activeTranslation)
   const savedComposerHeight = composerHeightMemory.current?.[composerEngine]
   const [draft, setDraft] = useState(() => readComposerDraft(draftScope))
+  const [mentionCaret, setMentionCaret] = useState<number | null>(null)
+  const [mentionIndex, setMentionIndex] = useState(0)
+  const mentionSelection = useRef<number | null>(null)
+  const mentionListId = useId()
+  const mentionQuery = mentionSuggestions && mentionCaret !== null ? composerMentionQuery(draft, mentionCaret, mentionSuggestions) : null
+  const mentionOptions = mentionQuery ? mentionSuggestions!.filter((name) => name.toLocaleLowerCase().startsWith(mentionQuery.query)) : []
+  const selectedMentionIndex = Math.min(mentionIndex, Math.max(0, mentionOptions.length - 1))
   const [translationPreview, setTranslationPreview] = useState<{ key: string; text?: string; error?: string; loading: boolean } | null>(null)
   const [sending, setSending] = useState(false)
   const sendingRef = useRef(false)
@@ -1352,7 +1468,7 @@ const MessageComposer = memo(forwardRef<ComposerHandle, MessageComposerProps>(fu
   const movingQueuedRef = useRef(false)
   const [editingQueuedMessageId, setEditingQueuedMessageId] = useState<string | null>(null)
   const [editingQueuedPreferences, setEditingQueuedPreferences] = useState<QueuedMessageEditPreferences | null>(null)
-  const [openMenu, setOpenMenu] = useState<'model' | 'effort' | 'approval' | null>(null)
+  const [openMenu, setOpenMenu] = useState<'model' | 'effort' | 'approval' | 'agent' | null>(null)
   const [mobileSettingsExpanded, setMobileSettingsExpanded] = useState(false)
   const mobileSettingsExpandedRef = useRef(false)
   const mobileSettingsRoot = useRef<HTMLDivElement>(null)
@@ -1377,7 +1493,7 @@ const MessageComposer = memo(forwardRef<ComposerHandle, MessageComposerProps>(fu
   const attachedDocumentsRef = useRef(attachedDocuments)
   attachedDocumentsRef.current = attachedDocuments
   const editingQueuedMessageIdRef = useRef<string | null>(null)
-  const openMenuRef = useRef<'model' | 'effort' | 'approval' | null>(null)
+  const openMenuRef = useRef<'model' | 'effort' | 'approval' | 'agent' | null>(null)
   const composerEngineRef = useRef(composerEngine)
   const draftSaveTimer = useRef<number | undefined>(undefined)
   const tableDraftSaveTimer = useRef<number | undefined>(undefined)
@@ -1486,7 +1602,7 @@ const MessageComposer = memo(forwardRef<ComposerHandle, MessageComposerProps>(fu
     return () => window.removeEventListener('resize', measureComposerHeight)
   }, [compactLandscape, draft, attachedDocuments.length, attachedImages.length])
 
-  const changeOpenMenu = useCallback((next: 'model' | 'effort' | 'approval' | null) => {
+  const changeOpenMenu = useCallback((next: 'model' | 'effort' | 'approval' | 'agent' | null) => {
     openMenuRef.current = next
     setOpenMenu(next)
   }, [])
@@ -1668,6 +1784,14 @@ const MessageComposer = memo(forwardRef<ComposerHandle, MessageComposerProps>(fu
   useLayoutEffect(() => onDraftChange(draft), [draft, onDraftChange])
 
   useLayoutEffect(() => {
+    const caret = mentionSelection.current
+    if (caret === null) return
+    mentionSelection.current = null
+    composer.current?.focus({ preventScroll: true })
+    composer.current?.setSelectionRange(caret, caret)
+  }, [draft])
+
+  useLayoutEffect(() => {
     if (focusRestoreAttempted.current) return
     focusRestoreAttempted.current = true
 
@@ -1724,12 +1848,15 @@ const MessageComposer = memo(forwardRef<ComposerHandle, MessageComposerProps>(fu
       updateDraft(value)
       window.requestAnimationFrame(() => composer.current?.focus({ preventScroll: true }))
     },
-    appendReplyDraft(value) {
+    appendReplyDraft(value, images = []) {
       if (editingQueuedMessageIdRef.current || sendingRef.current) return false
+      if (attachedImagesRef.current.length + images.length > maxImagesPerTurn) return false
+      if ([...attachedImagesRef.current, ...images].reduce((sum, image) => sum + Math.ceil(image.data.length * 3 / 4), 0) > 24 * 1024 * 1024) return false
       const current = draftRef.current
       const separator = current.trim() ? current.endsWith('\n') ? '\n' : '\n\n' : ''
       const next = `${current}${separator}${value}`
       updateDraft(next)
+      if (images.length) updateAttachedImages([...attachedImagesRef.current, ...images])
       window.requestAnimationFrame(() => {
         const textarea = composer.current
         if (!textarea) return
@@ -1911,7 +2038,7 @@ const MessageComposer = memo(forwardRef<ComposerHandle, MessageComposerProps>(fu
     }
   }, [])
 
-  const canCompose = !sending && !writerConflict && connection === 'connected'
+  const canCompose = !managedTask && !sending && !writerConflict && connection === 'connected'
   const canConfigure = canCompose
   const canSend = (draft.trim().length > 0 || attachedDocuments.length > 0 || attachedImages.length > 0)
     && !readingDocuments
@@ -1919,8 +2046,8 @@ const MessageComposer = memo(forwardRef<ComposerHandle, MessageComposerProps>(fu
     && imagesReady
     && (editingQueuedMessageId ? !sending : canCompose)
   const canAttachFiles = (editingQueuedMessageId ? !sending : canCompose) && !readingDocuments && !readingImages
-  const stopWithSendButton = isRunning && canInterrupt && !writerConflict && !editingQueuedMessageId
-  const continueWithSendButton = continuationPending && !isRunning && !writerConflict && !editingQueuedMessageId
+  const stopWithSendButton = !managedTask && isRunning && canInterrupt && !writerConflict && !editingQueuedMessageId
+  const continueWithSendButton = !managedTask && continuationPending && !isRunning && !writerConflict && !editingQueuedMessageId
   const temporaryPreferencesToggle = (
     <button className="composer-menu__option composer-menu__temporary" type="button" role="switch"
       aria-checked={temporaryPreferences} disabled={!canConfigure}
@@ -2223,6 +2350,8 @@ const MessageComposer = memo(forwardRef<ComposerHandle, MessageComposerProps>(fu
         documents: previousDocuments,
         model: showCodexPreferences ? selectedModel || undefined : undefined,
         effort: showCodexPreferences ? selectedEffort || undefined : undefined,
+        deepseekAgentPreset: composerEngine === 'deepseek-harness' ? selectedDeepseekAgentPreset : undefined,
+        deepseekPermissionMode: composerEngine === 'deepseek-harness' ? selectedDeepseekPermissionMode : undefined,
         approvalPolicy: showCodexPreferences ? selectedApprovalPolicy : undefined,
         claudeModel: !showCodexPreferences && selectedModel !== 'default' ? selectedModel : undefined,
         claudeEffort: !showCodexPreferences && selectedEffort !== 'default' ? selectedEffort : undefined,
@@ -2439,6 +2568,16 @@ const MessageComposer = memo(forwardRef<ComposerHandle, MessageComposerProps>(fu
   }
 
   function handleInputKey(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if (mentionOptions.length && !inputIsComposing.current && !event.nativeEvent.isComposing && event.nativeEvent.keyCode !== 229
+        && !event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey) {
+      if (['ArrowDown', 'ArrowUp', 'Enter', 'Tab', 'Escape'].includes(event.key)) {
+        event.preventDefault(); event.stopPropagation()
+        if (event.key === 'Escape') setMentionCaret(null)
+        else if (event.key === 'Enter' || event.key === 'Tab') chooseMention(mentionOptions[selectedMentionIndex])
+        else setMentionIndex((selectedMentionIndex + (event.key === 'ArrowDown' ? 1 : -1) + mentionOptions.length) % mentionOptions.length)
+        return
+      }
+    }
     const action = composerKeyAction(event.nativeEvent, inputIsComposing.current)
     if (!action) return
     if (action !== 'send') {
@@ -2450,6 +2589,13 @@ const MessageComposer = memo(forwardRef<ComposerHandle, MessageComposerProps>(fu
     if (!canSend) return
     event.preventDefault()
     event.currentTarget.form?.requestSubmit()
+  }
+
+  function chooseMention(name: string) {
+    if (!mentionQuery) return
+    const next = insertComposerMention(draftRef.current, mentionQuery, name)
+    mentionSelection.current = next.caret
+    updateDraft(next.text); setMentionCaret(null); setMentionIndex(0)
   }
 
   function handleQueueKeyboardShortcut(event: KeyboardEvent<HTMLFormElement>) {
@@ -2582,10 +2728,25 @@ const MessageComposer = memo(forwardRef<ComposerHandle, MessageComposerProps>(fu
     return true
   }
 
+  const agentOptions = [
+    { value: 'standard', label: 'Standard', description: ui('标准开发工具、技能与工作流') },
+    { value: 'ptc', label: 'PTC', description: ui('通过代码编排工具调用') },
+    { value: 'minimal', label: 'Minimal', description: ui('精简工具与原生终端') },
+    { value: 'cordis', label: 'Creator', description: ui('Cordis 插件开发与运行时检查') },
+    ...(selectedDeepseekAgentPreset === 'legacy' ? [{ value: 'legacy', label: ui('旧版 SDK') }] : []),
+  ]
   const preferenceMenus = showCodexPreferences ? <>
+    {composerEngine === 'deepseek-harness' ? <ComposerMenu label="Agent" value={selectedDeepseekAgentPreset}
+      options={agentOptions} emptyLabel="Standard" valuePrefix="Agent · " locked={deepseekAgentPresetLocked}
+      hint={ui(!deepseekAgentPresetsAvailable ? '后端更新后可选择 Agent 模式' : deepseekAgentPresetLocked ? '此对话的 Agent 模式已锁定，请新建对话后切换。' : '首次发送后锁定 Agent 模式')}
+      disabled={!canConfigure || !deepseekAgentPresetsAvailable || deepseekAgentPresetLocked || Boolean(editingQueuedMessageId)}
+      open={openMenu === 'agent'} onOpenChange={(open) => changeOpenMenu(open ? 'agent' : null)}
+      onChange={(value) => onDeepseekAgentPresetChange(value as DeepSeekAgentPreset)} compact compactTypography
+      mobileSettingsOwner={mobileLayout && mobileSettingsExpanded ? mobileSettingsOwner : undefined}
+      portalTheme={portalTheme} portalThemeStyle={portalThemeStyle} /> : null}
     <ComposerMenu label={ui("模型")} value={composerSelectedModel} options={modelOptions} emptyLabel={ui("读取模型…")} disabled={!canConfigure || modelOptions.length === 0} open={openMenu === 'model'} onOpenChange={(open) => changeOpenMenu(open ? 'model' : null)} onChange={selectComposerModel} footer={editingQueuedMessageId ? undefined : temporaryPreferencesToggle} temporary={temporaryPreferences && !editingQueuedMessageId} compact mobileSettingsOwner={mobileLayout && mobileSettingsExpanded ? mobileSettingsOwner : undefined} portalTheme={portalTheme} portalThemeStyle={portalThemeStyle} />
     <ComposerMenu label={ui("思考")} value={composerSelectedEffort} options={composerReasoningOptions} emptyLabel="default" disabled={!canConfigure || composerReasoningOptions.length === 0} open={openMenu === 'effort'} onOpenChange={(open) => changeOpenMenu(open ? 'effort' : null)} onChange={changeComposerEffort} footer={editingQueuedMessageId ? undefined : temporaryPreferencesToggle} temporary={temporaryPreferences && !editingQueuedMessageId} compact mobileSettingsOwner={mobileLayout && mobileSettingsExpanded ? mobileSettingsOwner : undefined} portalTheme={portalTheme} portalThemeStyle={portalThemeStyle} />
-    <ComposerMenu label={approvalPolicyUpdating ? ui('授权更新中') : ui('授权')} value={selectedApprovalPolicy} options={authorizationOptions} emptyLabel={ui("请求批准")} disabled={!canCompose || Boolean(editingQueuedMessageId) || approvalPolicyUpdating} open={openMenu === 'approval'} onOpenChange={(open) => changeOpenMenu(open ? 'approval' : null)} onChange={(approvalPolicy) => onApprovalPolicyChange(approvalPolicy as CodexApprovalPolicy)} mobileSettingsOwner={mobileLayout && mobileSettingsExpanded ? mobileSettingsOwner : undefined} portalTheme={portalTheme} portalThemeStyle={portalThemeStyle} />
+    <ComposerMenu label={approvalPolicyUpdating ? ui('授权更新中') : ui('授权')} value={composerEngine === 'deepseek-harness' ? selectedDeepseekPermissionMode : selectedApprovalPolicy} options={authorizationOptions} emptyLabel={ui("请求批准")} disabled={!canCompose || Boolean(editingQueuedMessageId) || approvalPolicyUpdating} open={openMenu === 'approval'} onOpenChange={(open) => changeOpenMenu(open ? 'approval' : null)} onChange={(value) => composerEngine === 'deepseek-harness' ? onDeepseekPermissionModeChange(value as DeepSeekPermissionMode) : onApprovalPolicyChange(value as CodexApprovalPolicy)} mobileSettingsOwner={mobileLayout && mobileSettingsExpanded ? mobileSettingsOwner : undefined} portalTheme={portalTheme} portalThemeStyle={portalThemeStyle} />
   </> : <>
     <ComposerMenu label={ui("Claude 模型")} value={composerSelectedModel} options={claudeModelOptions} emptyLabel={ui("本机默认模型")} disabled={!canConfigure} open={openMenu === 'model'} onOpenChange={(open) => changeOpenMenu(open ? 'model' : null)} onChange={selectComposerModel} footer={editingQueuedMessageId ? undefined : temporaryPreferencesToggle} temporary={temporaryPreferences && !editingQueuedMessageId} compact mobileSettingsOwner={mobileLayout && mobileSettingsExpanded ? mobileSettingsOwner : undefined} portalTheme={portalTheme} portalThemeStyle={portalThemeStyle} />
     <ComposerMenu label={ui("思考等级")} value={composerSelectedEffort} options={composerReasoningOptions} emptyLabel="default" disabled={!canConfigure || composerReasoningOptions.length === 0} open={openMenu === 'effort'} onOpenChange={(open) => changeOpenMenu(open ? 'effort' : null)} onChange={changeComposerEffort} footer={editingQueuedMessageId ? undefined : temporaryPreferencesToggle} temporary={temporaryPreferences && !editingQueuedMessageId} compact mobileSettingsOwner={mobileLayout && mobileSettingsExpanded ? mobileSettingsOwner : undefined} portalTheme={portalTheme} portalThemeStyle={portalThemeStyle} />
@@ -2708,7 +2869,7 @@ const MessageComposer = memo(forwardRef<ComposerHandle, MessageComposerProps>(fu
             onClick={() => setQueuedMessagesExpanded((expanded) => !expanded)}
           >
             <span>{submittingQueuedMessageId ? ui('待处理') : ui('已排队')} {queuedMessages.length} {ui("条")}</span>
-            {queuedMessagesExpanded ? <small>{editingQueuedMessageId || queuedMessages[0]?.editing ? ui('编辑期间暂停 · 结束后继续队列') : sendingQueuedId ? ui('正在发送排队消息') : queuedMessages[0]?.sendAttempt ? ui('有消息送达待核对') : submittingQueuedMessageId ? ui('正在确认送达') : uiMessage(queuedMessages[0]?.blockedReason ?? (isRunning ? showCodexPreferences ? ui('回复结束后依次发送；点“插队”沿用当前轮次设置立即发送') : ui('普通消息回复后发送；点“插队”提交到当前 Claude 会话，回复结束后处理') : ui('等待电脑端自动发送')))}</small> : null}
+            {queuedMessagesExpanded ? <small>{editingQueuedMessageId || queuedMessages[0]?.editing ? ui('编辑期间暂停 · 结束后继续队列') : sendingQueuedId ? ui('正在发送排队消息') : queuedMessages[0]?.sendAttempt ? ui('有消息送达待核对') : submittingQueuedMessageId ? ui('正在确认送达') : uiMessage(queuedMessages[0]?.blockedReason ?? (isRunning ? composerEngine === 'deepseek-harness' ? ui('回复结束后依次发送；Ctrl+Enter 追加到当前任务') : showCodexPreferences ? ui('回复结束后依次发送；点“插队”沿用当前轮次设置立即发送') : ui('普通消息回复后发送；点“插队”提交到当前 Claude 会话，回复结束后处理') : ui('等待电脑端自动发送')))}</small> : null}
             <ChevronDown size={14} aria-hidden="true" />
           </button>
           <div id="composer-queue-list" className="composer-queue__list" hidden={!queuedMessagesExpanded}>
@@ -2735,6 +2896,7 @@ const MessageComposer = memo(forwardRef<ComposerHandle, MessageComposerProps>(fu
                 : translationFailed ? `翻译失败：${message.translationError ?? '请重试翻译。'}`
                   : isSubmitting ? '消息正在提交，请稍候'
                 : deliveryUnverified ? '请先核对这条消息是否已发送'
+                  : sendMode === 'steer' && composerEngine === 'deepseek-harness' ? '追加到当前 DeepSeek 任务，下一步处理'
                   : sendMode === 'steer' && !showCodexPreferences ? '提交到当前 Claude 会话，当前回复结束后处理'
                     : sendMode === 'steer' ? '立即插入当前 Codex 回复，沿用当前轮次的模型和思考等级'
                       : index > 0 ? '优先按这条消息保存的模型和思考等级开始新一轮，其余消息留在队列中'
@@ -2783,34 +2945,48 @@ const MessageComposer = memo(forwardRef<ComposerHandle, MessageComposerProps>(fu
             ? <p className="composer-translation-preview__error">{uiMessage(translationPreview.error)}</p>
             : <p>{ui("正在翻译最新内容…")}</p>}
       </div> : null}
+      {mentionOptions.length > 0 && <div className="composer-mentions" id={mentionListId} role="listbox" aria-label={ui('选择回复成员')}>
+        {mentionOptions.map((name, index) => <button type="button" role="option" key={name} id={`${mentionListId}-${index}`} aria-selected={selectedMentionIndex === index}
+          onPointerDown={(event) => event.preventDefault()} onClick={() => chooseMention(name)}>@{name}</button>)}
+      </div>}
       <div className="composer-editor" style={{ height: `${composerHeight}px` }}>
         <button className="composer-resize" type="button" onPointerDown={startComposerResize} aria-label={ui("调整输入框高度")} title={ui("上下拖动调整输入框高度")}><ChevronsUpDown size={14} /></button>
         <textarea
           ref={composer}
           data-chat-composer
+          disabled={managedTask}
           value={draft}
-          onChange={(event) => updateDraft(event.target.value)}
+          onChange={(event) => { updateDraft(event.target.value); setMentionCaret(event.target.selectionStart); setMentionIndex(0) }}
+          onSelect={(event) => {
+            const caret = event.currentTarget.selectionStart
+            setMentionCaret((current) => current === null ? null : caret)
+          }}
           onCompositionStart={() => { inputIsComposing.current = true }}
           onCompositionEnd={() => { inputIsComposing.current = false }}
-          onBlur={() => { inputIsComposing.current = false }}
+          onBlur={() => { inputIsComposing.current = false; setMentionCaret(null) }}
           onKeyDownCapture={(event) => {
             if (inputIsComposing.current && event.key === 'Escape') event.stopPropagation()
           }}
           onKeyDown={handleInputKey}
           onPaste={handlePaste}
           onFocus={requestComposerKeyboard}
+          role={mentionSuggestions ? 'combobox' : undefined}
+          aria-autocomplete={mentionSuggestions ? 'list' : undefined}
+          aria-expanded={mentionSuggestions ? mentionOptions.length > 0 : undefined}
+          aria-controls={mentionOptions.length ? mentionListId : undefined}
+          aria-activedescendant={mentionOptions.length ? `${mentionListId}-${selectedMentionIndex}` : undefined}
           onPointerDown={(event) => {
             if (document.activeElement === event.currentTarget) {
               requestComposerKeyboard()
             }
           }}
-          placeholder={editingQueuedMessageId ? ui('编辑排队消息…') : uiFormat("给{0}发送消息…", showCodexPreferences ? ' Codex' : ' Claude Code')}
-          aria-label={editingQueuedMessageId ? ui('编辑排队消息') : uiFormat("发送消息给{0}", showCodexPreferences ? ' Codex' : ' Claude Code')}
+          placeholder={managedTask ? ui('请在协同中发送消息') : editingQueuedMessageId ? ui('编辑排队消息…') : mentionSuggestions ? ui('发送到群聊，开头 @ 可指定回复成员…') : uiFormat("给{0}发送消息…", ` ${engineLabel(composerEngine)}`)}
+          aria-label={editingQueuedMessageId ? ui('编辑排队消息') : uiFormat("发送消息给{0}", ` ${engineLabel(composerEngine)}`)}
           aria-keyshortcuts={[
             stableQueueHeight ? 'Control+ArrowLeft Control+ArrowRight' : '',
             editingQueuedMessageId ? '' : 'Control+Enter',
           ].filter(Boolean).join(' ') || undefined}
-          title={`${editingQueuedMessageId ? ui('Enter 确认编辑；请先结束编辑再使用 Ctrl+Enter') : showCodexPreferences ? ui('Ctrl+Enter 立即发送；回复时插队') : ui('Ctrl+Enter 提交到当前 Claude 会话；当前回复结束后处理')}${stableQueueHeight ? ui('；Ctrl+←/→ 切换并发窗口') : ''}`}
+          title={`${editingQueuedMessageId ? ui('Enter 确认编辑；请先结束编辑再使用 Ctrl+Enter') : composerEngine === 'deepseek-harness' ? ui('回复结束后依次发送；Ctrl+Enter 追加到当前任务') : showCodexPreferences ? ui('Ctrl+Enter 立即发送；回复时插队') : ui('Ctrl+Enter 提交到当前 Claude 会话；当前回复结束后处理')}${stableQueueHeight ? ui('；Ctrl+←/→ 切换并发窗口') : ''}`}
           inputMode="text"
           enterKeyHint="send"
         />
@@ -2853,7 +3029,7 @@ const MessageComposer = memo(forwardRef<ComposerHandle, MessageComposerProps>(fu
               onClick={stopWithSendButton ? onInterrupt : continueWithSendButton ? onContinue : undefined}
               disabled={stopWithSendButton ? isInterrupting : continueWithSendButton ? !canContinue : !canSend}
               aria-label={stopWithSendButton ? (isInterrupting ? ui('正在中断回复') : showCodexPreferences ? ui('暂时中断回复，之后可继续') : ui('停止回复')) : continueWithSendButton ? (canContinue ? ui('继续刚才中断的任务') : ui('当前无法继续，请稍后重试')) : editingQueuedMessageId ? ui('确定编辑消息') : isRunning ? ui('将消息加入发送队列') : ui('发送消息')}
-              title={stopWithSendButton ? (isInterrupting ? ui('正在中断回复') : showCodexPreferences ? ui('暂时中断回复，之后可继续') : ui('停止回复')) : continueWithSendButton ? (canContinue ? ui('继续刚才中断的任务（新一轮）') : ui('当前无法继续，请稍后重试')) : editingQueuedMessageId ? ui('确定编辑消息') : isRunning ? showCodexPreferences ? ui('加入发送队列；Ctrl+Enter 插队') : ui('加入发送队列；Ctrl+Enter 提交到当前 Claude 会话') : ui('发送消息；Ctrl+Enter 立即发送')}
+              title={stopWithSendButton ? (isInterrupting ? ui('正在中断回复') : showCodexPreferences ? ui('暂时中断回复，之后可继续') : ui('停止回复')) : continueWithSendButton ? (canContinue ? ui('继续刚才中断的任务（新一轮）') : ui('当前无法继续，请稍后重试')) : editingQueuedMessageId ? ui('确定编辑消息') : isRunning ? composerEngine === 'deepseek-harness' ? ui('回复结束后依次发送；Ctrl+Enter 追加到当前任务') : showCodexPreferences ? ui('加入发送队列；Ctrl+Enter 插队') : ui('加入发送队列；Ctrl+Enter 提交到当前 Claude 会话') : ui('发送消息；Ctrl+Enter 立即发送')}
             >
               {sending || (!imagesReady && !stopWithSendButton) || (stopWithSendButton && isInterrupting)
                 ? <LoaderCircle className="spin" size={16} />
@@ -2877,6 +3053,7 @@ const MessageComposer = memo(forwardRef<ComposerHandle, MessageComposerProps>(fu
         document.body,
       ) : null}
       </form>
+      <ComposerTokenUsage token={token} threadId={threadId} engine={composerEngine} isRunning={isReplying} />
     </div>
   )
 }))
@@ -3102,6 +3279,7 @@ const WorkspaceExplorer = memo(function WorkspaceExplorer({ token, eyebrow = '�
   const pendingPreviewScopeReset = useRef(false)
   const restoreMobilePanelAfterPreview = useRef(false)
   const treeElement = useRef<HTMLDivElement>(null)
+  const treeScrollIdleTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const viewStateCache = useRef(new Map<string, WorkspaceExplorerViewState>())
   const pendingScrollRestore = useRef<number | null>(null)
   const browsingRoot = manualRoot || cwd
@@ -3118,6 +3296,55 @@ const WorkspaceExplorer = memo(function WorkspaceExplorer({ token, eyebrow = '�
   useEffect(() => {
     if (!manualRoot) setRootInput(cwd ?? '')
   }, [cwd, manualRoot])
+
+  const measureTreeGroups = useCallback(() => {
+    const tree = treeElement.current
+    if (!tree || !tree.getClientRects().length || !CSS.supports('content-visibility', 'auto')) return
+    const groups = Array.from(tree.querySelectorAll<HTMLElement>('.workspace-explorer__row-group'))
+    // Measure natural heights in one batch. Guessed heights shift scroll positions in
+    // themes with different fonts, and one auto-visibility boundary per file is costly.
+    for (const group of groups) group.removeAttribute('data-measured')
+    const heights = groups.map((group) => group.getBoundingClientRect().height)
+    groups.forEach((group, index) => {
+      group.style.setProperty('--workspace-tree-group-height', `${heights[index]}px`)
+      group.setAttribute('data-measured', '')
+    })
+  }, [])
+
+  const treeDraftLayout = theme === 'retro' && isMobileLayout() ? draft : ''
+  useLayoutEffect(() => {
+    measureTreeGroups()
+  }, [directories, expanded, loadingPaths, themePreferences, mobileOpen, workspaceSearchMode, treeDraftLayout, measureTreeGroups])
+
+  useEffect(() => {
+    const tree = treeElement.current
+    if (!tree) return
+    let frame = 0
+    let previousWidth = tree.clientWidth
+    const scheduleMeasurement = () => {
+      if (frame) return
+      frame = requestAnimationFrame(() => {
+        frame = 0
+        measureTreeGroups()
+      })
+    }
+    const observer = new ResizeObserver(() => {
+      const width = tree.clientWidth
+      if (width === previousWidth) return
+      previousWidth = width
+      scheduleMeasurement()
+    })
+    observer.observe(tree)
+    window.addEventListener('resize', scheduleMeasurement)
+    document.fonts.addEventListener('loadingdone', scheduleMeasurement)
+    return () => {
+      observer.disconnect()
+      window.removeEventListener('resize', scheduleMeasurement)
+      document.fonts.removeEventListener('loadingdone', scheduleMeasurement)
+      if (frame) cancelAnimationFrame(frame)
+      if (treeScrollIdleTimer.current !== null) clearTimeout(treeScrollIdleTimer.current)
+    }
+  }, [measureTreeGroups])
 
   const directoryKey = (path: string) => path || '.'
   const rememberViewState = useCallback((key: string, state: WorkspaceExplorerViewState) => {
@@ -3890,7 +4117,13 @@ const WorkspaceExplorer = memo(function WorkspaceExplorer({ token, eyebrow = '�
         </button>,
       )
     }
-    return rows
+    // Group siblings within each directory so expanding a folder preserves the
+    // DOM and keyboard focus of the other directories' entries.
+    const groups: ReactNode[] = []
+    for (let offset = 0; offset < rows.length; offset += 16) {
+      groups.push(<div className="workspace-explorer__row-group" key={`${directoryKey(path)}:${offset}`}>{rows.slice(offset, offset + 16)}</div>)
+    }
+    return groups
   }
 
   const rootLoading = loadingPaths['.']
@@ -3971,11 +4204,6 @@ const WorkspaceExplorer = memo(function WorkspaceExplorer({ token, eyebrow = '�
   const contextMenuCanDelete = Boolean(contextMenu && !contextMenu.root && contextMenu.paths.length > 0)
   const contextMenuHasQuickActions = contextMenuCanBind || contextMenuCanOpenTerminal || contextMenuCanRunInTerminal || contextMenuMissingDraftPaths.length > 0
   const contextMenuHasFileActions = contextMenuCanRename || contextMenuCanCopy || contextMenuCanCut || contextMenuCanDownload || contextMenuCanPaste || contextMenuCanUpload
-  let contextMenuShortcut = 0
-  const nextContextMenuShortcut = () => {
-    contextMenuShortcut += 1
-    return contextMenuShortcut === 10 ? 0 : contextMenuShortcut
-  }
   const uploadPercent = uploadProgress
     ? uploadProgress.size > 0
       ? Math.min(100, Math.floor(uploadProgress.loaded / uploadProgress.size * 100))
@@ -3991,7 +4219,7 @@ const WorkspaceExplorer = memo(function WorkspaceExplorer({ token, eyebrow = '�
       }} onTransitionEnd={(event) => { if (event.target === event.currentTarget && event.propertyName === 'transform' && !mobileDragging) event.currentTarget.style.removeProperty('--workspace-drag-offset') }}>
         <input ref={uploadInput} className="workspace-explorer__upload-input" type="file" multiple onChange={handleWorkspaceUploadSelection} aria-label={ui("选择要上传到工作区的本机文件")} />
         <header className="workspace-explorer__header">
-          <div><span className="workspace-explorer__eyebrow">{ui(eyebrow)}</span><strong>{ui("文件")}</strong></div>
+          <div className="workspace-explorer__header-title"><span className="workspace-explorer__eyebrow">{ui(eyebrow)}</span><strong>{ui("文件")}</strong></div>
           <div className="workspace-explorer__header-actions">
             <button className="icon-button" type="button" disabled={!browsingRoot || workspaceReplacing} onClick={() => setWorkspaceSearchMode((current) => current === 'find' ? null : 'find')} aria-label={ui('在目录中查找')} title={ui('在目录中查找（Ctrl/⌘+Shift+F）')} aria-pressed={workspaceSearchMode === 'find'}><Search size={15} /></button>
             <button className="icon-button" type="button" disabled={!browsingRoot || workspaceReplacing} onClick={() => setWorkspaceSearchMode((current) => current === 'replace' ? null : 'replace')} aria-label={ui('在目录中替换')} title={ui('在目录中替换（Ctrl/⌘+Shift+H）')} aria-pressed={workspaceSearchMode === 'replace'}><ReplaceAll size={15} /></button>
@@ -4045,6 +4273,15 @@ const WorkspaceExplorer = memo(function WorkspaceExplorer({ token, eyebrow = '�
             onContextMenu={handleRootContextMenu}
             onPaste={handleWorkspacePaste}
             onScroll={(event) => {
+              const tree = event.currentTarget
+              // Keep native pointer input active while avoiding a new hover paint
+              // for every row passing beneath a stationary mouse during scrolling.
+              tree.setAttribute('data-scrolling', '')
+              if (treeScrollIdleTimer.current !== null) clearTimeout(treeScrollIdleTimer.current)
+              treeScrollIdleTimer.current = setTimeout(() => {
+                tree.removeAttribute('data-scrolling')
+                treeScrollIdleTimer.current = null
+              }, 150)
               rememberViewState(scopeKey, {
                 ...currentViewState.current,
                 scrollTop: event.currentTarget.scrollTop,
@@ -4181,24 +4418,24 @@ const WorkspaceExplorer = memo(function WorkspaceExplorer({ token, eyebrow = '�
           <div className="workspace-file-context-menu__name" title={contextMenu.entry.path}>{contextMenu.entry.name}{contextMenu.paths.length > 1 ? uiFormat(" · 已选 {0} 项", contextMenu.paths.length) : ''}</div>
           {contextMenuHasQuickActions ? <div className="workspace-file-context-menu__group workspace-file-context-menu__group--primary">
             <span className="workspace-file-context-menu__group-label">{ui("快捷操作")}</span>
-            {contextMenuCanBind ? <ShortcutContextMenuButton shortcut={nextContextMenuShortcut()} disabled={!canBindThreadWorkspace} onClick={() => void bindDirectoryToCurrentThread()}><FolderOpen size={14} />{ui("绑定当前聊天到此目录")}</ShortcutContextMenuButton> : null}
-            {contextMenuCanOpenTerminal ? <ShortcutContextMenuButton shortcut={nextContextMenuShortcut()} onClick={() => { const path = workspaceAbsolutePath(browsingRoot, contextMenu.entry.path); setContextMenu(null); onAddToTerminal(path) }}><TerminalIcon size={14} />{ui("添加到终端")}</ShortcutContextMenuButton> : null}
-            {contextMenuCanRunInTerminal ? <ShortcutContextMenuButton shortcut={nextContextMenuShortcut()} onClick={() => { const path = workspaceAbsolutePath(browsingRoot, contextMenu.entry.path); setContextMenu(null); onRunInTerminal(path) }}><Play size={14} />{ui("终端运行")}</ShortcutContextMenuButton> : null}
-            {contextMenuMissingDraftPaths.length > 0 ? <ShortcutContextMenuButton shortcut={nextContextMenuShortcut()} onClick={() => { setContextMenu(null); onInsertPath(contextMenuMissingDraftPaths.join('\n'), !mobileOpen) }}><EngineBrandIcon engine={engine} size={14} />{ui("加入输入框")}</ShortcutContextMenuButton> : null}
+            {contextMenuCanBind ? <ShortcutContextMenuButton shortcut={1} disabled={!canBindThreadWorkspace} onClick={() => void bindDirectoryToCurrentThread()}><FolderOpen size={14} />{ui("绑定当前聊天到此目录")}</ShortcutContextMenuButton> : null}
+            {contextMenuCanOpenTerminal ? <ShortcutContextMenuButton shortcut={2} onClick={() => { const path = workspaceAbsolutePath(browsingRoot, contextMenu.entry.path); setContextMenu(null); onAddToTerminal(path) }}><TerminalIcon size={14} />{ui("添加到终端")}</ShortcutContextMenuButton> : null}
+            {contextMenuCanRunInTerminal ? <ShortcutContextMenuButton shortcut={2} onClick={() => { const path = workspaceAbsolutePath(browsingRoot, contextMenu.entry.path); setContextMenu(null); onRunInTerminal(path) }}><Play size={14} />{ui("终端运行")}</ShortcutContextMenuButton> : null}
+            {contextMenuMissingDraftPaths.length > 0 ? <ShortcutContextMenuButton shortcut={3} onClick={() => { setContextMenu(null); onInsertPath(contextMenuMissingDraftPaths.join('\n'), !mobileOpen) }}><EngineBrandIcon engine={engine} size={14} />{ui("加入输入框")}</ShortcutContextMenuButton> : null}
           </div> : null}
           {contextMenuCanCreate ? <div className="workspace-file-context-menu__group workspace-file-context-menu__group--create">
             <span className="workspace-file-context-menu__group-label">{ui("新建")}</span>
-            <ShortcutContextMenuButton shortcut={nextContextMenuShortcut()} onClick={() => startWorkspaceCreate('file')}><FilePlus2 size={14} />{ui("新建文件")}</ShortcutContextMenuButton>
-            <ShortcutContextMenuButton shortcut={nextContextMenuShortcut()} onClick={() => startWorkspaceCreate('directory')}><FolderPlus size={14} />{ui("新建文件夹")}</ShortcutContextMenuButton>
+            <ShortcutContextMenuButton shortcut={4} onClick={() => startWorkspaceCreate('file')}><FilePlus2 size={14} />{ui("新建文件")}</ShortcutContextMenuButton>
+            <ShortcutContextMenuButton shortcut={5} onClick={() => startWorkspaceCreate('directory')}><FolderPlus size={14} />{ui("新建文件夹")}</ShortcutContextMenuButton>
           </div> : null}
           {contextMenuHasFileActions ? <div className="workspace-file-context-menu__group workspace-file-context-menu__group--manage">
             <span className="workspace-file-context-menu__group-label">{ui("文件操作")}</span>
-            {contextMenuCanRename ? <ShortcutContextMenuButton shortcut={nextContextMenuShortcut()} onClick={startWorkspaceRename}><Pencil size={14} />{ui("重命名")}</ShortcutContextMenuButton> : null}
-            {contextMenuCanCopy ? <ShortcutContextMenuButton shortcut={nextContextMenuShortcut()} onClick={() => rememberWorkspaceEntries('copy')}><Copy size={14} />{ui("复制")}{contextMenu.paths.length > 1 ? uiFormat(" {0} 项", contextMenu.paths.length) : ''}</ShortcutContextMenuButton> : null}
-            {contextMenuCanCut ? <ShortcutContextMenuButton shortcut={nextContextMenuShortcut()} onClick={() => rememberWorkspaceEntries('move')}><Scissors size={14} />{ui("剪切")}{contextMenu.paths.length > 1 ? uiFormat(" {0} 项", contextMenu.paths.length) : ''}</ShortcutContextMenuButton> : null}
-            {contextMenuCanDownload ? <ShortcutContextMenuButton shortcut={nextContextMenuShortcut()} onClick={() => void downloadWorkspaceFile()}><Download size={14} />{ui("文件下载")}</ShortcutContextMenuButton> : null}
-            {contextMenuCanPaste ? <ShortcutContextMenuButton shortcut={nextContextMenuShortcut()} onClick={() => void pasteWorkspaceEntries()}><ClipboardPaste size={14} />{ui("粘贴到此处")}</ShortcutContextMenuButton> : null}
-            {contextMenuCanUpload ? <ShortcutContextMenuButton shortcut={nextContextMenuShortcut()} disabled={Boolean(uploadProgress)} onClick={() => chooseWorkspaceUpload(contextMenu.entry.path)}><Upload size={14} />{ui("上传文件")}</ShortcutContextMenuButton> : null}
+            {contextMenuCanRename ? <ShortcutContextMenuButton shortcut={6} onClick={startWorkspaceRename}><Pencil size={14} />{ui("重命名")}</ShortcutContextMenuButton> : null}
+            {contextMenuCanCopy ? <ShortcutContextMenuButton shortcut={7} onClick={() => rememberWorkspaceEntries('copy')}><Copy size={14} />{ui("复制")}{contextMenu.paths.length > 1 ? uiFormat(" {0} 项", contextMenu.paths.length) : ''}</ShortcutContextMenuButton> : null}
+            {contextMenuCanCut ? <ShortcutContextMenuButton shortcut={8} onClick={() => rememberWorkspaceEntries('move')}><Scissors size={14} />{ui("剪切")}{contextMenu.paths.length > 1 ? uiFormat(" {0} 项", contextMenu.paths.length) : ''}</ShortcutContextMenuButton> : null}
+            {contextMenuCanDownload ? <ShortcutContextMenuButton shortcut={9} onClick={() => void downloadWorkspaceFile()}><Download size={14} />{ui("文件下载")}</ShortcutContextMenuButton> : null}
+            {contextMenuCanPaste ? <ShortcutContextMenuButton shortcut={0} onClick={() => void pasteWorkspaceEntries()}><ClipboardPaste size={14} />{ui("粘贴到此处")}</ShortcutContextMenuButton> : null}
+            {contextMenuCanUpload ? <ShortcutContextMenuButton shortcut={9} disabled={Boolean(uploadProgress)} onClick={() => chooseWorkspaceUpload(contextMenu.entry.path)}><Upload size={14} />{ui("上传文件")}</ShortcutContextMenuButton> : null}
           </div> : null}
           {contextMenuCanDelete ? <ShortcutContextMenuButton shortcut="Del" className="thread-context-menu__danger workspace-file-context-menu__delete" onClick={startWorkspaceDelete}><Trash2 size={14} />{ui("删除")}{contextMenu.paths.length > 1 ? uiFormat(" {0} 项", contextMenu.paths.length) : ''}</ShortcutContextMenuButton> : null}
         </div>,
@@ -4299,8 +4536,9 @@ interface RemoteChatPaneProps {
   onCreateThread: () => void
   claudeCodeAvailable: boolean | null
   claudeModelOptions: ComposerMenuOption[]
-  onSwitchEngine: (engine: 'codex' | 'claude-code') => Promise<unknown>
+  onSwitchEngine: (engine: 'codex' | 'claude-code' | 'deepseek-harness') => Promise<unknown>
   onOpenSidebar: () => void
+  managedTask?: boolean
   onOpenWorkspace: () => void
   onOpenWorkspaceFile: (path: string, cwd?: string, diff?: string) => void
   onOpenWorkspaceImage: (path: string, cwd?: string, viewedByCodexThreadId?: string) => void
@@ -4343,6 +4581,7 @@ const RemoteChatPane = memo(function RemoteChatPane({
   claudeModelOptions,
   onSwitchEngine,
   onOpenSidebar,
+  managedTask,
   onOpenWorkspace,
   onOpenWorkspaceFile,
   onOpenWorkspaceImage,
@@ -4441,12 +4680,12 @@ const RemoteChatPane = memo(function RemoteChatPane({
   useLayoutEffect(() => {
     choiceReplyTarget.current = remote
   }, [remote])
-  const fillChoiceReply = useCallback((reply: string) => {
+  const fillChoiceReply = useCallback((reply: string, images: CodexImageAttachment[] = []) => {
     const currentComposer = composerHandle.current
     if (!active || !currentComposer) return false
-    return currentComposer.appendReplyDraft(reply)
+    return currentComposer.appendReplyDraft(reply, images)
   }, [active, composerHandle])
-  const sendChoiceReply = useCallback(async (reply: string): Promise<ChoiceReplyDelivery | false> => {
+  const sendChoiceReply = useCallback(async (reply: string, images: CodexImageAttachment[] = []): Promise<ChoiceReplyDelivery | false> => {
     const target = choiceReplyTarget.current
     if (!active || !target.activeThread) return false
     let prompt = reply
@@ -4466,7 +4705,7 @@ const RemoteChatPane = memo(function RemoteChatPane({
     const accepted = await target.sendMessage({
       prompt,
       ...(prompt !== reply ? { originalText: reply } : {}),
-      images: [],
+      images,
       documents: [],
       sendImmediately: true,
       onDeliveryStatus: (status) => { delivery = status },
@@ -4597,11 +4836,16 @@ const RemoteChatPane = memo(function RemoteChatPane({
     // Layout changes can also move scrollTop; only recent input may pause following.
     upwardMessageScrollIntentUntil.current = window.performance.now() + 750
   }, [])
-  const pauseFollowOnOriginalToggle = useCallback(() => {
-    // Expanding/collapsing the translated original inside a message changes the
-    // stream height; without pausing following the resize observer would yank
-    // the view back to the bottom and blink the just-opened text away.
+  const pauseFollowOnDetailsToggle = useCallback(() => {
+    // Pause before native details change height, including a pending initial
+    // bottom placement, so ResizeObserver cannot move the reader's viewport.
     followMessageStream.current = false
+    forceMessageStreamBottomFor.current = null
+    forceMessageStreamBottomVersion.current += 1
+    if (forceMessageStreamBottomTimer.current !== undefined) window.clearTimeout(forceMessageStreamBottomTimer.current)
+    if (scrollAnimationFrame.current !== undefined) window.cancelAnimationFrame(scrollAnimationFrame.current)
+    forceMessageStreamBottomTimer.current = undefined
+    scrollAnimationFrame.current = undefined
     upwardMessageScrollIntentUntil.current = window.performance.now() + 750
     setShowScrollToBottom(true)
   }, [])
@@ -4824,19 +5068,13 @@ const RemoteChatPane = memo(function RemoteChatPane({
   const currentConnectionLabel = remote.handedOff
     ? ui('已交还给本机')
     : connectionLabel[remote.connection]
-  const activeEngineLabel = remote.activeEngine === 'claude-code' ? 'Claude Code' : 'Codex'
+  const activeEngineLabel = engineLabel(remote.activeEngine)
   const assistantModelOptions = useMemo<ComposerMenuOption[]>(() => remote.activeEngine === 'claude-code'
     ? claudeModelOptions
     : remote.models.flatMap((model) => {
       const id = modelIdOf(model)
       return id ? [{ value: id, label: modelLabelOf(model) }] : []
     }), [remote.activeEngine, remote.models, claudeModelOptions])
-  const targetEngine = remote.activeEngine === 'claude-code' ? 'codex' : 'claude-code'
-  const targetEngineLabel = targetEngine === 'claude-code' ? 'Claude Code' : 'Codex'
-  const claudeCodeUnavailable = targetEngine === 'claude-code' && claudeCodeAvailable === false
-  const engineSwitchLabel = claudeCodeUnavailable
-    ? ui('Claude Code 不可用')
-    : uiFormat('切换到 {0} 聊天', targetEngineLabel)
   let streamingAssistant: CodexMessage | undefined
   for (let index = remote.messages.length - 1; index >= 0; index -= 1) {
     const message = remote.messages[index]
@@ -4883,7 +5121,7 @@ const RemoteChatPane = memo(function RemoteChatPane({
     window.requestAnimationFrame(() => composerHandle.current?.focusInput())
   }
   return (
-    <main className={`remote-chat conversation-pane${remote.activeEngine === 'claude-code' ? ' remote-chat--claude' : ''}${active ? ' conversation-pane--selected' : ''}${active && showActiveFrame ? ' conversation-pane--active' : ''}${isPaneReplying ? ' conversation-pane--replying' : ''}`} onPointerDown={handlePanePointerDown} onClick={handlePaneClick}>
+    <main className={`remote-chat conversation-pane${remote.activeEngine === 'claude-code' ? ' remote-chat--claude' : remote.activeEngine === 'deepseek-harness' ? ' remote-chat--deepseek' : ''}${active ? ' conversation-pane--selected' : ''}${active && showActiveFrame ? ' conversation-pane--active' : ''}${isPaneReplying ? ' conversation-pane--replying' : ''}`} onPointerDown={handlePanePointerDown} onClick={handlePaneClick}>
       {showActiveFrame ? <span className="conversation-pane__breath" data-pane-border-breath-layer aria-hidden="true" ref={active && isPaneReplying ? syncReplyBreatheOnMount : undefined} onAnimationStart={(event) => { if (event.animationName === 'pane-border-breathe') scheduleReplyBreatheSync() }} /> : null}
       <header className="remote-chat__header">
         <div className="remote-chat__title-wrap">
@@ -4891,25 +5129,20 @@ const RemoteChatPane = memo(function RemoteChatPane({
           <div className="remote-chat__title"><strong>{activeTitle}</strong><span title={remote.activeThread?.cwd || remote.runtime.workspace}>{remote.activeThread?.cwd || remote.runtime.workspace || ui('本机项目')}</span></div>
         </div>
         <div className="remote-chat__controls">
-          <button
-            className="icon-button engine-switch-button"
-            type="button"
-            aria-label={engineSwitchLabel}
-            title={engineSwitchLabel}
-            disabled={claudeCodeUnavailable || engineSwitching}
-            onClick={async (event) => {
-              event.stopPropagation()
-              if (claudeCodeUnavailable || engineSwitching) return
-              setEngineSwitching(true)
-              try {
-                await onSwitchEngine(targetEngine)
-              } finally {
-                setEngineSwitching(false)
-              }
-            }}
-          >
-            <EngineBrandIcon engine={targetEngine} />
-          </button>
+          <div className="chat-engine-switcher" role="group" aria-label={ui('聊天模式')}>
+            {(['codex', 'claude-code', 'deepseek-harness'] as const).map((engine) => <button
+              key={engine} className="icon-button engine-switch-button" type="button"
+              aria-label={uiFormat('切换到 {0} 聊天', engineLabel(engine))}
+              title={uiFormat('切换到 {0} 聊天', engineLabel(engine))}
+              aria-pressed={remote.activeEngine === engine}
+              disabled={engineSwitching || engine === 'claude-code' && claudeCodeAvailable === false}
+              onClick={async (event) => {
+                event.stopPropagation()
+                if (remote.activeEngine === engine) return
+                setEngineSwitching(true)
+                try { await onSwitchEngine(engine) } finally { setEngineSwitching(false) }
+              }}><EngineBrandIcon engine={engine} /></button>)}
+          </div>
           <button
             className={`icon-button terminal-open-button${terminalVisible ? ' terminal-open-button--active' : ''}`}
             type="button"
@@ -4959,7 +5192,7 @@ const RemoteChatPane = memo(function RemoteChatPane({
           {remote.handedOff ? <div className="handoff-notice" role="status"><strong>{ui("已交还给本机 Codex")}</strong><span>{ui("网页端已停止持有会话，也不会自动重新连接。请在本机 Codex 中继续；需要回到网页时再点“重新接管”。")}</span></div> : null}
           {remote.messages.length === 0 && !remote.loadingHistory ? (
             <div className="welcome-state">
-              <WelcomeTypingTitle text={remote.activeEngine === 'claude-code' ? '与 Claude Code 完成一个伟大项目' : '与 Codex 完成一个伟大项目'} />
+              <WelcomeTypingTitle text={uiFormat('与 {0} 完成一个伟大项目', activeEngineLabel)} />
             </div>
           ) : null}
           {remote.loadingHistory && remote.messages.length === 0 ? <div className="loading-state"><LoaderCircle className="spin" size={18} />{ui("正在加载对话…")}</div> : null}
@@ -5003,8 +5236,8 @@ const RemoteChatPane = memo(function RemoteChatPane({
                   onCopy={onCopy}
                   onResend={resendUserMessage}
                   resendingMessageId={resendingMessageId}
-                  canResend={active && Boolean(activeThreadId)}
-                  onOpenOriginal={pauseFollowOnOriginalToggle}
+                  canResend={active && Boolean(activeThreadId) && !managedTask}
+                  onToggleDetails={pauseFollowOnDetailsToggle}
                   onOpenFile={openChangedFilePreview}
                   onOpenImage={openViewedImagePreview}
                 />
@@ -5012,7 +5245,10 @@ const RemoteChatPane = memo(function RemoteChatPane({
               </Fragment>
             )
           })}
-          {!remote.loadingHistory && (remote.isRunning || remote.runningTurnId !== null || hasStreamingAssistant) ? (
+          {remote.deepseekQuestions.map((request) => <div className="message-question-slot" key={request.questionId} hidden={request.threadId !== activeThreadId}>
+            <HarnessQuestionCard token={token} request={request} onRespond={remote.respondToDeepseekQuestion} />
+          </div>)}
+          {!remote.loadingHistory && !remote.deepseekQuestion && (remote.isRunning || remote.runningTurnId !== null || hasStreamingAssistant) ? (
             <div className="running-indicator" role="status" aria-live="polite">
               <div className="running-indicator__row">
                 <OperationActivityLine className={`running-indicator__activity${remote.activeEngine === 'claude-code' && !currentRunningOperation && (!remote.activity || remote.activity.label === '正在思考') ? ' running-indicator__activity--claude-thinking' : ''}`} operation={currentRunningOperation} activity={remote.activity} iconSize={15} />
@@ -5020,8 +5256,8 @@ const RemoteChatPane = memo(function RemoteChatPane({
               </div>
               {!hasStreamingAssistant && runningOperations.length > 0 ? (
                 runningOperationTimeline.length > 0
-                  ? <ActivityTimelineContent text="" timeline={runningOperationTimeline} operations={runningOperations} fileChanges={remote.runningTurnId ? remote.fileChangesByTurn[remote.runningTurnId] ?? emptyFileChanges : emptyFileChanges} onOpenFile={openChangedFilePreview} onOpenImage={openViewedImagePreview} />
-                  : <OperationLog operations={runningOperations} fileChanges={remote.runningTurnId ? remote.fileChangesByTurn[remote.runningTurnId] ?? emptyFileChanges : emptyFileChanges} onOpenFile={openChangedFilePreview} onOpenImage={openViewedImagePreview} />
+                  ? <ActivityTimelineContent text="" timeline={runningOperationTimeline} operations={runningOperations} fileChanges={remote.runningTurnId ? remote.fileChangesByTurn[remote.runningTurnId] ?? emptyFileChanges : emptyFileChanges} onToggleDetails={pauseFollowOnDetailsToggle} onOpenFile={openChangedFilePreview} onOpenImage={openViewedImagePreview} />
+                  : <OperationLog operations={runningOperations} fileChanges={remote.runningTurnId ? remote.fileChangesByTurn[remote.runningTurnId] ?? emptyFileChanges : emptyFileChanges} onToggleDetails={pauseFollowOnDetailsToggle} onOpenFile={openChangedFilePreview} onOpenImage={openViewedImagePreview} />
               ) : null}
             </div>
           ) : null}
@@ -5044,6 +5280,7 @@ const RemoteChatPane = memo(function RemoteChatPane({
         }}
       >
         <ServerRequestCard
+          token={token}
           key={`${remote.approval.method}:${remote.approval.requestId}`}
           request={remote.approval}
           source={approvalSource}
@@ -5118,8 +5355,21 @@ const RemoteChatPane = memo(function RemoteChatPane({
   )
 })
 
-export function DevWispPage({ token, onUnauthorized, onUnpair, themePreferences, onThemePreferencesChange: setThemePreferences }: Props) {
+export function DevWispPage({ token, visible = true, collaborationTasks = [], collaboration, memberRequest, onOpenCollaboration, onUnauthorized, onUnpair, themePreferences, onThemePreferencesChange: setThemePreferences }: Props) {
   useUiLanguage()
+  const collaborationMode = collaboration?.visible ?? false
+  const selectedCollaboration = collaborationTasks.find((task) => task.id === collaboration?.selectedId)
+  const collaborationHandle = useRef<CollaborationHandle>(null)
+  const collaborationContent = useRef<HTMLDivElement>(null)
+  const [collaborationDraftCwd, setCollaborationDraftCwd] = useState('')
+  const [groupBusy, setGroupBusy] = useState(false)
+  const [groupError, setGroupError] = useState('')
+  const [joinGroupMenu, setJoinGroupMenu] = useState(false)
+  const pendingGroupAction = useRef<{ key: string; requestId: string } | null>(null)
+  const [collaborationTerminal, setCollaborationTerminal] = useState<{
+    scope: string; cwd: string; engine: ChatEngine; visible: boolean
+    directory: { id: number; path: string } | null; run: { id: number; path: string } | null
+  } | null>(null)
   const [initialPaneLayout] = useState(readPersistedPaneLayout)
   const [openPaneIndexes, setOpenPaneIndexes] = useState<number[]>(initialPaneLayout?.openPaneIndexes ?? [0])
   const [selectedPaneIndex, setSelectedPaneIndex] = useState(initialPaneLayout?.selectedPaneIndex ?? 0)
@@ -5137,6 +5387,42 @@ export function DevWispPage({ token, onUnauthorized, onUnpair, themePreferences,
   remotesRef.current = remotes
   const activeRemote = remotes[selectedPaneIndex] ?? remote0
   const isClaudeCodeThread = activeRemote.activeEngine === 'claude-code'
+  const isDeepSeekThread = activeRemote.activeEngine === 'deepseek-harness'
+  const [deepseekDefaultModel, setDeepseekDefaultModel] = useState('deepseek-v4-flash')
+  const [deepseekReasoningEffortsByModel, setDeepseekReasoningEffortsByModel] = useState<Record<string, string[]>>({})
+  const [deepseekConfigLoaded, setDeepseekConfigLoaded] = useState(false)
+  const [deepseekAgentPresetsAvailable, setDeepseekAgentPresetsAvailable] = useState(false)
+  const [deepseekAvailability, setDeepseekAvailability] = useState<'checking' | 'available' | 'unconfigured' | 'unavailable' | 'error'>('checking')
+  useEffect(() => {
+    let current = true
+    let revision = 0
+    const refresh = () => {
+      if (document.visibilityState === 'hidden') return
+      const requestRevision = ++revision
+      void devwispClient.deepseekStatus(token).then((status) => {
+        if (current && requestRevision === revision) {
+          setDeepseekAvailability(!status.available ? 'unavailable' : status.hasApiKey ? 'available' : 'unconfigured')
+          setDeepseekDefaultModel(status.model); setDeepseekConfigLoaded(true)
+          setDeepseekReasoningEffortsByModel(status.reasoningEffortsByModel ?? {})
+          setDeepseekAgentPresetsAvailable(deepSeekAgentPresets.every((preset) => status.agentPresets?.includes(preset)))
+        }
+      }).catch(() => { if (current && requestRevision === revision) setDeepseekAvailability('error') })
+    }
+    refresh()
+    const interval = window.setInterval(refresh, 30_000)
+    window.addEventListener('focus', refresh)
+    window.addEventListener('devwisp:resume', refresh)
+    document.addEventListener('visibilitychange', refresh)
+    window.addEventListener('devwisp:deepseek-config-changed', refresh)
+    return () => {
+      current = false
+      window.clearInterval(interval)
+      window.removeEventListener('focus', refresh)
+      window.removeEventListener('devwisp:resume', refresh)
+      document.removeEventListener('visibilitychange', refresh)
+      window.removeEventListener('devwisp:deepseek-config-changed', refresh)
+    }
+  }, [token, activeRemote.connection])
   const [continuation, setContinuation] = useState<{ paneIndex: number; threadId: string; turnId: string | null; phase: 'stopping' | 'ready' | 'continuing' } | null>(null)
   const continuationRef = useRef(continuation)
   continuationRef.current = continuation
@@ -5267,13 +5553,13 @@ export function DevWispPage({ token, onUnauthorized, onUnpair, themePreferences,
   const [copyFeedback, setCopyFeedback] = useState<{ id: string; label: string } | null>(null)
   const [completionToast, setCompletionToast] = useState<CodexThreadCompletion | null>(null)
   const [paneNotice, setPaneNotice] = useState<string | null>(null)
-  const [threadContextMenu, setThreadContextMenu] = useState<{ thread: CodexThread; x: number; y: number } | null>(null)
+  const [threadContextMenu, setThreadContextMenu] = useState<{ thread: SidebarConversation; x: number; y: number } | null>(null)
   const threadContextMenuElement = useRef<HTMLDivElement>(null)
   useContextMenuShortcuts(threadContextMenuElement, threadContextMenu)
   const [pinnedThreadIds, setPinnedThreadIds] = useState<Set<string>>(readPinnedThreadIds)
   const [scheduledThreadIds, setScheduledThreadIds] = useState<Set<string>>(() => new Set())
   const [threadContextAction, setThreadContextAction] = useState<{ threadId: string; type: 'export' | 'quote' } | null>(null)
-  const [threadRenameTarget, setThreadRenameTarget] = useState<CodexThread | null>(null)
+  const [threadRenameTarget, setThreadRenameTarget] = useState<SidebarConversation | null>(null)
   const [threadRenameDraft, setThreadRenameDraft] = useState('')
   const [threadRenameError, setThreadRenameError] = useState<string | null>(null)
   const [threadRenameSaving, setThreadRenameSaving] = useState(false)
@@ -5281,6 +5567,9 @@ export function DevWispPage({ token, onUnauthorized, onUnpair, themePreferences,
   const [threadDeleteError, setThreadDeleteError] = useState<string | null>(null)
   const [threadDeleteSaving, setThreadDeleteSaving] = useState(false)
   const [threadDeleteProgress, setThreadDeleteProgress] = useState(0)
+  const [dissolveTarget, setDissolveTarget] = useState<SidebarConversation | null>(null)
+  const [dissolveError, setDissolveError] = useState<string | null>(null)
+  const [dissolveSaving, setDissolveSaving] = useState(false)
   const [workspaceDraftSnapshot, setWorkspaceDraftSnapshot] = useState<{ scope: string; draft: string } | null>(null)
 
   useEffect(() => {
@@ -5441,7 +5730,8 @@ export function DevWispPage({ token, onUnauthorized, onUnpair, themePreferences,
     return true
   }, [themePreferences.systemNotificationsEnabled])
 
-  function openThreadContextMenu(thread: CodexThread, x: number, y: number) {
+  function openThreadContextMenu(thread: SidebarConversation, x: number, y: number) {
+    setJoinGroupMenu(false); setGroupError('')
     setThreadContextMenu({
       thread,
       x: Math.max(8, Math.min(x, window.innerWidth - 174)),
@@ -5455,7 +5745,7 @@ export function DevWispPage({ token, onUnauthorized, onUnpair, themePreferences,
     threadLongPress.current = null
   }
 
-  function handleThreadTouchStart(event: ReactTouchEvent<HTMLButtonElement>, thread: CodexThread) {
+  function handleThreadTouchStart(event: ReactTouchEvent<HTMLButtonElement>, thread: SidebarConversation) {
     clearThreadLongPress()
     if (!isMobileLayout() || event.touches.length !== 1) return
     const touch = event.touches[0]
@@ -5483,7 +5773,7 @@ export function DevWispPage({ token, onUnauthorized, onUnpair, themePreferences,
     }
   }
 
-  function startThreadRename(thread: CodexThread) {
+  function startThreadRename(thread: SidebarConversation) {
     setThreadContextMenu(null)
     setThreadRenameTarget(thread)
     setThreadRenameDraft((thread.name || thread.preview || '').slice(0, 72))
@@ -5511,9 +5801,15 @@ export function DevWispPage({ token, onUnauthorized, onUnpair, themePreferences,
     setThreadRenameSaving(true)
     setThreadRenameError(null)
     try {
-      await remote0.renameThread(threadRenameTarget.id, name)
+      if (threadRenameTarget.collaboration) {
+        await devwispClient.renameCollaboration(token, threadRenameTarget.collaboration.id, name)
+        await collaboration?.onRefresh()
+      } else {
+        await remote0.renameThread(threadRenameTarget.id, name)
+      }
       setThreadRenameTarget(null)
     } catch (reason) {
+      if (reason instanceof RemoteApiError && reason.status === 401) onUnauthorized()
       setThreadRenameError(reason instanceof Error ? reason.message : '重命名失败，请稍后重试。')
     } finally {
       setThreadRenameSaving(false)
@@ -5525,6 +5821,42 @@ export function DevWispPage({ token, onUnauthorized, onUnpair, themePreferences,
     setThreadDeleteTargets([thread])
     setThreadDeleteError(null)
     setThreadDeleteProgress(0)
+  }
+
+  function startDissolveGroup(thread: SidebarConversation) {
+    setThreadContextMenu(null)
+    setDissolveTarget(thread)
+    setDissolveError(null)
+  }
+
+  function closeDissolveGroup() {
+    if (dissolveSaving) return
+    setDissolveTarget(null)
+    setDissolveError(null)
+  }
+
+  async function submitDissolveGroup(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const groupId = dissolveTarget?.collaboration?.id
+    if (!groupId || dissolveSaving) return
+    setDissolveSaving(true)
+    setDissolveError(null)
+    try {
+      await devwispClient.dissolveCollaboration(token, groupId)
+    } catch (reason) {
+      if (reason instanceof RemoteApiError && reason.status === 401) onUnauthorized()
+      setDissolveError(reason instanceof Error ? reason.message : '解散群聊失败，请稍后重试。')
+      setDissolveSaving(false)
+      return
+    }
+    // Once deleted, a refresh failure must not turn this into a retry target.
+    setDissolveTarget(null)
+    setDissolveSaving(false)
+    if (collaboration?.selectedId === groupId) collaboration.onOpenChat()
+    collaboration?.onDissolved(groupId)
+    setCollaborationTerminal((previous) => previous?.scope === groupId ? null : previous)
+    showPaneNotice('群聊已解散，成员已恢复为单聊。')
+    await Promise.allSettled([collaboration?.onRefresh(), remote0.refreshThreads(true)])
   }
 
   function closeThreadDelete() {
@@ -5645,9 +5977,19 @@ export function DevWispPage({ token, onUnauthorized, onUnpair, themePreferences,
     }
     const touch = event.touches[0]
     if (!touch) return
+    const target = event.target
+    const targetElement = target instanceof Element ? target : null
+    // Tables own their entire scroll gesture, even at a boundary or screen edge.
+    if (targetElement?.closest('.chat-message__table-scroll, .pasted-table-preview__scroll')) {
+      sidebarTouchStart.current = null
+      sidebarDrag.current = null
+      workspaceDrag.current = null
+      return
+    }
     const globalOverlayOpen = settingsOpen || usageStatsOpen
       || Boolean(threadRenameTarget)
       || Boolean(threadDeleteTargets)
+      || Boolean(dissolveTarget)
       || Boolean(threadContextMenu)
       || workspacePreviewModeRef.current === 'mobile'
     if (globalOverlayOpen) {
@@ -5656,8 +5998,6 @@ export function DevWispPage({ token, onUnauthorized, onUnpair, themePreferences,
       workspaceDrag.current = null
       return
     }
-    const target = event.target
-    const targetElement = target instanceof Element ? target : null
     const startedOnBackdrop = Boolean(targetElement?.closest('.sidebar-backdrop, .workspace-backdrop'))
     const startedInsideSidebar = sidebarOpen && Boolean(targetElement?.closest('.remote-sidebar'))
     const startedOnInteractiveSurface = Boolean(targetElement?.closest([
@@ -5784,6 +6124,7 @@ export function DevWispPage({ token, onUnauthorized, onUnpair, themePreferences,
       else if (usageStatsOpen) closeUsageStatsPanel()
       else if (threadRenameTarget) closeThreadRename()
       else if (threadDeleteTargets) closeThreadDelete()
+      else if (dissolveTarget) closeDissolveGroup()
       else if (workspacePreviewModeRef.current === 'mobile') workspacePreviewCloseRef.current?.()
       else if (threadContextMenu) setThreadContextMenu(null)
     } else if (action === 'open-sidebar') openSidebarPanel()
@@ -5869,11 +6210,23 @@ export function DevWispPage({ token, onUnauthorized, onUnpair, themePreferences,
     ? activeComposerPreferences.claudeEffort ?? 'default'
     : activeComposerPreferences.effort ?? ''
   const selectedApprovalPolicy = activeComposerPreferences.approvalPolicy ?? 'on-request'
+  const selectedDeepseekPermissionMode = activeComposerPreferences.deepseekPermissionMode ?? (selectedApprovalPolicy === 'never' ? 'danger-full-access' : selectedApprovalPolicy === 'untrusted' ? 'full-access-ask' : 'workspace-write')
+  const deepseekAgentPresetLocked = Boolean(activeRemote.activeThread?.deepseekAgentPresetLocked || (isDeepSeekThread && activeRemote.messages.some((message) => message.role === 'user')))
+  const selectedDeepseekAgentPreset = activeRemote.activeThread?.deepseekAgentPresetLocked
+    ? activeRemote.activeThread.deepseekAgentPreset ?? 'legacy'
+    : activeComposerPreferences.deepseekAgentPreset ?? 'standard'
   const selectedClaudePermissionMode = activeComposerPreferences.claudePermissionMode ?? 'default'
-  const availableModels = useMemo(() => {
+  const availableModels = useMemo<CodexModel[]>(() => {
+    if (isDeepSeekThread && !deepseekConfigLoaded) return []
+    if (isDeepSeekThread) return [...new Set([deepseekDefaultModel, 'deepseek-v4-flash', 'deepseek-v4-pro'])].map((id) => ({
+      id, model: id, displayName: id, isDefault: id === deepseekDefaultModel,
+      supportedReasoningEfforts: (deepseekReasoningEffortsByModel[id] ?? ['default', 'high', 'max'])
+        .map((effort) => ({ reasoningEffort: effort, description: effort })),
+      defaultReasoningEffort: 'default', inputModalities: ['text', 'image'],
+    }))
     const source = remotes.find((remote) => remote.models.length > 0)
     return source?.models ?? []
-  }, [remote0.models, remote1.models, remote2.models, remote3.models, remote4.models])
+  }, [isDeepSeekThread, deepseekConfigLoaded, deepseekDefaultModel, deepseekReasoningEffortsByModel, remote0.models, remote1.models, remote2.models, remote3.models, remote4.models])
   const chosenModel = availableModels.find((model) => modelIdOf(model) === selectedModel)
   const effortOptions = useMemo(() => chosenModel?.supportedReasoningEfforts ?? [], [chosenModel])
   const darkStatusBarIcons = shouldUseDarkStatusBarIcons(themePreferences)
@@ -5922,15 +6275,31 @@ export function DevWispPage({ token, onUnauthorized, onUnpair, themePreferences,
       if (detail?.engine !== 'codex' || !detail.model) return
       const model = detail.model
       setDefaultComposerPreferences((current) => mergeComposerPreferences(current, { model }))
-      if (!isClaudeCodeThread) updateComposerPreferences({ model })
+      if (activeRemote.activeEngine === 'codex') updateComposerPreferences({ model })
     }
     window.addEventListener('devwisp:native-models-loaded', onNativeConfigChanged)
     return () => window.removeEventListener('devwisp:native-models-loaded', onNativeConfigChanged)
-  }, [isClaudeCodeThread, updateComposerPreferences])
+  }, [activeRemote.activeEngine, updateComposerPreferences])
+
+  useEffect(() => {
+    const onDeepSeekConfigChanged = (event: Event) => {
+      const model = (event as CustomEvent<{ model?: string }>).detail?.model
+      if (!model) return
+      setDeepseekDefaultModel(model)
+      setDeepseekConfigLoaded(true)
+      if (activeRemote.activeEngine === 'deepseek-harness') updateComposerPreferences({ model, effort: 'default' })
+    }
+    window.addEventListener('devwisp:deepseek-config-changed', onDeepSeekConfigChanged)
+    return () => window.removeEventListener('devwisp:deepseek-config-changed', onDeepSeekConfigChanged)
+  }, [activeRemote.activeEngine, updateComposerPreferences])
 
   const changeModel = useCallback((model: string) => updateComposerPreferences(isClaudeCodeThread ? { claudeModel: model } : { model }), [isClaudeCodeThread, updateComposerPreferences])
   const changeEffort = useCallback((effort: string) => updateComposerPreferences(isClaudeCodeThread ? { claudeEffort: effort } : { effort }), [isClaudeCodeThread, updateComposerPreferences])
   const changeClaudePermissionMode = useCallback((claudePermissionMode: ClaudeCodePermissionMode) => updateComposerPreferences({ claudePermissionMode }), [updateComposerPreferences])
+  const changeDeepseekAgentPreset = useCallback((deepseekAgentPreset: DeepSeekAgentPreset) => {
+    updateComposerPreferences({ deepseekAgentPreset, ...(deepseekAgentPreset === 'minimal' && selectedDeepseekPermissionMode === 'plan' ? { deepseekPermissionMode: 'workspace-write' } : {}) })
+  }, [updateComposerPreferences, selectedDeepseekPermissionMode])
+  const changeDeepseekPermissionMode = useCallback((deepseekPermissionMode: DeepSeekPermissionMode) => updateComposerPreferences({ deepseekPermissionMode }), [updateComposerPreferences])
   const changeApprovalPolicy = useCallback((approvalPolicy: CodexApprovalPolicy) => {
     updateComposerPreferences({ approvalPolicy })
   }, [updateComposerPreferences])
@@ -6008,8 +6377,20 @@ export function DevWispPage({ token, onUnauthorized, onUnpair, themePreferences,
     return () => document.removeEventListener('keydown', closeOnEscape)
   }, [threadDeleteTargets, threadDeleteSaving])
 
+  useEffect(() => {
+    if (!dissolveTarget) return
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== 'Escape' || event.isComposing || event.keyCode === 229) return
+      event.preventDefault()
+      closeDissolveGroup()
+    }
+    document.addEventListener('keydown', closeOnEscape)
+    return () => document.removeEventListener('keydown', closeOnEscape)
+  }, [dissolveTarget, dissolveSaving])
+
   useLayoutEffect(() => {
     const handleBack = () => {
+      if (!visible) return false
       const selectMenu = openSettingsSelectMenu()
       if (selectMenu) {
         selectMenu.hidePopover()
@@ -6028,11 +6409,19 @@ export function DevWispPage({ token, onUnauthorized, onUnpair, themePreferences,
         closeThreadDelete()
         return true
       }
+      if (dissolveTarget) {
+        closeDissolveGroup()
+        return true
+      }
       if (workspacePreviewModeRef.current === 'mobile') {
         workspacePreviewCloseRef.current?.()
         return true
       }
-      if (composerHandle.current?.closeOpenMenu()) return true
+      if (collaborationMode && collaborationTerminal?.visible) {
+        setCollaborationTerminal((previous) => previous && { ...previous, visible: false })
+        return true
+      }
+      if (!collaborationMode && composerHandle.current?.closeOpenMenu()) return true
       if (threadContextMenu) {
         setThreadContextMenu(null)
         return true
@@ -6051,13 +6440,14 @@ export function DevWispPage({ token, onUnauthorized, onUnpair, themePreferences,
     return () => {
       if (window.DevWispHandleBack === handleBack) delete window.DevWispHandleBack
     }
-  }, [closeSettingsPanel, settingsOpen, sidebarOpen, threadContextMenu, threadDeleteSaving, threadDeleteTargets, threadRenameTarget, usageStatsOpen, workspaceOpen, threadRenameSaving])
+  }, [visible, collaborationMode, collaborationTerminal?.visible, closeSettingsPanel, settingsOpen, sidebarOpen, threadContextMenu, threadDeleteSaving, threadDeleteTargets, threadRenameTarget, usageStatsOpen, workspaceOpen, threadRenameSaving, dissolveTarget, dissolveSaving])
 
   useEffect(() => {
     const interruptOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (!visible || collaborationMode || collaborationTasks.some((task) => [...Object.values(task.members), ...Object.values(task.workerMembers ?? {})].some((member) => member.threadId === activeRemote.activeThread?.id))) return
       if (event.key !== 'Escape' || event.defaultPrevented || event.isComposing || event.keyCode === 229) return
       if (document.querySelector('dialog[open]')) return
-      if (threadRenameTarget || threadDeleteTargets) return
+      if (threadRenameTarget || threadDeleteTargets || dissolveTarget) return
       if (workspacePreviewModeRef.current !== null) {
         event.preventDefault()
         workspacePreviewCloseRef.current?.()
@@ -6088,7 +6478,7 @@ export function DevWispPage({ token, onUnauthorized, onUnpair, themePreferences,
     }
     document.addEventListener('keydown', interruptOnEscape)
     return () => document.removeEventListener('keydown', interruptOnEscape)
-  }, [activeRemote.activeThread?.id, activeRemote.isRunning, activeRemote.stopInterruptedThread, pauseCurrentReply, selectedPaneIndex, threadDeleteTargets, threadRenameTarget, updateContinuation])
+  }, [visible, collaborationMode, collaborationTasks, activeRemote.activeThread?.id, activeRemote.isRunning, activeRemote.stopInterruptedThread, pauseCurrentReply, selectedPaneIndex, threadDeleteTargets, threadRenameTarget, dissolveTarget, updateContinuation])
 
   useEffect(() => {
     if (isClaudeCodeThread || availableModels.length === 0) return
@@ -6251,6 +6641,29 @@ export function DevWispPage({ token, onUnauthorized, onUnpair, themePreferences,
     }, 2_400)
   }
 
+  async function openGroupForThread(thread?: CodexThread, groupId?: string) {
+    if (groupBusy || !collaboration) return
+    setGroupBusy(true); setGroupError('')
+    const key = `${groupId ?? 'new'}:${thread?.id ?? 'empty'}`
+    const previous = pendingGroupAction.current
+    const input = previous?.key === key ? previous : { key, requestId: collaborationId() }
+    pendingGroupAction.current = input
+    try {
+      const member = thread ? { engine: thread.engine ?? (thread.id.startsWith('claude:') ? 'claude-code' as const : thread.id.startsWith('deepseek:') ? 'deepseek-harness' as const : 'codex' as const), threadId: thread.id } : undefined
+      const group = groupId && member
+        ? await devwispClient.addCollaborationMember(token, groupId, { requestId: input.requestId, ...member })
+        : await devwispClient.createCollaborationGroup(token, { requestId: input.requestId, ...(member ? { member } : { cwd: activeWorkspaceCwd }) })
+      pendingGroupAction.current = null
+      await collaboration.onRefresh()
+      setThreadContextMenu(null); setJoinGroupMenu(false); setSettingsOpen(false); setUsageStatsOpen(false); setSidebarOpen(false)
+      onOpenCollaboration?.(group.id)
+      void remote0.refreshThreads()
+    } catch (cause) {
+      if (cause instanceof RemoteApiError && cause.status === 401) onUnauthorized()
+      setGroupError(cause instanceof Error ? cause.message : ui('请求失败，请重试'))
+    } finally { setGroupBusy(false) }
+  }
+
   async function toggleThreadPin(thread: CodexThread) {
     const pinned = !pinnedThreadIds.has(thread.id)
     setThreadContextMenu(null)
@@ -6336,15 +6749,23 @@ export function DevWispPage({ token, onUnauthorized, onUnpair, themePreferences,
       ? resolvedComposerPreferences(defaultComposerPreferences, threadComposerPreferences[targetThreadId])
       : savedComposerPreferences
     const thread = await target.createThread(
-      selectedEngine === 'codex' ? targetPreferences.model : undefined,
-      selectedEngine === 'codex' ? targetPreferences.approvalPolicy : undefined,
+      selectedEngine !== 'claude-code' ? targetPreferences.model : undefined,
+      selectedEngine !== 'claude-code' ? targetPreferences.approvalPolicy : undefined,
       undefined,
       cwd,
       selectedEngine,
     )
     if (!thread) return null
     if (paneIndex === selectedPaneIndex && !activeThreadId) composerHandle.current?.adoptUnassignedDraft(thread.id)
-    rememberThreadComposerPreferences(thread.id, selectedEngine === 'codex'
+    rememberThreadComposerPreferences(thread.id, selectedEngine === 'deepseek-harness'
+      ? {
+          model: target.activeEngine === 'deepseek-harness' ? targetPreferences.model ?? deepseekDefaultModel : deepseekDefaultModel,
+          effort: target.activeEngine === 'deepseek-harness' ? targetPreferences.effort ?? 'default' : 'default',
+          approvalPolicy: targetPreferences.approvalPolicy,
+          deepseekAgentPreset: targetPreferences.deepseekAgentPreset,
+          deepseekPermissionMode: targetPreferences.deepseekPermissionMode,
+        }
+      : selectedEngine === 'codex'
       ? {
           model: targetPreferences.model,
           effort: targetPreferences.effort,
@@ -6359,7 +6780,7 @@ export function DevWispPage({ token, onUnauthorized, onUnpair, themePreferences,
     return thread
   }
 
-  async function switchEngineForPane(paneIndex: number, engine: 'codex' | 'claude-code') {
+  async function switchEngineForPane(paneIndex: number, engine: 'codex' | 'claude-code' | 'deepseek-harness') {
     const targetRemote = remotes[paneIndex] ?? remote0
     const cwd = targetRemote.activeThread?.cwd || targetRemote.runtime.workspace || undefined
     const threadsForEngine = (threads: CodexThread[]) => threads.filter((thread) => (thread.engine ?? 'codex') === engine)
@@ -6392,7 +6813,13 @@ export function DevWispPage({ token, onUnauthorized, onUnpair, themePreferences,
     await createThreadForPane(selectedPaneIndex)
   }
 
-  async function selectThread(thread: CodexThread, options?: SelectThreadOptions, focusComposer = true) {
+  async function selectThread(thread: SidebarConversation, options?: SelectThreadOptions, focusComposer = true) {
+    if (thread.collaboration) {
+      setSettingsOpen(false); setUsageStatsOpen(false); setSidebarOpen(false)
+      onOpenCollaboration?.(thread.collaboration.id)
+      return
+    }
+    if (collaborationMode) collaboration?.onOpenChat()
     if (focusComposer) requestComposerFocusForThread(thread.id)
     else focusComposerAfterThreadSwitch.current = null
     setSidebarOpen(false)
@@ -6407,6 +6834,14 @@ export function DevWispPage({ token, onUnauthorized, onUnpair, themePreferences,
     setSelectedPaneIndex(targetIndex)
     await remotes[targetIndex].selectThread(thread, options)
   }
+
+  const handledMemberRequest = useRef<number | null>(null)
+  useEffect(() => {
+    if (!memberRequest || handledMemberRequest.current === memberRequest.sequence) return
+    handledMemberRequest.current = memberRequest.sequence
+    setSettingsOpen(false); setUsageStatsOpen(false)
+    void selectThread(memberRequest.thread, { refreshHistory: true }, false)
+  }, [memberRequest])
 
   function openSystemNotificationThread(threadId: string) {
     if (!threadId) return
@@ -6568,18 +7003,35 @@ export function DevWispPage({ token, onUnauthorized, onUnpair, themePreferences,
     if (!canContinue || !activeContinuation || continuationRef.current !== activeContinuation) return
     const pending = { ...activeContinuation, phase: 'continuing' as const }
     updateContinuation(pending)
-    void sendComposerMessage({ prompt: isClaudeCodeThread ? '请继续刚才中断的任务。' : '', images: [], documents: [], continuePaused: true }).then((sent) => {
+    void sendComposerMessage({ prompt: activeRemote.activeEngine !== 'codex' ? '请继续刚才中断的任务。' : '', images: [], documents: [], continuePaused: true }).then((sent) => {
       if (!sent && continuationRef.current === pending) updateContinuation({ ...pending, phase: 'ready' })
     })
-  }, [activeContinuation, canContinue, isClaudeCodeThread, sendComposerMessage, updateContinuation])
+  }, [activeContinuation, activeRemote.activeEngine, canContinue, sendComposerMessage, updateContinuation])
 
-  const activeWorkspaceCwd = activeRemote.activeThread?.cwd || activeRemote.runtime.workspace || undefined
+  const activeWorkspaceCwd = (collaborationMode
+    ? selectedCollaboration?.cwd || collaborationDraftCwd
+    : activeRemote.activeThread?.cwd) || activeRemote.runtime.workspace || undefined
+  const collaborationTerminalScope = collaboration?.selectedId ?? 'new'
+  function openCollaborationTerminal(path?: string, action?: 'directory' | 'run') {
+    const scope = collaborationTerminalScope
+    const cwd = activeWorkspaceCwd ?? ''
+    const engine = Object.values(selectedCollaboration?.members ?? {})[0]?.engine ?? 'claude-code'
+    const request = path ? { id: ++workspaceTerminalRequestSequence.current, path } : null
+    setCollaborationTerminal((previous) => ({
+      ...(previous?.scope === scope && previous.cwd === cwd ? previous : { directory: null, run: null }),
+      scope, cwd, engine, visible: true,
+      ...(action === 'directory' ? { directory: request } : action === 'run' ? { run: request } : {}),
+    }))
+    if (isMobileLayout()) setWorkspaceOpen(false)
+  }
   const insertWorkspacePath = useCallback((path: string, focus = true) => {
-    composerHandle.current?.appendDraft(path, focus)
-  }, [])
+    if (collaborationMode) collaborationHandle.current?.appendText(path, focus)
+    else composerHandle.current?.appendDraft(path, focus)
+  }, [collaborationMode])
   const addWorkspaceDocument = useCallback((document: CodexDocumentAttachment, focus = true) => {
-    composerHandle.current?.addDocumentAttachment(document, focus)
-  }, [])
+    if (collaborationMode) collaborationHandle.current?.addDocument(document, focus)
+    else composerHandle.current?.addDocumentAttachment(document, focus)
+  }, [collaborationMode])
 
   function setWorkspaceExplorerWidthValue(value: number, persist = false) {
     const width = clampWorkspaceExplorerWidth(value)
@@ -6688,6 +7140,13 @@ export function DevWispPage({ token, onUnauthorized, onUnpair, themePreferences,
     : claudeCodeAvailable
       ? { label: ui('Claude Code 可用'), state: 'connected' }
       : { label: ui('Claude Code 不可用'), state: 'unavailable' }
+  const sidebarDeepseekStatus = {
+    checking: { label: ui('正在检查 DeepSeek'), state: 'connecting' },
+    available: { label: ui('DeepSeek 可用'), state: 'connected' },
+    unconfigured: { label: ui('DeepSeek 未配置 API'), state: 'connecting' },
+    unavailable: { label: ui('DeepSeek 不可用'), state: 'unavailable' },
+    error: { label: ui('DeepSeek 状态获取失败'), state: 'disconnected' },
+  }[deepseekAvailability]
   const androidEndpointBridgeAvailable = typeof window !== 'undefined' && typeof window.DevWispAndroid?.changeEndpoint === 'function'
   const modelSupportsImages = isClaudeCodeThread || !chosenModel || !Array.isArray(chosenModel.inputModalities) || chosenModel.inputModalities.includes('image')
   const modelOptions = useMemo<ComposerMenuOption[]>(() => availableModels.flatMap((model) => {
@@ -6713,12 +7172,14 @@ export function DevWispPage({ token, onUnauthorized, onUnpair, themePreferences,
     }
     return byModel
   }, [availableModels])
-  const sidebarThreads = useMemo(() => [...remote0.threads]
+  const activeCollaboration = collaborationTasks.find((task) => [...Object.values(task.members), ...Object.values(task.workerMembers ?? {})].some((member) => member.threadId === activeRemote.activeThread?.id))
+  const collaborationThreadIds = useMemo(() => new Set(collaborationTasks.flatMap((task) => [...Object.values(task.members), ...Object.values(task.workerMembers ?? {})].map((member) => member.threadId).filter(Boolean))), [collaborationTasks])
+  const sidebarThreads = useMemo(() => mergeSidebarConversations(remote0.threads, collaborationTasks)
     .sort((left, right) => {
       const leftPinned = pinnedThreadIds.has(left.id)
       const rightPinned = pinnedThreadIds.has(right.id)
       return Number(rightPinned) - Number(leftPinned)
-    }), [pinnedThreadIds, remote0.threads])
+    }), [pinnedThreadIds, remote0.threads, collaborationTasks])
   const normalizedSidebarSearch = sidebarSearch.trim().toLocaleLowerCase()
   const visibleSidebarThreads = useMemo(() => filterSidebarThreads(sidebarThreads, sidebarEngineFilter, normalizedSidebarSearch), [normalizedSidebarSearch, sidebarEngineFilter, sidebarThreads])
   const sidebarHasActiveFilter = Boolean(normalizedSidebarSearch || sidebarEngineFilter)
@@ -6727,49 +7188,49 @@ export function DevWispPage({ token, onUnauthorized, onUnpair, themePreferences,
 
   useEffect(() => {
     const switchSidebarThread = (event: globalThis.KeyboardEvent) => {
-      if (event.defaultPrevented || event.isComposing || event.keyCode === 229) return
+      if (!visible || event.defaultPrevented || event.isComposing || event.keyCode === 229) return
       const direction = matchesSidebarChatShortcut(event, sidebarChatShortcuts.previous)
         ? -1
         : matchesSidebarChatShortcut(event, sidebarChatShortcuts.next) ? 1 : 0
       if (direction === 0) return
       if (sidebarSelectionMode || sidebarSelectionBusy || activeRemote.handedOff || settingsOpen || usageStatsOpen
-        || threadContextMenu || threadRenameTarget || threadDeleteTargets || workspacePreviewModeRef.current !== null) return
+        || threadContextMenu || threadRenameTarget || threadDeleteTargets || dissolveTarget || workspacePreviewModeRef.current !== null) return
 
       const target = event.target instanceof HTMLElement ? event.target : null
       const editableTarget = target?.closest('input, textarea, select, [contenteditable], [role="textbox"]')
       if (editableTarget && !editableTarget.matches('textarea[data-chat-composer]')) return
-      if (document.querySelector('[role="dialog"], [role="menu"], [role="listbox"]')) return
+      if ([...document.querySelectorAll('[role="dialog"], [role="menu"], [role="listbox"]')].some((element) => element.checkVisibility())) return
 
       const threads = groupedSidebarThreads.flatMap((section) => section.threads)
       if (threads.length === 0) return
 
-      const currentIndex = threads.findIndex((thread) => thread.id === activeRemote.activeThread?.id)
+      const currentIndex = threads.findIndex((thread) => collaborationMode ? thread.collaboration?.id === collaboration?.selectedId : thread.id === activeRemote.activeThread?.id)
       const nextIndex = currentIndex < 0
         ? direction > 0 ? 0 : threads.length - 1
         : (currentIndex + direction + threads.length) % threads.length
       const nextThread = threads[nextIndex]
 
       event.preventDefault()
-      if (nextThread.id !== activeRemote.activeThread?.id) void selectThread(nextThread, undefined, true)
+      void selectThread(nextThread, undefined, true)
     }
 
     document.addEventListener('keydown', switchSidebarThread)
     return () => document.removeEventListener('keydown', switchSidebarThread)
-  }, [activeRemote.activeThread?.id, activeRemote.handedOff, groupedSidebarThreads, selectThread, settingsOpen, usageStatsOpen, sidebarChatShortcuts, sidebarSelectionBusy, sidebarSelectionMode, threadContextMenu, threadDeleteTargets, threadRenameTarget])
+  }, [visible, collaborationMode, collaboration?.selectedId, activeRemote.activeThread?.id, activeRemote.handedOff, groupedSidebarThreads, selectThread, settingsOpen, usageStatsOpen, sidebarChatShortcuts, sidebarSelectionBusy, sidebarSelectionMode, threadContextMenu, threadDeleteTargets, threadRenameTarget, dissolveTarget])
 
   useEffect(() => {
     const switchConcurrentPane = (event: globalThis.KeyboardEvent) => {
-      if (event.defaultPrevented || event.isComposing || event.keyCode === 229
+      if (!visible || collaborationMode || event.defaultPrevented || event.isComposing || event.keyCode === 229
         || !event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return
       const direction = event.key === 'ArrowLeft' ? -1 : event.key === 'ArrowRight' ? 1 : 0
       if (direction === 0 || openPaneIndexes.length < 2) return
       if (sidebarOpen || sidebarSelectionMode || sidebarSelectionBusy || settingsOpen || usageStatsOpen
-        || threadContextMenu || threadRenameTarget || threadDeleteTargets || workspacePreviewModeRef.current !== null) return
+        || threadContextMenu || threadRenameTarget || threadDeleteTargets || dissolveTarget || workspacePreviewModeRef.current !== null) return
 
       const target = event.target instanceof HTMLElement ? event.target : null
       const editableTarget = target?.closest('input, textarea, select, [contenteditable], [role="textbox"]')
       if (editableTarget && !editableTarget.matches('textarea[data-chat-composer]')) return
-      if (document.querySelector('dialog, [role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"]')) return
+      if ([...document.querySelectorAll('dialog, [role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"]')].some((element) => element.checkVisibility())) return
 
       const currentPosition = openPaneIndexes.indexOf(selectedPaneIndex)
       if (currentPosition < 0) return
@@ -6784,9 +7245,10 @@ export function DevWispPage({ token, onUnauthorized, onUnpair, themePreferences,
 
     document.addEventListener('keydown', switchConcurrentPane, true)
     return () => document.removeEventListener('keydown', switchConcurrentPane, true)
-  }, [openPaneIndexes, selectedPaneIndex, sidebarOpen, sidebarSelectionMode, sidebarSelectionBusy, settingsOpen, usageStatsOpen, threadContextMenu, threadRenameTarget, threadDeleteTargets])
+  }, [visible, collaborationMode, openPaneIndexes, selectedPaneIndex, sidebarOpen, sidebarSelectionMode, sidebarSelectionBusy, settingsOpen, usageStatsOpen, threadContextMenu, threadRenameTarget, threadDeleteTargets, dissolveTarget])
 
-  const selectedSidebarThreads = sidebarThreads.filter((thread) => selectedSidebarThreadIds.has(thread.id))
+  const selectableSidebarThreads = visibleSidebarThreads.filter((thread) => !thread.collaboration)
+  const selectedSidebarThreads = sidebarThreads.filter((thread) => !thread.collaboration && selectedSidebarThreadIds.has(thread.id))
   const completedThread = findCompletedThread()
 
   function toggleSidebarSelectionMode() {
@@ -6841,10 +7303,78 @@ export function DevWispPage({ token, onUnauthorized, onUnpair, themePreferences,
 
   const sidebarBackdropVisible = sidebarOpen || sidebarDragging
 
+  const sharedComposerProps: MessageComposerProps = {
+    token: token,
+    threadId: activeRemote.activeThread?.id,
+    translation: translationPreferences,
+    translationRevision: translationRevision,
+    portalTheme: themePreferences.theme,
+    portalThemeStyle: composerPortalThemeStyle,
+    draftScope: composerDraftScope,
+    onDraftChange: syncWorkspaceDraft,
+    composerHeightMemory: composerHeightMemory,
+    connection: activeRemote.handedOff ? 'disconnected' : activeRemote.connection,
+    managedTask: Boolean(activeCollaboration),
+    isRunning: activeRemote.isRunning,
+    isReplying: activeRemote.isRunning || activeRemote.runningTurnId !== null || activeRemote.messages[activeRemote.messages.length - 1]?.streaming === true,
+    canInterrupt: activeRemote.activeEngine !== 'codex' || activeRemote.activeThread?.canInterrupt !== false,
+    fileChangeSummary: runningFileChangeSummary,
+    fileChangeSummaryKey: activeRemote.runningTurnId,
+    reserveFileChangeSummarySpace: openPaneIndexes.length > 1 && Boolean(hasRunningFileChangesInOpenPanes),
+    stableQueueHeight: openPaneIndexes.length > 1,
+    composerEngine: activeRemote.activeEngine,
+    showCodexPreferences: !isClaudeCodeThread,
+    isInterrupting: activeRemote.isInterrupting,
+    writerConflict: activeRemote.writerConflict,
+    modelSupportsImages: modelSupportsImages,
+    selectedModel: selectedModel,
+    selectedEffort: selectedEffort,
+    selectedApprovalPolicy: selectedApprovalPolicy,
+    selectedClaudePermissionMode: selectedClaudePermissionMode,
+    temporaryPreferences: Boolean(temporaryPreferences),
+    onTemporaryPreferencesChange: changeTemporaryPreferences,
+    modelOptions: modelOptions,
+    reasoningOptions: reasoningOptions,
+    reasoningOptionsByModel: reasoningOptionsByModel,
+    authorizationOptions: isDeepSeekThread ? deepseekPermissionOptions.filter((option) => selectedDeepseekAgentPreset !== 'minimal' || option.value !== 'plan') : approvalPolicyOptions,
+    claudeModelOptions: claudeModelOptions,
+    claudeEffortOptions: claudeEffortOptions,
+    claudePermissionModeOptions: claudePermissionModeOptions,
+    onModelChange: changeModel,
+    onEffortChange: changeEffort,
+    onApprovalPolicyChange: changeApprovalPolicy,
+    selectedDeepseekAgentPreset: selectedDeepseekAgentPreset,
+    deepseekAgentPresetLocked: deepseekAgentPresetLocked,
+    deepseekAgentPresetsAvailable: deepseekAgentPresetsAvailable,
+    onDeepseekAgentPresetChange: changeDeepseekAgentPreset,
+    selectedDeepseekPermissionMode: selectedDeepseekPermissionMode,
+    onDeepseekPermissionModeChange: changeDeepseekPermissionMode,
+    onClaudePermissionModeChange: changeClaudePermissionMode,
+    approvalPolicyUpdating: activeRemote.updatingApprovalPolicy,
+    onUploadPdf: activeRemote.uploadPdfAttachment,
+    onSend: sendComposerMessage,
+    queuedMessages: activeRemote.queuedMessages,
+    onSendQueuedNow: activeRemote.sendQueuedMessageNow,
+    onRetryQueuedTranslation: activeRemote.retryQueuedTranslation,
+    onBeginQueuedEdit: activeRemote.beginEditQueuedMessage,
+    onUpdateQueuedMessage: activeRemote.updateQueuedMessage,
+    onEndQueuedEdit: activeRemote.endEditQueuedMessage,
+    onRemoveQueued: activeRemote.removeQueuedMessage,
+    onMoveQueued: activeRemote.moveQueuedMessage,
+    onInterrupt: pauseCurrentReply,
+    onContinue: continueInterruptedReply,
+    canContinue: canContinue,
+    continuationPending: Boolean(activeContinuation),
+    onRefresh: activeRemote.refreshActiveThread,
+    onCreateThread: createComposerThread,
+    createThreadDisabled: activeRemote.handedOff || activeRemote.connection !== 'connected' || activeRemote.loadingHistory || (newThreadEngine === 'claude-code' && claudeCodeAvailable === false),
+    createThreadTitle: newThreadEngine === 'claude-code' && claudeCodeAvailable === false ? ui('Claude Code 不可用') : uiFormat('新建{0}对话', ` ${engineLabel(newThreadEngine)}`),
+  }
+
   return (
     <div
       ref={remoteShell}
-      className={'remote-shell remote-shell--theme-' + themePreferences.theme + (isClaudeCodeThread ? ' remote-shell--claude-mode' : '') + (androidEndpointBridgeAvailable ? ' remote-shell--android' : '') + (sidebarCollapsed ? ' remote-shell--sidebar-collapsed' : '') + (workspaceCollapsed ? ' remote-shell--workspace-collapsed' : '') + (settingsOpen || usageStatsOpen ? ' remote-shell--global-panel' : '') + (workspaceResizing ? ' remote-shell--resizing' : '') + (sidebarDragging ? ' remote-shell--sidebar-dragging' : '') + (workspaceDragging ? ' remote-shell--workspace-dragging' : '')}
+      className={'remote-shell remote-shell--theme-' + themePreferences.theme + (!collaborationMode && isClaudeCodeThread ? ' remote-shell--claude-mode' : '') + (androidEndpointBridgeAvailable ? ' remote-shell--android' : '') + (sidebarCollapsed ? ' remote-shell--sidebar-collapsed' : '') + (workspaceCollapsed ? ' remote-shell--workspace-collapsed' : '') + (settingsOpen || usageStatsOpen ? ' remote-shell--global-panel' : '') + (workspaceResizing ? ' remote-shell--resizing' : '') + (sidebarDragging ? ' remote-shell--sidebar-dragging' : '') + (workspaceDragging ? ' remote-shell--workspace-dragging' : '')}
       style={themeStyle}
       onTouchStartCapture={handleSidebarTouchStart}
       onTouchMoveCapture={handleSidebarTouchMove}
@@ -6868,7 +7398,7 @@ export function DevWispPage({ token, onUnauthorized, onUnpair, themePreferences,
         <div className={`thread-completion-toast thread-completion-toast--${completionToast.engine}`} role="status" aria-live="polite">
           <button className="thread-completion-toast__open" type="button" onClick={openCompletedThread}>
             <span className={`thread-completion-toast__icon thread-completion-toast__icon--${completionToast.engine}`}><EngineBrandIcon engine={completionToast.engine} size={16} /></span>
-            <span className="thread-completion-toast__copy"><strong>{completedThread ? uiFormat("“{0}”已完成回复", titleOf(completedThread)) : ui('一条对话已完成回复')}</strong><small>{completionToast.engine === 'claude-code' ? 'Claude Code' : 'Codex'} {ui("· 点击查看这条对话")}</small></span>
+            <span className="thread-completion-toast__copy"><strong>{completedThread ? uiFormat("“{0}”已完成回复", titleOf(completedThread)) : ui('一条对话已完成回复')}</strong><small>{engineLabel(completionToast.engine)} {ui("· 点击查看这条对话")}</small></span>
           </button>
           <button className="thread-completion-toast__close" type="button" aria-label={ui("关闭完成提示")} onClick={() => setCompletionToast(null)}><X size={15} /></button>
         </div>
@@ -6882,6 +7412,13 @@ export function DevWispPage({ token, onUnauthorized, onUnpair, themePreferences,
           </button>
           <button className="icon-button remote-sidebar__close" type="button" aria-label={ui("关闭对话列表")} onClick={() => setSidebarOpen(false)}><X size={18} /></button>
         </div>
+        {onOpenCollaboration && <nav className="remote-sidebar__modes" aria-label={ui('工作模式')}>
+          <button className="remote-sidebar__mode" aria-current={!collaborationMode ? 'page' : undefined} type="button" onClick={() => { setSettingsOpen(false); setUsageStatsOpen(false); setSidebarOpen(false); collaboration?.onOpenChat() }}><MessageSquarePlus size={16} /><span>{ui('聊天')}</span></button>
+          <button className="remote-sidebar__mode" aria-current={collaborationMode ? 'page' : undefined} type="button" onClick={() => { setSettingsOpen(false); setUsageStatsOpen(false); setSidebarOpen(false); onOpenCollaboration() }}><UsersRound size={16} /><span>{ui('协同')}</span></button>
+        </nav>}
+        {onOpenCollaboration && !collaborationMode && activeCollaboration && <button className="sidebar-settings" type="button" onClick={() => onOpenCollaboration(activeCollaboration.id)}><UsersRound size={16} /><span>{ui(activeCollaboration.kind === 'group' ? '返回协同群' : '返回所属协同任务')}</span></button>}
+        {collaborationMode && <button className="sidebar-settings collaboration-new-task" type="button" onClick={() => { setSettingsOpen(false); setUsageStatsOpen(false); setSidebarOpen(false); void openGroupForThread() }} disabled={groupBusy}><Plus size={16} /><span>{ui('新建协同群')}</span></button>}
+        {groupError && !threadContextMenu && <div className="collaboration-sidebar-error" role="alert">{groupError}</div>}
         <div className="sidebar-search">
           <Search size={15} aria-hidden="true" />
           <input type="text" value={sidebarSearch} onChange={(event) => setSidebarSearch(event.currentTarget.value)} placeholder={ui("搜索聊天记录")} aria-label={ui("搜索聊天记录")} autoComplete="off" enterKeyHint="search" />
@@ -6889,39 +7426,41 @@ export function DevWispPage({ token, onUnauthorized, onUnpair, themePreferences,
         </div>
         <div className="new-thread-control">
           <div className="sidebar-engine-filters" role="group" aria-label={ui("按聊天模式筛选")}>
-            {(['codex', 'claude-code'] as const).map((engine) => {
-              const engineLabel = engine === 'claude-code' ? 'Claude' : 'Codex'
+            {(['codex', 'claude-code', 'deepseek-harness'] as const).map((engine) => {
+              const engineLabel = engine === 'deepseek-harness' ? 'DeepSeek' : engine === 'claude-code' ? 'Claude' : 'Codex'
               const active = sidebarEngineFilter === engine
               return <button className={`sidebar-engine-filter sidebar-engine-filter--${engine}`} type="button" key={engine} onClick={() => toggleSidebarEngineFilter(engine)} aria-label={active ? uiFormat("取消{0}筛选，显示全部聊天", engineLabel) : uiFormat("只显示{0}聊天", engineLabel)} aria-pressed={active} title={active ? uiFormat("取消{0}筛选，显示全部聊天", engineLabel) : uiFormat("只显示{0}聊天", engineLabel)}><EngineBrandIcon engine={engine} size={17} /></button>
             })}
           </div>
         </div>
         <div className="thread-list-heading">
-          <span>{normalizedSidebarSearch ? ui('搜索结果') : sidebarEngineFilter === 'codex' ? ui('Codex 对话') : sidebarEngineFilter === 'claude-code' ? ui('Claude 对话') : ui('聊天记录')}</span>
+          <span>{normalizedSidebarSearch ? ui('搜索结果') : sidebarEngineFilter === 'codex' ? ui('Codex 对话') : sidebarEngineFilter === 'claude-code' ? ui('Claude 对话') : sidebarEngineFilter === 'deepseek-harness' ? ui('DeepSeek 对话') : ui('聊天记录')}</span>
           <small className="thread-list-heading__shortcut" title={uiFormat("上一条：{0}；下一条：{1}", formatSidebarChatShortcut(sidebarChatShortcuts.previous), formatSidebarChatShortcut(sidebarChatShortcuts.next))}>{sidebarShortcutHint}</small>
           <div className="thread-list-heading__actions">
-            <button className="thread-list-heading__select" type="button" onClick={toggleSidebarSelectionMode} disabled={sidebarSelectionBusy || (!sidebarSelectionMode && visibleSidebarThreads.length === 0)} aria-pressed={sidebarSelectionMode}>{sidebarSelectionMode ? ui('取消') : ui('选择')}</button>
+            <button className="thread-list-heading__select" type="button" onClick={toggleSidebarSelectionMode} disabled={sidebarSelectionBusy || (!sidebarSelectionMode && selectableSidebarThreads.length === 0)} aria-pressed={sidebarSelectionMode}>{sidebarSelectionMode ? ui('取消') : ui('选择')}</button>
           </div>
         </div>
         {sidebarSelectionMode ? <div className="sidebar-selection-bar">
-          <div className="sidebar-selection-bar__summary"><span>{ui("已选")} {selectedSidebarThreads.length} {ui("个聊天")}</span><button type="button" onClick={() => setSelectedSidebarThreadIds((current) => new Set([...current, ...visibleSidebarThreads.map((thread) => thread.id)]))} disabled={sidebarSelectionBusy || visibleSidebarThreads.length === 0}>{ui("全选")}</button><button type="button" onClick={() => setSelectedSidebarThreadIds(new Set())} disabled={sidebarSelectionBusy || selectedSidebarThreads.length === 0}>{ui("清空")}</button></div>
+          <div className="sidebar-selection-bar__summary"><span>{ui("已选")} {selectedSidebarThreads.length} {ui("个聊天")}</span><button type="button" onClick={() => setSelectedSidebarThreadIds((current) => new Set([...current, ...selectableSidebarThreads.map((thread) => thread.id)]))} disabled={sidebarSelectionBusy || selectableSidebarThreads.length === 0}>{ui("全选")}</button><button type="button" onClick={() => setSelectedSidebarThreadIds(new Set())} disabled={sidebarSelectionBusy || selectedSidebarThreads.length === 0}>{ui("清空")}</button></div>
           <div className="sidebar-selection-bar__actions"><button type="button" onClick={() => void pinSelectedSidebarThreads()} disabled={sidebarSelectionBusy || selectedSidebarThreads.length === 0}>{sidebarSelectionBusy ? <LoaderCircle className="spin" size={14} /> : <Pin size={14} />}{ui("置顶")}</button><button className="sidebar-selection-bar__delete" type="button" onClick={startBulkThreadDelete} disabled={sidebarSelectionBusy || selectedSidebarThreads.length === 0}><Trash2 size={14} />{ui("删除")}</button></div>
         </div> : null}
+        {collaboration?.listError && <div className="collaboration-error collaboration-list-error" role="alert"><span>{collaboration.listError}</span><button className="collaboration-text-button" type="button" onClick={() => void collaboration.onRefresh()}>{ui('重试')}</button></div>}
         <nav className="thread-list">
           {groupedSidebarThreads.map((section) => <Fragment key={section.label}>
             <div className="thread-list__section">{ui(section.label)}</div>
             {section.threads.map((thread) => {
-              const paneIndex = paneIndexForThread(thread.id)
+              const task = thread.collaboration
+              const paneIndex = task ? undefined : paneIndexForThread(thread.id)
               const threadRemote = paneIndex === undefined ? null : remotes[paneIndex]
-              const isReplying = threadRemote
+              const isReplying = task ? task.status === 'running' || task.status === 'waiting' : threadRemote
                 ? threadRemote.isRunning || threadRemote.runningTurnId !== null || threadRemote.messages.at(-1)?.streaming === true
                 : threadIsRunning(thread)
-              const isActive = !sidebarSelectionMode && paneIndex === selectedPaneIndex
+              const isActive = !sidebarSelectionMode && (task ? collaborationMode && task.id === collaboration?.selectedId : !collaborationMode && paneIndex === selectedPaneIndex)
               const isSelected = sidebarSelectionMode && selectedSidebarThreadIds.has(thread.id)
               const isPinned = pinnedThreadIds.has(thread.id)
               const hasScheduledMessage = scheduledThreadIds.has(thread.id)
-              const threadEngine = thread.engine === 'claude-code' ? 'claude-code' : 'codex'
-              const threadEngineLabel = threadEngine === 'claude-code' ? 'Claude Code' : 'Codex'
+              const threadEngine = thread.engine ?? 'codex'
+              const threadEngineLabel = engineLabel(threadEngine)
               return (
                 <div className={'thread-row-item' + (isActive ? ' thread-row-item--active' : '') + (isSelected ? ' thread-row-item--selected' : '') + (isReplying ? ' thread-row-item--replying' : '')} key={thread.id}>
                   <button className={'thread-row' + (isActive ? ' thread-row--active' : '') + (isSelected ? ' thread-row--selected' : '') + (paneIndex !== undefined ? ' thread-row--open' : '') + (isReplying ? ' thread-row--replying' : '')} type="button" ref={isReplying ? syncReplyBreatheOnMount : undefined} onAnimationStart={(event) => { if (event.animationName === 'composer-fill-breathe' || event.animationName === 'thread-row-reply-breathe') scheduleReplyBreatheSync() }} onClick={(event) => {
@@ -6934,10 +7473,10 @@ export function DevWispPage({ token, onUnauthorized, onUnpair, themePreferences,
                     clearThreadLongPress()
                     if (sidebarSelectionMode) toggleSidebarThreadSelection(thread.id)
                     else void selectThread(thread)
-                  }} onContextMenu={(event) => { event.preventDefault(); if (!sidebarSelectionMode) openThreadContextMenu(thread, event.clientX, event.clientY) }} onTouchStart={(event) => { if (!sidebarSelectionMode) handleThreadTouchStart(event, thread) }} onTouchMove={(event) => { if (!sidebarSelectionMode) handleThreadTouchMove(event) }} onTouchEnd={() => { if (!threadLongPress.current?.triggered) clearThreadLongPress() }} onTouchCancel={clearThreadLongPress} disabled={activeRemote.handedOff || sidebarSelectionBusy} aria-current={isActive ? 'page' : undefined} aria-pressed={sidebarSelectionMode ? isSelected : undefined} aria-description={isReplying ? ui('正在回复') : undefined}>
+                  }} onContextMenu={(event) => { event.preventDefault(); if (!sidebarSelectionMode) openThreadContextMenu(thread, event.clientX, event.clientY) }} onTouchStart={(event) => { if (!sidebarSelectionMode) handleThreadTouchStart(event, thread) }} onTouchMove={(event) => { if (!sidebarSelectionMode) handleThreadTouchMove(event) }} onTouchEnd={() => { if (!threadLongPress.current?.triggered) clearThreadLongPress() }} onTouchCancel={clearThreadLongPress} disabled={(!task && activeRemote.handedOff) || sidebarSelectionBusy || Boolean(task && sidebarSelectionMode)} aria-current={isActive ? 'page' : undefined} aria-pressed={sidebarSelectionMode ? isSelected : undefined} aria-description={isReplying ? ui('正在回复') : undefined}>
                     <span className="thread-row__breath" data-reply-breath-layer aria-hidden="true" />
-                    <span className="thread-row__icon" title={sidebarSelectionMode ? undefined : threadEngineLabel} role={sidebarSelectionMode ? undefined : 'img'} aria-label={sidebarSelectionMode ? undefined : threadEngineLabel}>{sidebarSelectionMode ? <span className={'thread-row__checkbox' + (isSelected ? ' thread-row__checkbox--checked' : '')} aria-hidden="true">{isSelected ? <Check size={13} /> : null}</span> : <EngineBrandIcon engine={threadEngine} size={15} />}</span>
-                    <span className="thread-row__copy"><strong>{titleOf(thread)}</strong><span className="thread-row__meta">{isPinned ? <Pin className="thread-row__pin" size={12} aria-label={ui("已置顶")} /> : null}{hasScheduledMessage ? <CalendarClock className="thread-row__scheduled" size={12} aria-label={ui("有定时发送")} /> : null}{remote0.completedThreadIds.includes(thread.id) ? <span className="thread-row__completion-dot" role="status" aria-label={ui("回复已完成")} title={ui("回复已完成")} /> : null}<small>{timeOf(thread)}</small></span></span>
+                    {!task && <span className="thread-row__icon" title={sidebarSelectionMode ? undefined : threadEngineLabel} role={sidebarSelectionMode ? undefined : 'img'} aria-label={sidebarSelectionMode ? undefined : threadEngineLabel}>{sidebarSelectionMode ? <span className={'thread-row__checkbox' + (isSelected ? ' thread-row__checkbox--checked' : '')} aria-hidden="true">{isSelected ? <Check size={13} /> : null}</span> : <EngineBrandIcon engine={threadEngine} size={15} />}</span>}
+                    <span className="thread-row__copy"><span className="thread-row__title-line">{task && <CollaborationModelIcons members={task.members} />}<strong>{titleOf(thread)}</strong></span><span className="thread-row__meta">{isPinned ? <Pin className="thread-row__pin" size={12} aria-label={ui("已置顶")} /> : null}{hasScheduledMessage ? <CalendarClock className="thread-row__scheduled" size={12} aria-label={ui("有定时发送")} /> : null}{remote0.completedThreadIds.includes(thread.id) ? <span className="thread-row__completion-dot" role="status" aria-label={ui("回复已完成")} title={ui("回复已完成")} /> : null}<small>{timeOf(thread)}</small></span></span>
                     {paneIndex !== undefined ? <span className="thread-row__pane-dot" title={ui("已打开")} /> : null}
                   </button>
                 </div>
@@ -6958,7 +7497,7 @@ export function DevWispPage({ token, onUnauthorized, onUnpair, themePreferences,
         </div>
         <footer className="remote-sidebar__footer">
           <div className="remote-sidebar__engine-statuses" role="group" aria-label={ui("引擎状态")}>
-            {[sidebarCodexStatus, sidebarClaudeStatus].map((status) => (
+            {[sidebarCodexStatus, sidebarClaudeStatus, sidebarDeepseekStatus].map((status) => (
               <span key={status.label} className="remote-sidebar__engine-status" role="img" aria-label={status.label} title={status.label}>
                 <i className={'status-dot status-dot--' + status.state} aria-hidden="true" />
                 <span className="remote-sidebar__engine-status-label">{status.label}</span>
@@ -6972,12 +7511,23 @@ export function DevWispPage({ token, onUnauthorized, onUnpair, themePreferences,
       {workspaceOpen || workspaceDragging ? <button className="workspace-backdrop" type="button" aria-label={ui("关闭文件树")} onClick={() => setWorkspaceOpen(false)} /> : null}
       {threadContextMenu ? (
         <div ref={threadContextMenuElement} className="thread-context-menu" style={{ left: threadContextMenu.x, top: threadContextMenu.y }} role="menu" tabIndex={-1} onPointerDown={(event) => event.stopPropagation()}>
+          {threadContextMenu.thread.collaboration ? <>
+            <ShortcutContextMenuButton shortcut={1} onClick={() => startThreadRename(threadContextMenu.thread)}><Pencil size={14} />{ui('重命名')}</ShortcutContextMenuButton>
+            <ShortcutContextMenuButton shortcut="Del" className="thread-context-menu__danger" onClick={() => startDissolveGroup(threadContextMenu.thread)}><Trash2 size={14} />{ui('解散群聊')}</ShortcutContextMenuButton>
+          </> : joinGroupMenu ? <>
+            <button type="button" role="menuitem" onClick={() => setJoinGroupMenu(false)}><ChevronLeft size={14} />{ui('返回')}</button>
+            <ShortcutContextMenuButton shortcut={1} disabled={groupBusy} onClick={() => void openGroupForThread(threadContextMenu.thread)}><Plus size={14} />{ui('新建协同群')}</ShortcutContextMenuButton>
+            <div className="collaboration-join-targets">{collaborationTasks.filter((task) => task.kind === 'group').map((task, index) => <ShortcutContextMenuButton key={task.id} shortcut={index + 2} disabled={groupBusy || task.status !== 'idle'} onClick={() => void openGroupForThread(threadContextMenu.thread, task.id)}><UsersRound size={14} /><span>{task.title}</span></ShortcutContextMenuButton>)}</div>
+          </> : <>
           <ShortcutContextMenuButton shortcut={1} onClick={() => { const thread = threadContextMenu.thread; setThreadContextMenu(null); void openConcurrentThread(thread) }}><MessagesSquare size={14} />{ui("并发打开")}</ShortcutContextMenuButton>
           <ShortcutContextMenuButton shortcut={2} onClick={() => void toggleThreadPin(threadContextMenu.thread)}>{pinnedThreadIds.has(threadContextMenu.thread.id) ? <PinOff size={14} /> : <Pin size={14} />}{pinnedThreadIds.has(threadContextMenu.thread.id) ? ui('取消置顶') : ui('置顶')}</ShortcutContextMenuButton>
           <ShortcutContextMenuButton shortcut={3} disabled={threadContextAction !== null} onClick={() => void exportThread(threadContextMenu.thread)}>{threadContextAction?.threadId === threadContextMenu.thread.id && threadContextAction.type === 'export' ? <LoaderCircle className="spin" size={14} /> : <Download size={14} />}{threadContextAction?.threadId === threadContextMenu.thread.id && threadContextAction.type === 'export' ? ui('导出中…') : ui('导出')}</ShortcutContextMenuButton>
           <ShortcutContextMenuButton shortcut={4} disabled={threadContextAction !== null} onClick={() => void quoteThread(threadContextMenu.thread)}>{threadContextAction?.threadId === threadContextMenu.thread.id && threadContextAction.type === 'quote' ? <LoaderCircle className="spin" size={14} /> : <Quote size={14} />}{threadContextAction?.threadId === threadContextMenu.thread.id && threadContextAction.type === 'quote' ? ui('引用中…') : ui('引用')}</ShortcutContextMenuButton>
           <ShortcutContextMenuButton shortcut={5} onClick={() => startThreadRename(threadContextMenu.thread)}><Pencil size={14} />{ui("重命名")}</ShortcutContextMenuButton>
           <ShortcutContextMenuButton shortcut="Del" className="thread-context-menu__danger" disabled={threadContextAction !== null} onClick={() => startThreadDelete(threadContextMenu.thread)}><Trash2 size={14} />{ui("删除聊天")}</ShortcutContextMenuButton>
+          {collaboration && <ShortcutContextMenuButton shortcut={6} onClick={() => setJoinGroupMenu(true)}><UsersRound size={14} />{ui('加入协同')}<ChevronRight size={13} /></ShortcutContextMenuButton>}
+          </>}
+          {groupError && <p className="collaboration-menu-error" role="alert">{groupError}</p>}
         </div>
       ) : null}
 
@@ -6994,6 +7544,23 @@ export function DevWispPage({ token, onUnauthorized, onUnpair, themePreferences,
             <div className="thread-rename-dialog__actions">
               <button type="button" onClick={closeThreadRename} disabled={threadRenameSaving}>{ui("取消")}</button>
               <button type="submit" disabled={threadRenameSaving || !threadRenameDraft.trim()}>{threadRenameSaving ? <><LoaderCircle className="spin" size={14} />{ui("保存中")}</> : ui('确定')}</button>
+            </div>
+          </form>
+        </div>
+      ) : null}
+
+      {dissolveTarget ? (
+        <div className="thread-rename-backdrop" role="presentation" onPointerDown={(event) => { if (event.target === event.currentTarget) closeDissolveGroup() }}>
+          <form className="thread-rename-dialog thread-delete-dialog" role="dialog" aria-modal="true" aria-labelledby="group-dissolve-title" aria-describedby="group-dissolve-description" aria-busy={dissolveSaving} onSubmit={(event) => { void submitDissolveGroup(event) }} onPointerDown={(event) => event.stopPropagation()}>
+            <div className="thread-rename-dialog__heading">
+              <div className="thread-delete-dialog__title"><AlertTriangle size={18} /><h2 id="group-dissolve-title">{ui('解散群聊')}</h2></div>
+              <p id="group-dissolve-description">{ui('解散后将移除群聊记录，成员恢复为单聊，成员聊天记录保留。正在进行的回复会在单聊中继续。')}</p>
+            </div>
+            <div className="thread-delete-dialog__thread" title={titleOf(dissolveTarget)}>{titleOf(dissolveTarget)}</div>
+            {dissolveError ? <p className="thread-rename-dialog__error" role="alert">{uiMessage(dissolveError)}</p> : null}
+            <div className="thread-rename-dialog__actions">
+              <button type="button" autoFocus onClick={closeDissolveGroup} disabled={dissolveSaving}>{ui('取消')}</button>
+              <button type="submit" disabled={dissolveSaving}>{dissolveSaving ? <><LoaderCircle className="spin" size={14} />{ui('解散中')}</> : <><Trash2 size={14} />{dissolveError ? ui('重试解散') : ui('确认解散')}</>}</button>
             </div>
           </form>
         </div>
@@ -7016,13 +7583,39 @@ export function DevWispPage({ token, onUnauthorized, onUnpair, themePreferences,
         </div>
       ) : null}
 
+          {collaboration && <div className="remote-workspace collaboration-workspace" hidden={!collaborationMode || settingsOpen || usageStatsOpen} ref={collaborationContent}>
+            <CollaborationPage ref={collaborationHandle} token={token} onCreate={() => void openGroupForThread()} creating={groupBusy} visible={collaborationMode && !settingsOpen && !usageStatsOpen} selectedId={collaboration.selectedId}
+              onSelect={collaboration.onSelect} onRefresh={async () => { await collaboration.onRefresh(); await remote0.refreshThreads() }} onOpenChat={collaboration.onOpenChat}
+              onUnauthorized={onUnauthorized} onOpenSidebar={openSidebarPanel} onOpenWorkspace={openWorkspacePanel}
+              onDraftCwdChange={setCollaborationDraftCwd} onOpenTerminal={() => openCollaborationTerminal()}
+              renderComposer={(task, ref, refresh) => <CollaborationComposer key={task.id} task={task} token={token} visible={collaborationMode && !settingsOpen && !usageStatsOpen}
+                composerRef={ref} base={{ ...sharedComposerProps, authorizationOptions: approvalPolicyOptions }}
+                catalogs={{
+                  codex: remotes.find((remote) => remote.models.length > 0)?.models ?? [],
+                  'claude-code': claudeModelOptions.filter((option) => option.value !== 'default').map((option) => ({ model: option.value, displayName: option.label, inputModalities: ['text', 'image'] })),
+                  'deepseek-harness': [...new Set([deepseekDefaultModel, 'deepseek-v4-flash', 'deepseek-v4-pro'])].filter(Boolean).map((model) => ({ model, displayName: model, inputModalities: ['text', 'image'], defaultReasoningEffort: 'default', supportedReasoningEfforts: (deepseekReasoningEffortsByModel[model] ?? ['default', 'high', 'max']).map((reasoningEffort) => ({ reasoningEffort })) })),
+                }} permissions={deepseekPermissionOptions} onRefresh={refresh} onCreate={() => void openGroupForThread()} onUnauthorized={onUnauthorized}
+                render={(overrides, handle) => <MessageComposer {...sharedComposerProps} {...overrides} ref={handle} />} />}
+            />
+            {collaborationTerminal && <TerminalRecoveryBoundary key={`${collaborationTerminal.scope}:${collaborationTerminal.cwd}`} onClose={() => setCollaborationTerminal((previous) => previous && { ...previous, visible: false })} hidden={!collaborationMode || settingsOpen || usageStatsOpen || !collaborationTerminal.visible || collaborationTerminal.scope !== collaborationTerminalScope}>
+              <Suspense fallback={<div className="collaboration-loading"><LoaderCircle className="spin" size={20} /></div>}>
+                <TerminalDialog token={token} engine={collaborationTerminal.engine} cwd={collaborationTerminal.cwd}
+                  visible={collaborationMode && !settingsOpen && !usageStatsOpen && collaborationTerminal.visible && collaborationTerminal.scope === collaborationTerminalScope}
+                  directoryRequest={collaborationTerminal.directory} onDirectoryRequestConsumed={(id) => setCollaborationTerminal((previous) => previous?.directory?.id === id ? { ...previous, directory: null } : previous)}
+                  runRequest={collaborationTerminal.run} onRunRequestConsumed={(id) => setCollaborationTerminal((previous) => previous?.run?.id === id ? { ...previous, run: null } : previous)}
+                  onClose={() => setCollaborationTerminal((previous) => previous && { ...previous, visible: false })}
+                  onInsertText={(text) => collaborationHandle.current?.appendText(text)} />
+              </Suspense>
+            </TerminalRecoveryBoundary>}
+          </div>}
+
       {settingsOpen ? (
         <ThemeSettingsPanel token={token} preferences={themePreferences} onChange={setThemePreferences} onClose={closeSettingsPanel} onUnpair={onUnpair} chatShortcuts={sidebarChatShortcuts} onChatShortcutsChange={setSidebarChatShortcuts} cpaUsageSettings={cpaUsageSettings} onCPAUsageSettingsChange={updateCPAUsageSettings} translation={translationPreferences} onTranslationChange={updateTranslationPreferences} onTranslationConfigSaved={() => setTranslationRevision((value) => value + 1)} />
       ) : usageStatsOpen ? (
-        <CPAUsageStatsPanel settings={cpaUsageSettings} token={token} onSourceChange={(source) => updateCPAUsageSettings({ ...cpaUsageSettings, source })} onOpenSettings={openSettingsPanel} onClose={closeUsageStatsPanel} />
+        <UsageStatsPanel settings={cpaUsageSettings} token={token} onSourceChange={(source) => updateCPAUsageSettings({ ...cpaUsageSettings, source })} onOpenSettings={openSettingsPanel} onClose={closeUsageStatsPanel} />
       ) : (
         <>
-          <section className="remote-workspace">
+          <section className="remote-workspace" hidden={collaborationMode}>
             <div className="remote-pane-grid" ref={paneGrid} style={{ '--pane-count': openPaneIndexes.length } as CSSProperties}>
               {openPaneIndexes.map((paneIndex) => (
                 <div className="remote-pane-slot" data-pane-index={paneIndex} key={`${paneIndex}-thread`}>
@@ -7033,7 +7626,8 @@ export function DevWispPage({ token, onUnauthorized, onUnpair, themePreferences,
                     translation={translationPreferences}
                     translationRevision={translationRevision}
                     remote={remotes[paneIndex]}
-                    active={paneIndex === selectedPaneIndex}
+                    managedTask={collaborationThreadIds.has(remotes[paneIndex].activeThread?.id ?? '')}
+                    active={!collaborationMode && paneIndex === selectedPaneIndex}
                     showActiveFrame={openPaneIndexes.length > 1}
                     showPaneClose={openPaneIndexes.length > 1}
                     claudeCodeAvailable={claudeCodeAvailable}
@@ -7048,66 +7642,8 @@ export function DevWispPage({ token, onUnauthorized, onUnpair, themePreferences,
                 </div>
               ))}
             </div>
-            <MessageComposer
-              token={token}
-              translation={translationPreferences}
-              translationRevision={translationRevision}
-              portalTheme={themePreferences.theme}
-              portalThemeStyle={composerPortalThemeStyle}
-              key={composerDraftScope}
-              ref={composerHandle}
-              draftScope={composerDraftScope}
-              onDraftChange={syncWorkspaceDraft}
-              composerHeightMemory={composerHeightMemory}
-              connection={activeRemote.handedOff ? 'disconnected' : activeRemote.connection}
-              isRunning={activeRemote.isRunning}
-              isReplying={activeRemote.isRunning || activeRemote.runningTurnId !== null || activeRemote.messages[activeRemote.messages.length - 1]?.streaming === true}
-              canInterrupt={activeRemote.activeEngine === 'claude-code' || activeRemote.activeThread?.canInterrupt !== false}
-              fileChangeSummary={runningFileChangeSummary}
-              fileChangeSummaryKey={activeRemote.runningTurnId}
-              reserveFileChangeSummarySpace={openPaneIndexes.length > 1 && Boolean(hasRunningFileChangesInOpenPanes)}
-              stableQueueHeight={openPaneIndexes.length > 1}
-              showCodexPreferences={!isClaudeCodeThread}
-              isInterrupting={activeRemote.isInterrupting}
-              writerConflict={activeRemote.writerConflict}
-              modelSupportsImages={modelSupportsImages}
-              selectedModel={selectedModel}
-              selectedEffort={selectedEffort}
-              selectedApprovalPolicy={selectedApprovalPolicy}
-              selectedClaudePermissionMode={selectedClaudePermissionMode}
-              temporaryPreferences={Boolean(temporaryPreferences)}
-              onTemporaryPreferencesChange={changeTemporaryPreferences}
-              modelOptions={modelOptions}
-              reasoningOptions={reasoningOptions}
-              reasoningOptionsByModel={reasoningOptionsByModel}
-              authorizationOptions={approvalPolicyOptions}
-              claudeModelOptions={claudeModelOptions}
-              claudeEffortOptions={claudeEffortOptions}
-              claudePermissionModeOptions={claudePermissionModeOptions}
-              onModelChange={changeModel}
-              onEffortChange={changeEffort}
-              onApprovalPolicyChange={changeApprovalPolicy}
-              onClaudePermissionModeChange={changeClaudePermissionMode}
-              approvalPolicyUpdating={activeRemote.updatingApprovalPolicy}
-              onUploadPdf={activeRemote.uploadPdfAttachment}
-              onSend={sendComposerMessage}
-              queuedMessages={activeRemote.queuedMessages}
-              onSendQueuedNow={activeRemote.sendQueuedMessageNow}
-              onRetryQueuedTranslation={activeRemote.retryQueuedTranslation}
-              onBeginQueuedEdit={activeRemote.beginEditQueuedMessage}
-              onUpdateQueuedMessage={activeRemote.updateQueuedMessage}
-              onEndQueuedEdit={activeRemote.endEditQueuedMessage}
-              onRemoveQueued={activeRemote.removeQueuedMessage}
-              onMoveQueued={activeRemote.moveQueuedMessage}
-              onInterrupt={pauseCurrentReply}
-              onContinue={continueInterruptedReply}
-              canContinue={canContinue}
-              continuationPending={Boolean(activeContinuation)}
-              onRefresh={activeRemote.refreshActiveThread}
-              onCreateThread={createComposerThread}
-              createThreadDisabled={activeRemote.handedOff || activeRemote.connection !== 'connected' || activeRemote.loadingHistory || (newThreadEngine === 'claude-code' && claudeCodeAvailable === false)}
-              createThreadTitle={newThreadEngine === 'claude-code' && claudeCodeAvailable === false ? ui('Claude Code 不可用') : uiFormat('新建{0}对话', newThreadEngine === 'claude-code' ? ' Claude Code' : ' Codex')}
-            />
+            {activeCollaboration && <div className="collaboration-reason" role="status"><button type="button" className="collaboration-text-button" onClick={() => onOpenCollaboration?.(activeCollaboration.id)}><UsersRound size={16} />{ui(activeCollaboration.kind === 'group' ? '返回协同群' : '返回协同任务')}</button> {ui(activeCollaboration.kind === 'group' ? '这是群成员会话，请回协同群发送消息。' : '成员会话由任务调度，请在协同工作区补充要求。')}</div>}
+            <MessageComposer {...sharedComposerProps} key={composerDraftScope} ref={composerHandle} />
           </section>
           <div
             className="workspace-resize-handle"
@@ -7151,10 +7687,10 @@ export function DevWispPage({ token, onUnauthorized, onUnpair, themePreferences,
             eyebrow="当前窗口"
             theme={themePreferences.theme}
             themePreferences={themePreferences}
-            engine={activeRemote.activeEngine}
+            engine={collaborationMode ? Object.values(selectedCollaboration?.members ?? {})[0]?.engine ?? 'claude-code' : activeRemote.activeEngine}
             cwd={activeWorkspaceCwd}
-            threadId={activeRemote.activeThread?.id}
-            canBindThreadWorkspace={activeRemote.connection === 'connected' && !activeRemote.loadingHistory && !activeRemote.handedOff && Boolean(activeRemote.activeThread?.id)}
+            threadId={collaborationMode ? undefined : activeRemote.activeThread?.id}
+            canBindThreadWorkspace={!collaborationMode && activeRemote.connection === 'connected' && !activeRemote.loadingHistory && !activeRemote.handedOff && Boolean(activeRemote.activeThread?.id)}
             onBindDirectory={async (cwd) => {
               const threadId = activeRemote.activeThread?.id
               if (!threadId) return false
@@ -7163,18 +7699,20 @@ export function DevWispPage({ token, onUnauthorized, onUnpair, themePreferences,
               return true
             }}
             previewRequest={workspacePreviewRequest}
-            previewContainerRef={paneGrid}
+            previewContainerRef={collaborationMode ? collaborationContent : paneGrid}
             onPreviewStateChange={handleWorkspacePreviewStateChange}
-            draft={activeWorkspaceDraft}
+            draft={collaborationMode ? '' : activeWorkspaceDraft}
             onInsertPath={(path, focus) => {
               insertWorkspacePath(path, focus)
             }}
             onAddToTerminal={(path) => {
+              if (collaborationMode) { openCollaborationTerminal(path, 'directory'); return }
               workspaceTerminalRequestSequence.current += 1
               setWorkspaceTerminalRequest({ id: workspaceTerminalRequestSequence.current, paneIndex: selectedPaneIndex, path, action: 'directory' })
               if (isMobileLayout() || Boolean(window.DevWispAndroid?.changeEndpoint)) setWorkspaceOpen(false)
             }}
             onRunInTerminal={(path) => {
+              if (collaborationMode) { openCollaborationTerminal(path, 'run'); return }
               workspaceTerminalRequestSequence.current += 1
               setWorkspaceTerminalRequest({ id: workspaceTerminalRequestSequence.current, paneIndex: selectedPaneIndex, path, action: 'run' })
               if (isMobileLayout() || Boolean(window.DevWispAndroid?.changeEndpoint)) setWorkspaceOpen(false)
@@ -7332,6 +7870,7 @@ function ThemeSettingsPanel({ token, preferences, onChange, onClose, onUnpair, c
     { label: ui('连接'), items: [
       { id: 'codex-config', label: 'Codex API', icon: <EngineBrandIcon engine="codex" size={17} /> },
       { id: 'claude-config', label: 'Claude Code API', icon: <EngineBrandIcon engine="claude-code" size={17} /> },
+      { id: 'deepseek-config', label: 'DeepSeek API', icon: <EngineBrandIcon engine="deepseek-harness" size={17} /> },
       { id: 'cpa-manager', label: ui('token使用量查询'), icon: <Link2 size={17} /> },
       { id: 'ssh-mcp', label: ui('SSH MCP 服务器'), icon: <Server size={17} /> },
       { id: 'mcp-approvals', label: ui('MCP 自动批准'), icon: <ShieldCheck size={17} /> },
@@ -7362,8 +7901,8 @@ function ThemeSettingsPanel({ token, preferences, onChange, onClose, onUnpair, c
       setRecordingShortcut(null)
       setShortcutMessage('已取消录制。')
     }
-    const switchingEngineConfig = (activeSection === 'codex-config' || activeSection === 'claude-config')
-      && (sectionId === 'codex-config' || sectionId === 'claude-config')
+    const engineConfigSections: readonly SettingsSectionId[] = ['codex-config', 'claude-config', 'deepseek-config']
+    const switchingEngineConfig = engineConfigSections.includes(activeSection) && engineConfigSections.includes(sectionId)
     setActiveSection(sectionId)
     saveActiveSettingsSection(sectionId)
     if (!switchingEngineConfig) settingsContentRef.current?.scrollTo({ top: 0 })
@@ -7556,6 +8095,9 @@ function ThemeSettingsPanel({ token, preferences, onChange, onClose, onUnpair, c
         <div className="theme-settings-panel__content" ref={settingsContentRef}>
         <div id="settings-section-codex-config" className="theme-settings-panel__section" hidden={activeSection !== 'codex-config'}>
           {activeSection === 'codex-config' ? <NativeEngineConfigCard token={token} engine="codex" onDirtyChange={setNativeConfigDirty} /> : null}
+        </div>
+        <div id="settings-section-deepseek-config" className="theme-settings-panel__section" hidden={activeSection !== 'deepseek-config'}>
+          {activeSection === 'deepseek-config' ? <DeepSeekSettings token={token} onDirtyChange={setNativeConfigDirty} /> : null}
         </div>
         <div id="settings-section-claude-config" className="theme-settings-panel__section" hidden={activeSection !== 'claude-config'}>
           {activeSection === 'claude-config' ? <NativeEngineConfigCard token={token} engine="claude" onDirtyChange={setNativeConfigDirty} /> : null}
@@ -7887,8 +8429,9 @@ function renderMessageInlineMarkdown(value: string, keyPrefix: string, preferWeb
 }
 
 const ClaudeFormattingContext = createContext(false)
+const AssistantMessageContext = createContext(false)
 
-function renderMessageText(value: string, keyPrefix: string, preferWebUrlLabel: boolean, claudeFormatting = false): ReactNode[] {
+function renderMessageText(value: string, keyPrefix: string, preferWebUrlLabel: boolean, claudeFormatting = false, tableCopyEnabled = false): ReactNode[] {
   const lines = value.replace(/\r\n?/g, '\n').split('\n')
   const elements: ReactNode[] = []
   let plainLines: string[] = []
@@ -7915,7 +8458,7 @@ function renderMessageText(value: string, keyPrefix: string, preferWebUrlLabel: 
 
     flushPlainText()
     elements.push(
-      <div className="chat-message__table-scroll" key={`${keyPrefix}-table-${tableIndex++}`}>
+      <MessageTable copyEnabled={tableCopyEnabled} source={lines.slice(lineIndex, table.nextLine).join('\n')} key={`${keyPrefix}-table-${tableIndex++}`}>
         <table className="chat-message__table">
           <thead>
             <tr>{table.headers.map((cell, index) => <th key={index} scope="col" style={{ textAlign: table.alignments[index] }}>{renderMessageInlineMarkdown(cell, `${keyPrefix}-table-${tableIndex}-header-${index}`, preferWebUrlLabel)}</th>)}</tr>
@@ -7924,7 +8467,7 @@ function renderMessageText(value: string, keyPrefix: string, preferWebUrlLabel: 
             {table.rows.map((row, rowIndex) => <tr key={rowIndex}>{row.map((cell, index) => <td key={index} style={{ textAlign: table.alignments[index] }}>{renderMessageInlineMarkdown(cell, `${keyPrefix}-table-${tableIndex}-row-${rowIndex}-cell-${index}`, preferWebUrlLabel)}</td>)}</tr>)}
           </tbody>
         </table>
-      </div>,
+      </MessageTable>,
     )
     lineIndex = table.nextLine
   }
@@ -7935,6 +8478,7 @@ function renderMessageText(value: string, keyPrefix: string, preferWebUrlLabel: 
 
 const MessageContent = memo(function MessageContent({ text, hideStandaloneSeparators = false, preferWebUrlLabel = false }: { text: string; hideStandaloneSeparators?: boolean; preferWebUrlLabel?: boolean }) {
   const claudeFormatting = useContext(ClaudeFormattingContext)
+  const tableCopyEnabled = useContext(AssistantMessageContext)
   const codePattern = /```([^\n]*)\n([\s\S]*?)```/g
   const blocks: Array<{ type: 'text' | 'code'; value: string; language?: string }> = []
   let cursor = 0
@@ -7957,7 +8501,7 @@ const MessageContent = memo(function MessageContent({ text, hideStandaloneSepara
         const value = hideStandaloneSeparators
           ? stripStandaloneSeparators(block.value).replace(/\r\n?/g, '\n').replace(/\n(?:[\t ]*\n){2,}/g, '\n\n').trim()
           : block.value
-        return value ? renderMessageText(value, `text-${index}`, preferWebUrlLabel, claudeFormatting) : null
+        return value ? renderMessageText(value, `text-${index}`, preferWebUrlLabel, claudeFormatting, tableCopyEnabled) : null
       })}
     </div>
   )
@@ -7965,6 +8509,8 @@ const MessageContent = memo(function MessageContent({ text, hideStandaloneSepara
 
 const CodeBlock = memo(function CodeBlock({ value, language }: { value: string; language?: string }) {
   useUiLanguage()
+  const container = useRef<HTMLDivElement>(null)
+  const [highlightRequested, setHighlightRequested] = useState(false)
   const [copied, setCopied] = useState(false)
   const [highlighted, setHighlighted] = useState<{
     value: string
@@ -7974,8 +8520,26 @@ const CodeBlock = memo(function CodeBlock({ value, language }: { value: string; 
   const resetTimer = useRef<number | undefined>(undefined)
 
   useEffect(() => {
+    const element = container.current
+    if (!element || typeof IntersectionObserver === 'undefined') {
+      setHighlightRequested(true)
+      return
+    }
+    // Keep offscreen history as plain code, rather than thousands of token
+    // spans. Preload nearby blocks and retain highlighting once viewed.
+    const observer = new IntersectionObserver((entries) => {
+      if (!entries.some((entry) => entry.isIntersecting)) return
+      setHighlightRequested(true)
+      observer.disconnect()
+    }, { root: element.closest('.message-stream'), rootMargin: '600px 0px' })
+    observer.observe(element)
+    return () => observer.disconnect()
+  }, [])
+
+  useEffect(() => {
     let cancelled = false
     setHighlighted(null)
+    if (!highlightRequested) return
     void import('../lib/codeHighlight').then(({ highlightCodeLines }) => highlightCodeLines('', value, language, false)).then((lines) => {
       if (!cancelled) setHighlighted({ value, language, lines })
     }).catch(() => {
@@ -7984,7 +8548,7 @@ const CodeBlock = memo(function CodeBlock({ value, language }: { value: string; 
     return () => {
       cancelled = true
     }
-  }, [value, language])
+  }, [value, language, highlightRequested])
 
   useEffect(() => () => {
     if (resetTimer.current !== undefined) window.clearTimeout(resetTimer.current)
@@ -8000,7 +8564,7 @@ const CodeBlock = memo(function CodeBlock({ value, language }: { value: string; 
   const highlightedLines = highlighted?.value === value && highlighted.language === language ? highlighted.lines : null
 
   return (
-    <div className="chat-message__code-wrap">
+    <div className="chat-message__code-wrap" ref={container}>
       <pre className="chat-message__code">
         <code className="syntax-highlighted" data-language={language}>{highlightedLines
           ? highlightedLines.map((line, lineIndex) => (
@@ -8182,12 +8746,14 @@ const OperationLog = memo(function OperationLog({
   fileChanges = [],
   onOpenFile,
   onOpenImage,
+  onToggleDetails,
   title = '操作记录',
 }: {
   operations: CodexOperation[]
   fileChanges?: CodexFileChange[]
   onOpenFile: (path: string, diff?: string) => void
   onOpenImage: (path: string) => void
+  onToggleDetails?: () => void
   title?: string
 }) {
   useUiLanguage()
@@ -8212,7 +8778,7 @@ const OperationLog = memo(function OperationLog({
 
   return (
     <details className="operation-log" open={expanded} onToggle={(event) => setExpanded(event.currentTarget.open)}>
-      <summary><ChevronDown size={13} /><span>{ui(title)}</span><small>{uiMessage(statusText)}</small></summary>
+      <summary onClick={onToggleDetails}><ChevronDown size={13} /><span>{ui(title)}</span><small>{uiMessage(statusText)}</small></summary>
       <ul>
         {operations.map((operation) => {
           const fileChange = fileChanges.find((change) => change.id === operation.id)
@@ -8284,13 +8850,14 @@ function activityTimelineMatchesText(text: string, timeline: CodexActivityTimeli
   return offset === text.length
 }
 
-const ActivityTimelineContent = memo(function ActivityTimelineContent({ text, timeline, operations, fileChanges = [], onOpenFile, onOpenImage, preferWebUrlLabel = false, streaming = false, messageId, choiceItemId, choicePromptText, choiceCard }: {
+const ActivityTimelineContent = memo(function ActivityTimelineContent({ text, timeline, operations, fileChanges = [], onOpenFile, onOpenImage, onToggleDetails, preferWebUrlLabel = false, streaming = false, messageId, choiceItemId, choicePromptText, choiceCard }: {
   text: string
   timeline: CodexActivityTimelineEntry[]
   operations: CodexOperation[]
   fileChanges?: CodexFileChange[]
   onOpenFile: (path: string, diff?: string) => void
   onOpenImage: (path: string) => void
+  onToggleDetails?: () => void
   preferWebUrlLabel?: boolean
   streaming?: boolean
   messageId?: string
@@ -8310,7 +8877,7 @@ const ActivityTimelineContent = memo(function ActivityTimelineContent({ text, ti
       {beforeChoiceText ? <MessageContent text={beforeChoiceText} hideStandaloneSeparators preferWebUrlLabel={preferWebUrlLabel} /> : null}
       {choiceCard}
       {afterChoiceText ? <MessageContent text={afterChoiceText} hideStandaloneSeparators preferWebUrlLabel={preferWebUrlLabel} /> : null}
-      <OperationLog operations={operations} fileChanges={fileChanges} onOpenFile={onOpenFile} onOpenImage={onOpenImage} />
+      <OperationLog operations={operations} fileChanges={fileChanges} onToggleDetails={onToggleDetails} onOpenFile={onOpenFile} onOpenImage={onOpenImage} />
     </div>
   }
   // Keep one DOM layout throughout a live reply. Timeline lengths and text
@@ -8376,6 +8943,7 @@ const ActivityTimelineContent = memo(function ActivityTimelineContent({ text, ti
           key={block.key}
           operations={block.operations}
           fileChanges={fileChanges}
+          onToggleDetails={onToggleDetails}
           onOpenFile={onOpenFile}
           onOpenImage={onOpenImage}
           title={block.operations.length === 1 ? block.operations[0].label : uiFormat("{0} 个连续操作", block.operations.length)}
@@ -8432,7 +9000,7 @@ const TurnElapsed = memo(function TurnElapsed({ startedAt }: { startedAt: number
   return <time className="running-indicator__elapsed" aria-live="off">{ui("已用")} {formatTurnDuration(now - startedAt)}</time>
 })
 
-function MessageChoiceForm({ groups, replyGroups = groups, enabled, onUse, onSend }: { groups: MessageChoiceGroup[]; replyGroups?: MessageChoiceGroup[]; enabled: boolean; onUse: (reply: string) => boolean; onSend: (reply: string) => Promise<ChoiceReplyDelivery | false> }) {
+function MessageChoiceForm({ groups, replyGroups = groups, enabled, onUse, onSend }: { groups: MessageChoiceGroup[]; replyGroups?: MessageChoiceGroup[]; enabled: boolean; onUse: (reply: string, images?: CodexImageAttachment[]) => boolean; onSend: (reply: string, images?: CodexImageAttachment[]) => Promise<ChoiceReplyDelivery | false> }) {
   useUiLanguage()
   const [selected, setSelected] = useState(() => groups.map(() => -1))
   const [customAnswers, setCustomAnswers] = useState(() => groups.map(() => ''))
@@ -8444,18 +9012,20 @@ function MessageChoiceForm({ groups, replyGroups = groups, enabled, onUse, onSen
   const submittedRef = useRef(false)
   const composingRef = useRef(false)
   const lastCompositionEndAt = useRef(0)
-  const complete = selected.every((optionIndex, index) => optionIndex >= 0 || optionIndex === -2 && Boolean(customAnswers[index].trim()))
+  const images = useQuestionAnswerImages()
+  const complete = selected.every((optionIndex, index) => optionIndex >= 0 || optionIndex === -2 && Boolean(customAnswers[index].trim() || images.has(String(index))))
+  const selectedImages = () => selected.flatMap((value, index) => value === -2 ? images.get(String(index)) : [])
   // The displayed groups may be translated while the reply must still be
   // composed from the original (English) option labels so the AI receives
   // text consistent with the conversation.
-  const reply = () => formatAssistantChoiceReply(replyGroups, selected, customAnswers)
+  const reply = () => formatAssistantChoiceReply(replyGroups, selected, customAnswers.map((value, index) => value.trim() || (images.has(String(index)) ? ui('已附加图片') : '')))
 
   async function sendAnswer() {
-    if (!enabled || !complete || inserted || submittedRef.current || sendingRef.current) return
+    if (!enabled || !complete || images.isBusy() || inserted || submittedRef.current || sendingRef.current) return
     sendingRef.current = true
     setSending(true)
     try {
-      const result = await onSend(reply())
+      const result = await onSend(reply(), selectedImages())
       if (result) {
         submittedRef.current = true
         setSubmitted(result)
@@ -8489,34 +9059,26 @@ function MessageChoiceForm({ groups, replyGroups = groups, enabled, onUse, onSen
     <div className="message-choices" aria-label={enabled ? ui('助手提出的选择题') : ui('历史选择题，已有后续消息')}>
       <strong className="message-choices__heading">{ui("快速选择")}</strong>
       {groups.map((group, groupIndex) => (
-        <fieldset className="message-choices__group" key={`${groupIndex}-${group.question}`}>
-          <legend>{group.question}</legend>
-          <div className="message-choices__options">
-            {group.options.map((option, optionIndex) => (
-              <button
-                className={`message-choices__option${selected[groupIndex] === optionIndex ? ' message-choices__option--selected' : ''}`}
-                type="button"
-                key={`${optionIndex}-${option}`}
-                aria-pressed={selected[groupIndex] === optionIndex}
-                disabled={!enabled || inserted || sending || submitted !== null}
-                onClick={() => setSelected((current) => current.map((value, index) => index === groupIndex
-                  ? (value === optionIndex ? -1 : optionIndex)
-                  : value))}
-              >{selected[groupIndex] === optionIndex ? <Check size={14} aria-hidden="true" /> : null}<span>{option}{group.descriptions?.[optionIndex] ? <small>{group.descriptions[optionIndex]}</small> : null}</span></button>
-            ))}
-            <button className={`message-choices__option${selected[groupIndex] === -2 ? ' message-choices__option--selected' : ''}`} type="button" aria-pressed={selected[groupIndex] === -2} disabled={!enabled || inserted || sending || submitted !== null} onClick={() => setSelected((current) => current.map((value, index) => index === groupIndex ? value === -2 ? -1 : -2 : value))}>{ui("其他答案（没有合适选项时填写）")}</button>
-          </div>
+        <QuestionFields key={groupIndex} title={group.question}
+          options={[...group.options.map((label, index) => ({ value: String(index), label, description: group.descriptions?.[index] })),
+            { value: '-2', label: ui('其他答案（没有合适选项时填写）') }]}
+          selected={[String(selected[groupIndex])]} disabled={!enabled || inserted || sending || images.busy || submitted !== null}
+          onToggle={(value) => setSelected((current) => current.map((previous, index) => index === groupIndex
+            ? previous === Number(value) ? -1 : Number(value) : previous))}>
           {selected[groupIndex] === -2 ? <>
-            <textarea className="message-choices__custom" value={customAnswers[groupIndex]} maxLength={1000} disabled={!enabled || inserted || sending || submitted !== null} aria-label={uiFormat("{0}的其他答案", group.question)} aria-keyshortcuts="Enter" enterKeyHint="send" title={ui("Enter 发送；Shift+Enter 换行")} onChange={(event) => setCustomAnswers((current) => current.map((value, index) => index === groupIndex ? event.target.value : value))} onCompositionStart={() => { composingRef.current = true }} onCompositionEnd={() => { composingRef.current = false; lastCompositionEndAt.current = Date.now() }} onBlur={() => { composingRef.current = false }} onKeyDown={handleCustomAnswerKeyDown} />
-            {enabled && !inserted && submitted === null ? <small className="message-choices__custom-hint">{ui("Enter 发送 · Shift+Enter 换行")}</small> : null}
+            <textarea className="message-choices__custom" value={customAnswers[groupIndex]} maxLength={1000} disabled={!enabled || inserted || sending || images.busy || submitted !== null} aria-label={uiFormat("{0}的其他答案", group.question)} aria-keyshortcuts="Enter" enterKeyHint="send" title={ui("Enter 发送；Shift+Enter 换行")} onPaste={(event) => images.paste(String(groupIndex), event)} onChange={(event) => setCustomAnswers((current) => current.map((value, index) => index === groupIndex ? event.target.value : value))} onCompositionStart={() => { composingRef.current = true }} onCompositionEnd={() => { composingRef.current = false; lastCompositionEndAt.current = Date.now() }} onBlur={() => { composingRef.current = false }} onKeyDown={handleCustomAnswerKeyDown} />
+            <QuestionAnswerImages images={images.get(String(groupIndex))} disabled={!enabled || inserted || sending || images.busy || submitted !== null} onRemove={(index) => images.remove(String(groupIndex), index)} />
+            {enabled && !inserted && submitted === null ? <small className="message-choices__custom-hint">{ui("Enter 发送 · Shift+Enter 换行")} · {ui('支持粘贴图片')}</small> : null}
           </> : null}
-        </fieldset>
+        </QuestionFields>
       ))}
+      {images.error ? <p role="alert">{images.error}</p> : null}
       {enabled ? <div className="message-choices__footer">
-        <button type="button" disabled={!complete || inserted || sending || submitted !== null} onClick={() => void sendAnswer()}>{sending ? ui('正在发送…') : submitted === 'sent' ? ui('答案已发送') : submitted === 'queued' ? ui('已加入排队') : submitted === 'unverified' ? ui('送达未确认') : ui('发送并继续')}</button>
-        <button type="button" disabled={!complete || inserted || sending || submitted !== null} onClick={() => {
-          if (onUse(reply())) setInserted(true)
-          else setNotice('请先结束当前编辑，再填入回答')
+        <button type="button" disabled={!complete || inserted || sending || images.busy || submitted !== null} onClick={() => void sendAnswer()}>{sending ? ui('正在发送…') : submitted === 'sent' ? ui('答案已发送') : submitted === 'queued' ? ui('已加入排队') : submitted === 'unverified' ? ui('送达未确认') : ui('发送并继续')}</button>
+        <button type="button" disabled={!complete || inserted || sending || images.busy || submitted !== null} onClick={() => {
+          if (images.isBusy()) return
+          if (onUse(reply(), selectedImages())) setInserted(true)
+          else setNotice('无法填入回答：请先结束当前编辑，并检查图片数量和大小限制')
         }}>{inserted ? ui('已填入输入框') : ui('填入输入框')}</button>
         <small>{uiMessage(notice)}</small>
       </div> : <small className="message-choices__history-notice">{ui("该问题已有后续消息")}</small>}
@@ -8527,7 +9089,7 @@ function MessageChoiceForm({ groups, replyGroups = groups, enabled, onUse, onSen
 const assistantTranslationCache = new Map<string, string>()
 const assistantQuestionsTranslationCache = new Map<string, MessageChoiceGroup[]>()
 
-function AssistantTranslation({ token, text, preferences, revision, streaming, questions, choiceEnabled, onUseChoices, onSendChoices, children, renderCopyAction, onOpenOriginal }: {
+function AssistantTranslation({ token, text, preferences, revision, streaming, questions, choiceEnabled, onUseChoices, onSendChoices, children, renderCopyAction, onToggleDetails }: {
   token: string
   text: string
   preferences: TranslationPreferences
@@ -8535,11 +9097,11 @@ function AssistantTranslation({ token, text, preferences, revision, streaming, q
   streaming: boolean
   questions?: MessageChoiceGroup[]
   choiceEnabled?: boolean
-  onUseChoices?: (reply: string) => boolean
-  onSendChoices?: (reply: string) => Promise<ChoiceReplyDelivery | false>
+  onUseChoices?: (reply: string, images?: CodexImageAttachment[]) => boolean
+  onSendChoices?: (reply: string, images?: CodexImageAttachment[]) => Promise<ChoiceReplyDelivery | false>
   children: ReactNode
   renderCopyAction: (text: string) => ReactNode
-  onOpenOriginal?: () => void
+  onToggleDetails?: () => void
 }) {
   useUiLanguage()
   const translationProfileId = selectedTranslationProfileId(preferences)
@@ -8658,7 +9220,7 @@ function AssistantTranslation({ token, text, preferences, revision, streaming, q
     {eligible && error ? <div className="assistant-translation__error"><span>{uiMessage(error)}</span><button type="button" onClick={() => setRetry((value) => value + 1)}>{ui("重试")}</button></div> : null}
     {eligible || tooLong
       ? translated || error || tooLong
-        ? <details className="assistant-translation__original"><summary onClick={onOpenOriginal}>{ui("查看英文原文")}</summary>{children}{renderCopyAction(text)}</details>
+        ? <details className="assistant-translation__original"><summary onClick={onToggleDetails}>{ui("查看英文原文")}</summary>{children}{renderCopyAction(text)}</details>
         : null
       : waitingForText ? null : children}
     {renderedChoiceCard}
@@ -8666,7 +9228,7 @@ function AssistantTranslation({ token, text, preferences, revision, streaming, q
   </div>
 }
 
-const MessageBubble = memo(function MessageBubble({ token, translation, translationRevision, message, originalTextOverride, assistantName, operations, fileChanges, activityTimeline, showOperations, choiceVisible, choiceEnabled, onUseChoices, onSendChoices, assistantModelOptions, copyFeedback, onCopy, onResend, resendingMessageId, canResend, onOpenOriginal, onOpenFile, onOpenImage }: {
+const MessageBubble = memo(function MessageBubble({ token, translation, translationRevision, message, originalTextOverride, assistantName, operations, fileChanges, activityTimeline, showOperations, choiceVisible, choiceEnabled, onUseChoices, onSendChoices, assistantModelOptions, copyFeedback, onCopy, onResend, resendingMessageId, canResend, onToggleDetails, onOpenFile, onOpenImage }: {
   token: string
   translation: TranslationPreferences
   translationRevision: number
@@ -8679,20 +9241,20 @@ const MessageBubble = memo(function MessageBubble({ token, translation, translat
   showOperations: boolean
   choiceVisible?: boolean
   choiceEnabled?: boolean
-  onUseChoices?: (reply: string) => boolean
-  onSendChoices?: (reply: string) => Promise<ChoiceReplyDelivery | false>
+  onUseChoices?: (reply: string, images?: CodexImageAttachment[]) => boolean
+  onSendChoices?: (reply: string, images?: CodexImageAttachment[]) => Promise<ChoiceReplyDelivery | false>
   assistantModelOptions: ComposerMenuOption[]
   copyFeedback: string | null
   onCopy: (message: CodexMessage, displayedText?: string) => void | Promise<void>
   onResend: (message: CodexMessage) => boolean | Promise<boolean>
   resendingMessageId: string | null
   canResend: boolean
-  onOpenOriginal?: () => void
+  onToggleDetails?: () => void
   onOpenFile: (path: string, diff?: string) => void
   onOpenImage: (path: string) => void
 }) {
   useUiLanguage()
-  // Whole-message copy waits for the turn; closed code blocks can be copied immediately.
+  // Whole-message copy waits for the turn; rendered tables and closed code blocks can be copied immediately.
   const showCopyAction = !message.streaming && Boolean(message.text || message.documents?.length || message.images?.length)
   const resendImages = message.role === 'user' ? resendImageAttachments(message.images) : []
   const resendingThisMessage = resendingMessageId === message.id
@@ -8702,6 +9264,7 @@ const MessageBubble = memo(function MessageBubble({ token, translation, translat
   </div> : null
   const sentAtLabel = formatMessageTimestamp(message.role === 'user' ? message.sentAt : undefined)
   const replyStartedAtLabel = formatMessageTimestamp(message.role === 'assistant' ? message.replyStartedAt : undefined)
+  const assistantEngine = assistantName === 'DeepSeek Harness' ? 'deepseek-harness' : assistantName === 'Claude Code' ? 'claude-code' : 'codex'
   const revealedText = useStreamingTextReveal(message.text, Boolean(message.role === 'assistant' && message.streaming
     && !(translation.enabled && translation.showTranslated) && !message.questions?.length))
   const choiceText = message.streaming ? message.text.slice(0, message.completedTextLength ?? 0) : message.text
@@ -8744,16 +9307,17 @@ const MessageBubble = memo(function MessageBubble({ token, translation, translat
     {choiceCard}
     {afterChoiceText ? <MessageContent text={afterChoiceText} hideStandaloneSeparators preferWebUrlLabel={preferWebUrlLabel} /> : null}
   </> : message.role === 'assistant' && (activityTimeline.length > 0 || message.streaming || message.id.startsWith('streaming-assistant-'))
-    ? <ActivityTimelineContent text={renderedText} timeline={activityTimeline} operations={showOperations ? operations : emptyOperations} fileChanges={fileChanges} onOpenFile={onOpenFile} onOpenImage={onOpenImage} preferWebUrlLabel={preferWebUrlLabel} streaming={message.streaming} messageId={message.id} choiceItemId={choiceInTimeline ? message.choiceItemId : undefined} choicePromptText={choiceInTimeline ? message.choicePromptText : undefined} choiceCard={choiceInTimeline ? choiceCard : undefined} />
+    ? <ActivityTimelineContent text={renderedText} timeline={activityTimeline} operations={showOperations ? operations : emptyOperations} fileChanges={fileChanges} onToggleDetails={onToggleDetails} onOpenFile={onOpenFile} onOpenImage={onOpenImage} preferWebUrlLabel={preferWebUrlLabel} streaming={message.streaming} messageId={message.id} choiceItemId={choiceInTimeline ? message.choiceItemId : undefined} choicePromptText={choiceInTimeline ? message.choicePromptText : undefined} choiceCard={choiceInTimeline ? choiceCard : undefined} />
     : renderedText ? <MessageContent text={renderedText} hideStandaloneSeparators={message.role === 'assistant'} preferWebUrlLabel={preferWebUrlLabel} /> : null
 
   return (
+    <AssistantMessageContext.Provider value={message.role === 'assistant'}>
     <ClaudeFormattingContext.Provider value={message.role === 'assistant' && assistantName === 'Claude Code'}>
     <article className={`chat-message chat-message--${message.role}`} data-message-id={message.id}>
       <span className="chat-message__avatar">{message.role === 'user' ? ui('你') : 'C'}</span>
       <div className="chat-message__body">
         <div className="chat-message__meta">
-          {message.role === 'assistant' ? <strong className={`chat-message__assistant-name chat-message__assistant-name--${assistantName === 'Claude Code' ? 'claude' : 'codex'}`}>{assistantName}</strong> : null}
+          {message.role === 'assistant' ? <strong className={`chat-message__assistant-name chat-message__assistant-name--${assistantEngine === 'claude-code' ? 'claude' : assistantEngine === 'deepseek-harness' ? 'deepseek' : 'codex'}`}><EngineBrandIcon engine={assistantEngine} size={14} />{assistantName}</strong> : null}
           {replyStartedAtLabel ? <time className="chat-message__timing" aria-live="off" dateTime={message.replyStartedAt} title={message.replyStartedAt ? new Date(message.replyStartedAt).toLocaleString(getUiLanguage()) : undefined}>{ui("开始")} {replyStartedAtLabel}</time> : null}
           {!message.streaming && message.replyDurationMs !== undefined ? <time className="chat-message__timing" aria-live="off">{ui("用时")} {formatTurnDuration(message.replyDurationMs)}</time> : null}
         </div>
@@ -8761,12 +9325,15 @@ const MessageBubble = memo(function MessageBubble({ token, translation, translat
         {message.documents?.map((document, index) => document.name === 'pasted-table.md' && !document.sourceFileId
           ? <PastedTablePreview key={`${document.name}-${index}`} content={document.content} maxRows={60} />
           : <div className="message-document" key={`${document.name}-${document.sourceFileId ?? index}`}><FileText size={15} /><span><strong>{document.name}</strong><small>{document.sourceFileId ? ui('原始文件 · Codex 读取原件') : uiFormat("{0} 个字符", document.charCount.toLocaleString())}</small></span></div>)}
-        {message.role === 'assistant' && (translateAssistant || !message.streaming)
-          ? <AssistantTranslation token={token} text={translateAssistant ? completedAssistantText : message.text} preferences={translation} revision={translationRevision} streaming={Boolean(message.streaming)} questions={translateAssistant ? structuredQuestions ?? undefined : undefined} choiceEnabled={choiceEnabled} onUseChoices={onUseChoices} onSendChoices={onSendChoices} renderCopyAction={renderCopyAction} onOpenOriginal={onOpenOriginal}>{translateAssistant ? <MessageContent text={completedAssistantText} hideStandaloneSeparators preferWebUrlLabel /> : bodyContent}</AssistantTranslation>
+        {message.role === 'user' && isCollaborationPrompt(message.text)
+          ? <details className="chat-message__collaboration-context"><summary><UsersRound size={14} />{ui('协同上下文（点击展开）')}</summary>{bodyContent}</details>
+          : message.role === 'assistant' && (translateAssistant || !message.streaming)
+          ? <AssistantTranslation token={token} text={translateAssistant ? completedAssistantText : message.text} preferences={translation} revision={translationRevision} streaming={Boolean(message.streaming)} questions={translateAssistant ? structuredQuestions ?? undefined : undefined} choiceEnabled={choiceEnabled} onUseChoices={onUseChoices} onSendChoices={onSendChoices} renderCopyAction={renderCopyAction} onToggleDetails={onToggleDetails}>{translateAssistant ? <MessageContent text={completedAssistantText} hideStandaloneSeparators preferWebUrlLabel /> : bodyContent}</AssistantTranslation>
           : bodyContent}
         {originalUserText ? <details className="chat-message__alternate-text"><summary>{showTranslatedUser ? ui('查看中文原文') : ui('查看英文发送内容')}</summary><MessageContent text={showTranslatedUser ? originalUserText : message.text} hideStandaloneSeparators={false} preferWebUrlLabel={false} /></details> : null}
+        {message.harness ? <HarnessTurnDetails value={message.harness} streaming={message.streaming} onToggleDetails={onToggleDetails} /> : null}
         {message.replyError ? <div className="chat-message__reply-error" role="status"><AlertTriangle size={13} aria-hidden="true" /><span>{uiMessage(message.replyError)}</span></div> : null}
-        {showOperations && operations.length > 0 && !message.streaming && (translateAssistant || activityTimeline.length === 0) && (!message.id.startsWith('streaming-assistant-') || translateAssistant) ? <OperationLog operations={operations} fileChanges={fileChanges} onOpenFile={onOpenFile} onOpenImage={onOpenImage} /> : null}
+        {showOperations && operations.length > 0 && !message.streaming && (translateAssistant || activityTimeline.length === 0) && (!message.id.startsWith('streaming-assistant-') || translateAssistant) ? <OperationLog operations={operations} fileChanges={fileChanges} onToggleDetails={onToggleDetails} onOpenFile={onOpenFile} onOpenImage={onOpenImage} /> : null}
         {!translateAssistant && !choiceInTimeline && !splitStructuredChoice ? choiceCard : null}
       </div>
       {showAssistantPreferences ? (
@@ -8782,5 +9349,6 @@ const MessageBubble = memo(function MessageBubble({ token, translation, translat
       ) : null}
     </article>
     </ClaudeFormattingContext.Provider>
+    </AssistantMessageContext.Provider>
   )
 })

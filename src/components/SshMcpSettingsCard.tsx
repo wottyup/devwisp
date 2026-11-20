@@ -44,7 +44,7 @@ function permissionDescription(profile: SshMcpProfile): string {
 
 function approvalDescription(policy: SshMcpProfile['approvalPolicy']): string {
   if (policy === 'auto') return ui('在所选操作权限内自动批准，不再逐次询问。')
-  if (policy === 'ask-all') return ui('每次操作都在 Codex 对话中请求批准，包括只读操作。')
+  if (policy === 'ask-all') return ui('每次操作都在 Codex 或 DeepSeek 对话中请求批准，包括只读操作。')
   if (policy === 'deny') return ui('拒绝被判定为高风险的操作；其余操作按所选权限执行。')
   return ui('仅对被判定为高风险的操作询问，例如递归删除目录或提权。')
 }
@@ -155,7 +155,7 @@ export function SshMcpSettingsCard({ token }: { token: string }) {
       }))
       setSettings(result)
       setProfiles(draftsFor(result.profiles))
-      setMessage({ text: result.profiles.length ? 'SSH MCP 配置已保存；新建或重新打开的 Codex 对话会使用这些服务器。' : 'SSH MCP 配置已移除。', error: false })
+      setMessage({ text: result.profiles.length ? 'SSH MCP 配置已保存；新建或重新打开的 Codex 或 DeepSeek 对话会使用这些服务器。' : 'SSH MCP 配置已移除。', error: false })
     } catch (reason) {
       setMessage({ text: errorMessage(reason), error: true })
     } finally {
@@ -169,7 +169,7 @@ export function SshMcpSettingsCard({ token }: { token: string }) {
         <h2><span className="ssh-mcp-shield" aria-hidden="true">SSH</span>{ui('SSH MCP 服务器')}</h2>
         <p>{ui('添加 SSH 服务器，并分别设置 AI 的操作权限和审批方式。')}</p>
       </div>
-      <span className="theme-settings-card__badge">{ui('仅 Codex')}</span>
+      <span className="theme-settings-card__badge">{ui('Codex / DeepSeek')}</span>
     </div>
     <div className="native-config__body">
       {loading ? <p className="native-config__message" role="status">{ui('正在读取 SSH MCP 配置…')}</p> : null}
@@ -243,8 +243,8 @@ export function SshMcpSettingsCard({ token }: { token: string }) {
         </div>
         {message ? <p className={message.error ? 'native-config__message native-config__message--error' : 'native-config__message'} role={message.error ? 'alert' : 'status'}>{uiMessage(message.text)}</p> : null}
       </form>
-      <p className="native-config__hint">{ui('配置保存在运行 Dev Wisp 的电脑上。保存后，新建或重新打开的 Codex 对话使用最新设置；正在运行的对话不受影响。')}</p>
-      <p className="native-config__hint">{ui('Claude Code 暂不支持此功能，因为它的命令审批还不能转发到网页。')}</p>
+      <p className="native-config__hint">{ui('配置保存在运行 Dev Wisp 的电脑上。保存后，新建或重新打开的 Codex 或 DeepSeek 对话使用最新设置；正在运行的对话不受影响。')}</p>
+      <p className="native-config__hint">{ui('此配置目前供 Codex 和 DeepSeek 使用；DeepSeek 在下一轮任务加载新配置。')}</p>
     </div>
   </section>
 }

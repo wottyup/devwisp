@@ -1,5 +1,163 @@
 # Changelog
 
+## [0.144.0-dev.1] - Merge upstream image answers, Windows terminal handoff and Harness management with parallel collaboration and queue stability fixes
+
+## [0.143.0-dev.1] - Discuss in parallel in team chats, then assign isolated development tasks with dependency scheduling, checked integration and a shared summary
+
+## [0.142.0-dev.1] - Add @member suggestions and directed replies inside team chats, preserving recipients through translation and queued delivery
+
+## [0.141.0-dev.1] - Reuse the single-chat composer in team chats with attachments, translation, model settings and queued delivery; collapse injected collaboration context by default
+
+## [0.140.0-dev.1] - Add team-chat dissolution from the sidebar menu, releasing members to individual chats while preserving their histories
+
+## [0.139.3-dev.1] - Restore sidebar renaming for team chats and preserve custom group names across messages
+
+## [0.139.2-dev.1] - Restore Codex chat and queued-message delivery after collaboration locking changes
+
+## [0.139.1-dev.1] - Explain missing collaboration routes when the backend needs updating and improve sidebar retry usability
+
+## [0.139.0-dev.1] - Add chat-style collaboration groups with empty creation, dynamic repeated-engine members, sidebar invitations and shared conversation rounds
+
+## [0.138.4-dev.1] - Reduce file-tree scrolling paint costs with measured offscreen groups while preserving file navigation and scroll positions
+
+## [0.138.3-dev.1] - Simplify team setup to two assistant selectors and one request, with automatic titles and optional settings folded away
+
+## [0.138.2-dev.1] - Improve sidebar scrolling and pause reply animations outside the visible conversation list
+
+## [0.138.1-dev.1] - Improve long conversation scrolling and highlight historical code only as it approaches the viewport
+
+## [0.138.0-dev.1] - Let team tasks continue existing single chats with their native context and protect busy or queued conversations from conflicting handoffs
+
+## [0.137.5-dev.1] - Replace native usage filters with themed menus and keyboard selection
+
+## [0.137.4-dev.1] - Unify chat and team conversation sidebars and workspace tools, with one title icon per participating model
+
+## [0.137.3-dev.1] - Fix local terminal cold startup under uvloop and retain useful startup error diagnostics
+
+## [0.137.1-dev.1] - Show live per-model token breakdowns on hover or tap beneath chat composers
+
+## [0.137.0-dev.1] - Add a web team workspace with independent cross-engine implementer/reviewer conversations, bounded handoffs and durable task recovery
+
+## [0.136.4-dev.1] - Show token usage trends as responsive line charts with hover, touch and keyboard data labels
+
+## Android [0.133.4-dev.1] - Download updates through the app's own network with resumable progress, retry and verified installation
+
+## [0.136.3-dev.1] - Show live token totals across all conversations and engines beside current chat usage beneath the composer
+
+## [0.136.2-dev.1] - Push committed token usage to chat footers and statistics in real time, preserving newer counts across delayed responses and reconnects
+
+## [0.136.1-dev.1] - Show current chat token usage beneath the web composer with automatic updates
+
+## [0.136.0-dev.1] - Add persistent, channel-independent chat token statistics across all three engines alongside existing platform usage dashboards
+
+## Android [0.133.3-dev.1] - Align live reply timers with turn starts and server time across devices
+
+## Android [0.133.2-dev.1] - Let the chat browser handle be dragged to either edge and remember its position
+
+## Android [0.133.1-dev.1] - Unify compact browser edge handles without oversized shadows and localize the external-browser action
+
+## Android [0.133.0-dev.1] - Add historical download deletion and movable browser controls, fix duplicate bookmarks and keep back gestures within page history
+
+## Android [0.132.2-dev.1] - Refine browser address and navigation controls, themed bottom sheets and library/loading states
+
+## Android [0.132.1-dev.1] - Move browser addresses above the bottom buttons and let both control rows collapse for more page space
+
+## Android [0.132.0-dev.1] - Move the browser to a dedicated full-screen page while retaining minimized pages and browsing state
+
+## Android [0.131.2-dev.1] - Make browser bookmarks directly accessible, edit addresses inline and simplify the minimized browser entry
+
+## Android [0.131.1-dev.1] - Show update download progress in the app with cancel and minimize controls instead of system download notifications
+
+## Android [0.131.0-dev.2] - Publish a discoverable LAN update for the DeepSeek run-details build
+
+## Android [0.131.0-dev.1] - Add collapsible DeepSeek reply details with reported token usage, runtime status and request context
+
+## Android [0.130.1-dev.1] - Improve terminal clipboard paste and localize terminal controls and the waiting state
+
+## Android [0.130.0-dev.1] - Add retained browser pages, address search, bookmarks, history and page tools while keeping the native floating interface
+
+## Android [0.129.5-dev.1] - Add terminal connection recovery and preserve cross-screen text selection with scrollback
+
+## [0.135.15-dev.1] - Keep the chat viewport stable when expanding operation records and loading command output
+
+## Android [0.129.4-dev.1] - Keep question answers between assistant segments and center question cards
+
+## [0.135.14-dev.1] - Match edited-file cards, controls and review diffs to the warm theme
+
+## Android [0.129.3-dev.1] - Balance DeepSeek icon sizing, add engine icons to assistant names and match DeepSeek user bubble colors to the web
+
+## Android [0.129.2-dev.1] - Align DeepSeek Harness questions with Codex and retain submitted answers in conversation history
+
+## Android [0.129.1-dev.3] - Correct DeepSeek icon proportions, restore direct switches to the other two modes and align the xhigh reasoning label
+
+## Android [0.129.0-dev.2] - Add DeepSeek mode with conversation switching, Agent and permission preferences, queued messages, approvals and plan reviews
+
+## [0.135.13-dev.1] - Restore edited-file summaries, line counts and review diffs for Claude and DeepSeek turns
+
+## [0.135.12-dev.1] - Show submitted DeepSeek question answers as user messages and retain them in conversation history
+
+## [0.135.11-dev.1] - Prevent backdrop blur from slowing desktop terminal and preview window dragging and resizing
+
+## [0.135.10-dev.1] - 迁移冲突的对话切换快捷键为 Alt 加上下方向键
+
+## [0.135.9-dev.1] - 统一 Codex 与 DeepSeek 选择题选项和回答界面
+
+## [0.135.8-dev.1] - 修复首次启动失败后 DeepSeek 会话无法恢复
+
+## [0.135.7-dev.1] - 修复 Windows 下 Harness 原生组件加载失败并保留聊天工作目录
+
+## [0.135.6-dev.1] - 修复 Windows 下 DeepSeek 附件目录无效导致消息无法发送
+
+## [0.135.5-dev.1] - 修复 DeepSeek 消息停留队列及插队发送返回 500
+
+## [0.135.4-dev.1] - Prevent chat scroll jumps when expanding DeepSeek run details, reasoning and child-agent information
+
+## [0.135.3-dev.1] - Keep file-tree action shortcuts consistent across files, folders and changing menu contents
+
+## [0.135.2-dev.1] - Add an independent copy action below each assistant reply table, preserving rows and columns for pasting
+
+## [0.135.1-dev.1] - Enforce DeepSeek plan approval before local mutations, command escalation, remote tools, delegation and general PTC execution; release workspace execution only after an approved review
+
+## [0.135.0-dev.1] - Preserve DeepSeek native runtime state across turns and display execution status, provider reasoning, token/context usage and child-agent activity
+
+## [0.134.9-dev.1] - Prevent vertical jumps when switching among Codex, Claude Code and DeepSeek API settings or loading their configurations
+
+## [0.134.8-dev.1] - Arrange the mobile file tree header into separate title and action rows with comfortable touch targets
+
+## [0.134.7-dev.1] - Keep mobile table scrolling from triggering the conversation sidebar, file tree or preview back gesture
+
+## [0.134.6-dev.1] - Unify settings typography into consistent title, control and description sizes across modules, themes and text-size preferences
+
+## [0.134.5-dev.1] - Synchronize chat, composer and changed-file summary font sizes across themes and global text-size settings
+
+## [0.134.4-dev.1] - Show DeepSeek readiness alongside Codex and Claude Code in the sidebar with automatic status refresh
+
+## [0.134.3-dev.1] - Show DeepSeek questions inside their own conversation with theme-aware colors instead of a blocking approval dialog
+
+## [0.134.2-dev.1] - Compact DeepSeek question cards on mobile with pane-sized scrolling and always-visible decision buttons
+
+## [0.134.1-dev.1] - Fix Mercury reasoning compatibility in DeepSeek mode and show actionable API failures without exposing provider diagnostics
+
+## [0.134.0-dev.1] - Add native DeepSeek Agent selection with Standard, PTC, Minimal and Creator presets, persistent session bindings and compatibility for existing chats
+
+## [0.133.1-dev.1] - Fix terminal cold-start failures by waiting for tmux session creation before attaching, while preserving reconnects
+
+## [0.133.0-dev.1] - Add native DeepSeek questions and plan reviews, terminal handoff, configured SSH MCP with browser approvals, live follow-up messages and five permission modes
+
+## [0.132.1-dev.1] - Show all three chat engine logos with direct switching and a highlighted current mode
+
+## [0.132.0-dev.1] - Add named DeepSeek API profiles and connection diagnostics, align settings typography and restore the compact logo engine switch
+
+## [0.131.0-dev.1] - Support third-party DeepSeek Harness APIs through OpenAI Responses, Anthropic Messages and OpenAI Chat Completions with native streaming and tools
+
+## [0.130.2-dev.1] - Replace the temporary DeepSeek badge with its official blue whale icon throughout the interface
+
+## [0.130.1-dev.1] - Fix unreadable chat mode dropdown options across themes and operating-system color preferences
+
+## [0.130.0-dev.1] - Add the local DeepSeek Harness engine with streamed replies, tool activity, browser approvals, persistent sessions and private API settings
+
+## [0.129.5-dev.1] - Complete directory search and replacement beyond former scan limits with live progress and support for large text files
+
 ## [0.129.4-dev.1] - Make desktop floating windows follow dragging smoothly while preserving saved positions and sizes
 
 ## [0.129.3-dev.1] - Remember separate desktop file-preview and terminal window positions and sizes with movable, resizable panels
@@ -1719,3 +1877,17 @@
 ## [0.0.2] - Fix connection loop from large history session reads
 
 ## [0.0.1] - Add local Codex real-time remote chat web application
+
+## Merged upstream branch history (2026-11-20)
+
+### Upstream [0.138.0-dev.1] - 支持在选择题的其他回答中粘贴图片、预览删除并随答案提交
+
+### Upstream [0.137.0-dev.1] - 支持 Windows 网页终端 AI 接管本机 PowerShell 与已登录的 SSH 会话
+
+### Upstream [0.136.0-dev.1] - 支持 Harness 自动管理安装、运行检查与外部程序配置
+
+### Upstream [0.135.13-dev.1] - 对齐 DeepSeek 选择题的其他答案展开与提交交互
+
+### Upstream [0.135.12-dev.1] - 改善 DeepSeek 任务持续执行指令并准确显示非正常结束原因
+
+### Upstream [0.135.11-dev.1] - 修复 DeepSeek 选择题对齐并保存已提交回答到聊天记录

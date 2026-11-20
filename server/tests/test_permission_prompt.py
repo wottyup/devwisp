@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +11,7 @@ from unittest.mock import patch
 from devwisp.permission_prompt import PermissionPromptBroker, PermissionPromptError
 
 
+@unittest.skipIf(os.name == "nt", "permission broker uses Unix-domain sockets")
 class PermissionPromptBrokerTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.directory = tempfile.TemporaryDirectory()

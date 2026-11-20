@@ -6,7 +6,7 @@ export interface PersistedPaneLayout {
   openPaneIndexes: number[]
   selectedPaneIndex: number
   threadIdsByPane: Record<string, string>
-  enginesByPane: Record<string, 'codex' | 'claude-code'>
+  enginesByPane: Record<string, 'codex' | 'claude-code' | 'deepseek-harness'>
 }
 
 function parsePaneLayout(value: string | null): PersistedPaneLayout | null {
@@ -36,7 +36,7 @@ function parsePaneLayout(value: string | null): PersistedPaneLayout | null {
   const enginesByPane: PersistedPaneLayout['enginesByPane'] = {}
   for (const index of openPaneIndexes) {
     const engine = savedEngines[String(index)]
-    if (engine === 'codex' || engine === 'claude-code') enginesByPane[String(index)] = engine
+    if (engine === 'codex' || engine === 'claude-code' || engine === 'deepseek-harness') enginesByPane[String(index)] = engine
   }
   return { openPaneIndexes, selectedPaneIndex, threadIdsByPane, enginesByPane }
 }

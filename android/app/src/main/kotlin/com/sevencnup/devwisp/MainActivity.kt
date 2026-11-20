@@ -101,6 +101,8 @@ import android.webkit.CookieManager
 import android.webkit.URLUtil
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceError
+import android.webkit.ValueCallback
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -703,6 +705,7 @@ class MainActivity : Activity() {
         else -> if (lightTheme) Color.rgb(105, 112, 123) else Color.rgb(139, 145, 156)
     }
     private val ACCENT: Int get() = when {
+        currentMode == ChatEngines.DEEPSEEK -> brandIconTint(ChatEngines.DEEPSEEK)
         currentMode == "claude-code" -> if (lightTheme) Color.rgb(205, 102, 67) else Color.rgb(240, 141, 108)
         themeName == "lollipop" -> Color.rgb(111, 157, 197)
         pixelTheme -> PIXEL_BLUE
@@ -735,7 +738,18 @@ class MainActivity : Activity() {
     private val CLAUDE_USER_MESSAGE_TEXT = Color.WHITE
     private val CLAUDE_USER_MESSAGE_SURFACE: Int get() = if (retroTheme) Color.rgb(75, 48, 39) else CLAUDE_USER_MESSAGE_FILL
     private val CLAUDE_USER_MESSAGE_FOREGROUND: Int get() = if (retroTheme) Color.rgb(255, 224, 209) else CLAUDE_USER_MESSAGE_TEXT
+    private val USER_MESSAGE_SURFACE: Int get() = when (currentMode) {
+        ChatEngines.DEEPSEEK -> if (pixelTheme) Color.rgb(38, 75, 126) else Color.rgb(172, 195, 255)
+        "claude-code" -> CLAUDE_USER_MESSAGE_SURFACE
+        else -> CODEX_USER_MESSAGE_FILL
+    }
+    private val USER_MESSAGE_FOREGROUND: Int get() = when (currentMode) {
+        ChatEngines.DEEPSEEK -> if (pixelTheme) PIXEL_TEXT else Color.rgb(24, 27, 37)
+        "claude-code" -> CLAUDE_USER_MESSAGE_FOREGROUND
+        else -> CODEX_USER_MESSAGE_TEXT
+    }
     private val ASSISTANT_NAME_ACCENT: Int get() = when {
+        currentMode == ChatEngines.DEEPSEEK -> brandIconTint(ChatEngines.DEEPSEEK)
         themeName == "warm" || themeName == "custom" -> if (currentMode == "claude-code") DARK_THEME_CLAUDE_ACCENT else DARK_THEME_CODEX_ACCENT
         else -> ACCENT
     }
@@ -873,7 +887,13 @@ class MainActivity : Activity() {
     private var translatedInputMarker = ""
     private var translatedInputFetchInFlight = false
     private data class LocalAndroidUpdate(val version: String, val filename: String, val sizeBytes: Long, val sha256: String)
-    private var updateDownloadVerifying = false
+    private data class AndroidUpdateDownloadSnapshot(val status: Int, val reason: Int, val bytes: Long, val total: Long)
+    private data class AndroidUpdateDownloadUi(
+        val id: Long, val dialog: Dialog, val status: TextView, val progress: ProgressBar, val details: TextView,
+    )
+    private var updateDownloadUi: AndroidUpdateDownloadUi? = null
+    private var updateDownloadHidden = false
+    private var updateDownloadVerifyingId = -1L
     private var updateDownloadPromptedId = -1L
     private var pendingUpdateInstallId = -1L
     private val updateDownloadPoll = object : Runnable {
@@ -951,7 +971,7 @@ class MainActivity : Activity() {
     private var notificationPermissionRequestedFromSettings = false
     private var preferencePopup: PopupWindow? = null
     private enum class ComposerPreferenceSection(val title: String) {
-        MODEL("模型"), EFFORT("思考"), PERMISSION("权限"),
+        MODEL("模型"), AGENT("Agent"), EFFORT("思考"), PERMISSION("权限"),
     }
     private data class ComposerPreferenceMenu(
         val view: LinearLayout,
@@ -967,10 +987,29 @@ class MainActivity : Activity() {
         var displayedLabels: Triple<String, String, String>? = null,
     )
     private var composerPreferenceMenu: ComposerPreferenceMenu? = null
-    private var webPreviewPopup: PopupWindow? = null
+    private var browserScreen: FrameLayout? = null
+    private var browserScreenBack: (() -> Unit)? = null
+    private var browserBottomInset = 0
+    private var browserControlsCollapsed = false
     private var webPreviewView: WebView? = null
-    private var webPreviewRelayout: (() -> Unit)? = null
-    private var webPreviewCleanup: (() -> Unit)? = null
+    private var browserScreenCleanup: (() -> Unit)? = null
+    private class BrowserPage(val view: WebView, var address: String) {
+        var title = ""
+        var progress = 0
+        var loading = true
+        var error: String? = null
+        var disposed = false
+    }
+    private val browserPages = BrowserPages<BrowserPage>()
+    private var webPreviewRefresh: (() -> Unit)? = null
+    private var browserDock: BrowserEdgeHandle? = null
+    private var browserDockLayoutListener: View.OnLayoutChangeListener? = null
+    private var browserFileCallback: ValueCallback<Array<Uri>>? = null
+    private var browserFilePage: BrowserPage? = null
+    private var browserFilePickerActive = false
+    private val browserLibrary by lazy {
+        BrowserLibrary(prefs.getString("browser_bookmarks", "[]") ?: "[]", prefs.getString("browser_history", "[]") ?: "[]")
+    }
     private var pendingWebDownload: PendingWebDownload? = null
     private var sidebarHost: EdgeDrawerHost? = null
     private var sidebarLongPressActive = false
@@ -996,6 +1035,7 @@ class MainActivity : Activity() {
     private var queueTouchActive = false
     private var queueRenderDirty = false
     private var expandedOperationIds = mutableSetOf<String>()
+    private val expandedHarnessMetricsIds = mutableSetOf<String>()
     private val revealedTerminalOutputLogIds = mutableSetOf<String>()
     private val operationPageIndexes = mutableMapOf<String, Int>()
     private var expandedFileChangeIds = mutableSetOf<String>()
@@ -1022,6 +1062,9 @@ class MainActivity : Activity() {
     private var assistantChoiceFocusedField: EditText? = null
     private var assistantChoiceFocusedKey: String? = null
     private var assistantChoiceFocusedScope: String? = null
+    private var harnessQuestionFocusedField: EditText? = null
+    private var harnessQuestionFocusedKey: HarnessQuestionKey? = null
+    private var harnessQuestionFocusedConnection = -1L
     private var queueEditDraft = ""
     private var queueEditDraftFiles = mutableListOf<JSONObject>()
     private val queueEditPreferences = mutableMapOf<String, String?>()
@@ -1034,6 +1077,11 @@ class MainActivity : Activity() {
     @Volatile private var lastSocketActivityAt = 0L
     private var backgroundedAt = 0L
     private var pendingApproval: JSONObject? = null
+    private val harnessQuestions = HarnessQuestionInbox()
+    private var harnessQuestionRefreshInFlight = false
+    private var harnessQuestionsSupported = true
+    private var deepseekStatus = JSONObject()
+    private var deepseekStatusRefreshInFlight = false
     private val claudePermissions = ClaudePermissionInbox()
     private var claudePermissionRefreshGeneration = 0L
     private var claudePermissionRefreshInFlight = false
@@ -1047,12 +1095,18 @@ class MainActivity : Activity() {
     private var terminalPositionListener: View.OnLayoutChangeListener? = null
     @Volatile private var terminalSocket: WebSocket? = null
     private var terminalOutput: TerminalOutputView? = null
-    private var terminalOutputScroll: ScrollView? = null
+    private var terminalOutputViewport: FrameLayout? = null
     private var terminalStatusView: TextView? = null
     private var terminalInputSink: TerminalInputSink? = null
     private var terminalHandoffButton: TextView? = null
     private var terminalHandoffHint: TextView? = null
     private var terminalKeyboardButton: TextView? = null
+    private var terminalPasteButton: View? = null
+    private var terminalRestartButton: TextView? = null
+    private var terminalConnecting = false
+    private var terminalConnectionError = false
+    private var terminalConnectTimeout: Runnable? = null
+    private var terminalRenderedHistoryDrop = 0L
     private val terminalShortcutButtons = mutableListOf<TextView>()
     private var terminalHandoffLoaded = false
     private var terminalHandoffSupported = false
@@ -1146,7 +1200,12 @@ class MainActivity : Activity() {
                 reply.flush()
                 return
             }
-            appendLiveReplyToView(itemId, reply.revealNext())
+            val chunk = reply.revealNext()
+            if (chunk.isNotEmpty() && (liveReplyViewItemId != itemId || liveReplyView?.isAttachedToWindow != true)) {
+                // A question can seal the visible prefix before the same
+                // legacy item starts streaming its continuation.
+                renderMessages(false, liveReplyTurnId)
+            } else appendLiveReplyToView(itemId, chunk)
             scheduleLiveReplyFrame()
         }
     }
@@ -1165,15 +1224,15 @@ class MainActivity : Activity() {
     private var composerGlowAnimator: ValueAnimator? = null
     private var composerGlowRunning = false
     private lateinit var titleView: TextView
-    private lateinit var modeButton: ImageButton
+    private var modeSwitchButtons = emptyList<ImageButton>()
     private lateinit var statusView: TextView
     private lateinit var messageScroll: ScrollView
     private lateinit var messageList: LinearLayout
     private var activeActivityText: TextView? = null
     private var activeActivityTimer: TextView? = null
     private var activityShimmerAnimator: ValueAnimator? = null
-    private var activeActivityStartedAt = 0L
-    private var activeActivityTimerTurnId: String? = null
+    private val turnElapsedTimer = TurnElapsedTimer()
+    private var activeActivityTimerKey: TurnTimerKey? = null
     private var liveActivityItem: JSONObject? = null
     private var liveActivityItemCompleted = false
     private var liveActivityTurnId: String? = null
@@ -1181,7 +1240,9 @@ class MainActivity : Activity() {
     private val activityTick = object : Runnable {
         override fun run() {
             if (!running || activeActivityTimer == null) return
-            val elapsedMillis = (SystemClock.elapsedRealtime() - activeActivityStartedAt).coerceAtLeast(0L)
+            val key = activeActivityTimerKey ?: return
+            val nowMs = SystemClock.elapsedRealtime()
+            val elapsedMillis = turnElapsedTimer.elapsedMillis(key, nowMs, RemoteApi.serverTimeMillis(key.endpoint, nowMs))
             activeActivityTimer?.text = "${tr("已用")} ${formatTurnDuration(elapsedMillis)}"
             val nextSecond = (1000L - elapsedMillis % 1000L).coerceAtLeast(16L)
             handler.postDelayed(this, nextSecond)
@@ -1201,6 +1262,7 @@ class MainActivity : Activity() {
     private lateinit var sidebarNewThreadButton: ImageButton
     private lateinit var sidebarCodexFilterButton: ImageButton
     private lateinit var sidebarClaudeFilterButton: ImageButton
+    private lateinit var sidebarDeepseekFilterButton: ImageButton
     private val sidebarActionAccentViews = mutableListOf<Pair<ImageView, TextView>>()
     private lateinit var sidebarBrandMark: ImageView
     private lateinit var sendButton: ImageView
@@ -1254,6 +1316,7 @@ class MainActivity : Activity() {
             if (token.isNotBlank() && foreground) {
                 // Metadata is a cheap backstop even when the socket appears healthy.
                 refreshThreads(false)
+                refreshDeepseekStatus()
                 if (!socketConnected) {
                     refreshActiveThread(false)
                     refreshQueue(false)
@@ -1267,6 +1330,7 @@ class MainActivity : Activity() {
         override fun run() {
             if (!foreground || token.isBlank() || isFinishing || isDestroyed) return
             refreshClaudePermissions()
+            refreshHarnessQuestions()
             handler.postDelayed(this, 5_000L)
         }
     }
@@ -1332,7 +1396,7 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
-        webPreviewView?.onResume()
+        if (browserScreen != null) webPreviewView?.onResume()
         foreground = true
         if (claudePermissionUiDirty) refreshClaudePermissionViews()
         if (liveReplyThreadId == activeThreadId && liveReplyTexts.isNotEmpty() && ::messageList.isInitialized) {
@@ -1388,7 +1452,7 @@ class MainActivity : Activity() {
         activityShimmerAnimator?.cancel()
         activityShimmerAnimator = null
         persistCurrentDraft()
-        if (!imeInsetVisible) parkActivityInputFocus()
+        if (!imeInsetVisible && browserScreen == null) parkActivityInputFocus()
         foreground = false
         handler.removeCallbacks(liveReplyFrame)
         liveReplyFrameScheduled = false
@@ -1419,6 +1483,7 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         preferencePopup?.dismiss()
         updateCheckDialog?.let(::dismissUpdateCheckDialog)
+        dismissUpdateDownloadDialog()
         clearLiveReply()
         closeWebPreview()
         activityShimmerAnimator?.cancel()
@@ -1442,9 +1507,8 @@ class MainActivity : Activity() {
         when {
             settingsDialog?.isShowing == true -> settingsDialog?.dismiss()
             preferencePopup?.isShowing == true -> preferencePopup?.dismiss()
+            browserScreen != null -> browserScreenBack?.invoke()
             settingsOverlay != null -> closeSettings(animated = true)
-            webPreviewPopup?.isShowing == true && webPreviewView?.canGoBack() == true -> webPreviewView?.goBack()
-            webPreviewPopup?.isShowing == true -> closeWebPreview()
             terminalOverlay != null && (terminalImeVisible || System.currentTimeMillis() < terminalImeHiddenUntil) -> {
                 terminalImeHiddenUntil = 0L
                 terminalLockedImeInset = 0
@@ -1621,7 +1685,7 @@ class MainActivity : Activity() {
         }
 
         card.addView(label("电脑网页地址", 12, SUBTLE, true).apply { setPadding(0, dp(22), 0, dp(6)) }, widthWrap())
-        val address = editField("http://192.168.x.x:4173", endpoint, InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI)
+        val address = editField("http://192.168.x.x:26546", endpoint, InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI)
         address.setSingleLine(true)
         card.addView(address, LinearLayout.LayoutParams(MATCH, dp(48)))
         card.addView(label("匹配码", 12, SUBTLE, true).apply { setPadding(0, dp(13), 0, dp(6)) }, widthWrap())
@@ -1716,12 +1780,18 @@ class MainActivity : Activity() {
         models = JSONArray()
         queuedMessages = JSONArray()
         remoteUserMessageOverlays.clear()
+        expandedHarnessMetricsIds.clear()
         finishedTurnStates.clear()
         pendingLiveTurnIds.clear()
         turnLifecycleGeneration++
         running = false
         pendingApproval = null
         claudePermissions.clear()
+        harnessQuestions.clear()
+        harnessQuestionRefreshInFlight = false
+        harnessQuestionsSupported = true
+        deepseekStatus = JSONObject()
+        deepseekStatusRefreshInFlight = false
         claudePermissionRefreshGeneration++
         claudePermissionRefreshInFlight = false
         claudePermissionRecoverySupported = true
@@ -1780,6 +1850,7 @@ class MainActivity : Activity() {
         refreshThreads(true)
         refreshPins()
         refreshClaudeStatus()
+        refreshDeepseekStatus()
         refreshModels()
         connectSocket()
         startClaudePermissionRecovery()
@@ -1817,6 +1888,8 @@ class MainActivity : Activity() {
                 systemInsetTop = systemBars.top
                 systemInsetRight = systemBars.right
                 systemInsetBottom = systemBars.bottom
+                browserBottomInset = bottom
+                applyBrowserScreenInsets()
                 if (terminalOverlay != null && terminalInputSink?.hasFocus() == true && keyboardVisible) {
                     terminalLockedImeInset = max(terminalLockedImeInset, bottom)
                 } else if (terminalOverlay != null && !keyboardVisible && terminalInputSink?.hasActiveComposition != true) {
@@ -1883,7 +1956,7 @@ class MainActivity : Activity() {
                     if (imeAnimationDepth == 0) {
                         view.rootWindowInsets?.let(update)
                         if (terminalOverlay != null) {
-                            terminalOutputScroll?.post { updateTerminalDimensions(forceSend = true) }
+                            terminalOutputViewport?.post { updateTerminalDimensions(forceSend = true) }
                         }
                         if (imeInsetVisible && imeFollowMessageBottom) scheduleImeMessageBottomFollow()
                     }
@@ -2035,7 +2108,7 @@ class MainActivity : Activity() {
             systemInsetBottom,
         )
         positionTerminalOverlay()
-        webPreviewRelayout?.invoke()
+        applyBrowserScreenInsets()
     }
 
     private fun renderHome() {
@@ -2167,10 +2240,12 @@ class MainActivity : Activity() {
         titleView = label(appDisplayName, titleBaseSize, if (retroTheme) ANDROID1_TITLE_TEXT else TEXT, true).apply { maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END }
         titleColumn.addView(titleView, widthWrap())
         headerView.addView(titleColumn, LinearLayout.LayoutParams(0, WRAP, 1f))
-        val targetMode = modeSwitchTarget()
-        modeButton = iconButton(if (targetMode == "claude-code") "claude" else "codex", modeSwitchDescription()) { switchMode() }
-        if (retroTheme) modeButton.background = android1SegmentButtonBackground()
-        headerView.addView(modeButton, LinearLayout.LayoutParams(actionSize, actionSize))
+        modeSwitchButtons = ChatEngines.all.filter { it != currentMode }.map { engine ->
+            iconButton(engineIcon(engine), "切换到 ${ChatEngines.label(engine)}") { switchMode(engine) }.also { button ->
+                setBrandIcon(button, engine, if (retroTheme) 12 else 9)
+                headerView.addView(button, LinearLayout.LayoutParams(actionSize, actionSize))
+            }
+        }
         headerView.addView(iconButton("terminal", "打开终端") { showTerminal() }.apply {
             if (retroTheme) {
                 imageTintList = null
@@ -2222,21 +2297,19 @@ class MainActivity : Activity() {
         completionNoticeEngine = engine
         completionNotice.removeAllViews()
         val brand = ImageView(this).apply {
-            setImageResource(if (engine == "claude-code") R.drawable.ic_brand_claude else R.drawable.ic_brand_codex)
+            setBrandIcon(this, engine)
             imageTintList = ColorStateList.valueOf(brandIconTint(engine))
-            contentDescription = if (engine == "claude-code") "Claude Code" else "Codex"
+            contentDescription = ChatEngines.label(engine)
         }
         completionNotice.addView(brand, LinearLayout.LayoutParams(dp(22), dp(22)).apply { rightMargin = dp(9) })
         val thread = findThread(threadId)
         val copy = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         copy.addView(label(thread?.let(::threadTitle)?.let { "“$it”${tr("已完成回复")}" } ?: tr("另一模式的对话已完成回复"), 12, TEXT, true, translateUi = false), widthWrap())
-        copy.addView(label("${if (engine == "claude-code") "Claude Code" else "Codex"} 已完成 · 点击查看", 10, MUTED), widthWrap())
+        copy.addView(label("${ChatEngines.label(engine)} 已完成 · 点击查看", 10, MUTED), widthWrap())
         completionNotice.addView(copy, LinearLayout.LayoutParams(0, WRAP, 1f))
         completionNotice.addView(ImageView(this).apply {
-            val activeClaude = currentMode == "claude-code"
-            setImageResource(if (activeClaude) R.drawable.ic_brand_claude else R.drawable.ic_brand_codex)
-            imageTintList = ColorStateList.valueOf(brandIconTint(if (activeClaude) "claude-code" else "codex"))
-            contentDescription = "当前${if (activeClaude) "Claude Code" else "Codex"}模式"
+            setBrandIcon(this, currentMode)
+            contentDescription = "当前${ChatEngines.label(currentMode)}模式"
         }, LinearLayout.LayoutParams(dp(19), dp(19)).apply { rightMargin = dp(3) })
         completionNotice.addView(iconButton("close", "关闭完成提示") { dismissCompletionNotice() }, LinearLayout.LayoutParams(dp(30), dp(30)))
         completionNotice.setOnClickListener {
@@ -2277,11 +2350,9 @@ class MainActivity : Activity() {
         if (!::modeSwitchNotice.isInitialized) return
         modeSwitchNotice.removeAllViews()
         listOf(previousMode, newMode).forEachIndexed { index, engine ->
-            val claude = engine == "claude-code"
             modeSwitchNotice.addView(ImageView(this).apply {
-                setImageResource(if (claude) R.drawable.ic_brand_claude else R.drawable.ic_brand_codex)
-                imageTintList = ColorStateList.valueOf(brandIconTint(if (claude) "claude-code" else "codex"))
-                contentDescription = if (claude) "Claude Code" else "Codex"
+                setBrandIcon(this, engine)
+                contentDescription = ChatEngines.label(engine)
             }, LinearLayout.LayoutParams(dp(19), dp(19)).apply { if (index == 0) rightMargin = dp(4) else leftMargin = dp(4) })
             if (index == 0) {
                 if (retroTheme) modeSwitchNotice.addView(ImageView(this).apply {
@@ -2291,7 +2362,7 @@ class MainActivity : Activity() {
                 else modeSwitchNotice.addView(label("→", 13, MUTED, true), LinearLayout.LayoutParams(WRAP, WRAP))
             }
         }
-        val modeLabel = if (newMode == "claude-code") "Claude Code" else "Codex"
+        val modeLabel = ChatEngines.label(newMode)
         val copy = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(8), 0, 0, 0) }
         copy.addView(label("已切换到 $modeLabel", 12, TEXT, true), widthWrap())
         copy.addView(label("新消息将发送到当前模式", 10, MUTED), widthWrap())
@@ -2852,8 +2923,10 @@ class MainActivity : Activity() {
         }
         sidebarCodexFilterButton = sidebarEngineFilterButton("codex")
         sidebarClaudeFilterButton = sidebarEngineFilterButton("claude-code")
+        sidebarDeepseekFilterButton = sidebarEngineFilterButton(ChatEngines.DEEPSEEK)
         engineFilters.addView(sidebarCodexFilterButton, LinearLayout.LayoutParams(dp(36), dp(36)))
         engineFilters.addView(sidebarClaudeFilterButton, LinearLayout.LayoutParams(dp(36), dp(36)).apply { leftMargin = dp(4) })
+        engineFilters.addView(sidebarDeepseekFilterButton, LinearLayout.LayoutParams(dp(36), dp(36)).apply { leftMargin = dp(4) })
         drawer.addView(engineFilters, LinearLayout.LayoutParams(MATCH, dp(36)).apply { topMargin = dp(7) })
         updateSidebarModeAccent()
 
@@ -2900,8 +2973,14 @@ class MainActivity : Activity() {
         val footerDivider = View(this).apply { setBackgroundColor(BORDER) }
         drawer.addView(footerDivider, LinearLayout.LayoutParams(MATCH, dp(1)).apply { topMargin = dp(8); bottomMargin = dp(5) })
         val footer = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
-        val footerHeight = if (pixelTheme) 68 else 40
+        val footerHeight = if (pixelTheme) 68 else 44
         footer.addView(sidebarAction("设置", "settings") { showSettings() }, LinearLayout.LayoutParams(0, dp(footerHeight), 1f))
+        footer.addView(sidebarAction("浏览器", "globe") {
+            setSidebarVisible(false)
+            if (browserPages.active != null) showWebPreview() else showWebAddressDialog("") { url ->
+                if (newBrowserPage(url) != null) showWebPreview()
+            }
+        }, LinearLayout.LayoutParams(0, dp(footerHeight), 1f))
         footer.addView(sidebarAction("切换配置", "link") { showConnectionPicker() }, LinearLayout.LayoutParams(0, dp(footerHeight), 1f))
         footer.addView(sidebarAction("重连", "refresh") { reconnect() }, LinearLayout.LayoutParams(0, dp(footerHeight), 1f))
         drawer.addView(footer, LinearLayout.LayoutParams(MATCH, dp(footerHeight)))
@@ -3030,12 +3109,25 @@ class MainActivity : Activity() {
             ?: if (activeThreadId == null) "新对话" else appDisplayName
         titleView.text = title
         titleView.setTextColor(if (retroTheme) ANDROID1_TITLE_TEXT else TEXT)
-        if (::modeButton.isInitialized) {
-            setBrandIcon(modeButton, modeSwitchTarget())
-            modeButton.contentDescription = modeSwitchDescription()
+        modeSwitchButtons.zip(ChatEngines.all.filter { it != currentMode }).forEach { (button, engine) ->
+            setBrandIcon(button, engine, if (retroTheme) 12 else 9)
+            val description = tr("切换到 ${ChatEngines.label(engine)}")
+            button.contentDescription = description
+            button.tooltipText = description
+            button.setOnClickListener { switchMode(engine) }
         }
         updateSidebarBrand()
         updateSidebarModeAccent()
+        if (currentMode == ChatEngines.DEEPSEEK) {
+            val ready = deepseekStatus.optBoolean("available") && deepseekStatus.optBoolean("hasApiKey")
+            statusView.visibility = if (ready) View.GONE else View.VISIBLE
+            statusView.text = deepseekStatus.optString("error").takeIf { it.isNotBlank() && it != "null" }
+                ?: tr(if (deepseekStatus.optBoolean("available")) "请先在电脑网页配置 DeepSeek API" else "正在检查 DeepSeek…")
+            statusView.setTextColor(WARNING)
+            updateSendButton()
+            updateComposerPreferences()
+            return
+        }
         statusView.visibility = if (runtime.optBoolean("connected", false)) View.GONE else View.VISIBLE
         statusView.text = runtime.optString("error").takeIf { it.isNotBlank() && it != "null" }
             ?: tr(if (runtime.optBoolean("available", false)) "Codex 已连接" else "正在连接 Codex…")
@@ -3044,9 +3136,11 @@ class MainActivity : Activity() {
         updateComposerPreferences()
     }
 
-    private fun modeSwitchTarget(): String = if (currentMode == "codex") "claude-code" else "codex"
-
-    private fun modeSwitchDescription(): String = if (modeSwitchTarget() == "claude-code") "切换到 Claude Code" else "切换到 Codex"
+    private fun engineIcon(engine: String): String = when (engine) {
+        ChatEngines.DEEPSEEK -> "deepseek"
+        "claude-code" -> "claude"
+        else -> "codex"
+    }
 
     private fun updateSidebarBrand() {
         if (!::sidebarBrandMark.isInitialized) return
@@ -3090,8 +3184,8 @@ class MainActivity : Activity() {
     private fun updateSidebarModeAccent() {
         if (!::sidebarNewThreadButton.isInitialized) return
         val claudeMode = currentMode == "claude-code"
-        val fill = if (claudeMode) CLAUDE_MODE_ACCENT else CODEX_MODE_ACCENT
-        val foreground = if (claudeMode) Color.rgb(24, 27, 37) else CODEX_MODE_ACCENT_FOREGROUND
+        val fill = if (currentMode == ChatEngines.DEEPSEEK) brandIconTint(currentMode) else if (claudeMode) CLAUDE_MODE_ACCENT else CODEX_MODE_ACCENT
+        val foreground = if (currentMode == ChatEngines.DEEPSEEK) (if (lightTheme) Color.WHITE else Color.rgb(24, 27, 37)) else if (claudeMode) Color.rgb(24, 27, 37) else CODEX_MODE_ACCENT_FOREGROUND
         val newThreadShape = rounded(fill, dp(if (retroTheme) 2 else 10))
         sidebarNewThreadButton.background = when {
             pixelTheme -> pixelSidebarNewThreadBackground()
@@ -3116,9 +3210,8 @@ class MainActivity : Activity() {
     }
 
     private fun sidebarEngineFilterButton(engine: String): ImageButton = ImageButton(this).apply {
-        setBrandIcon(this, engine)
-        scaleType = ImageView.ScaleType.CENTER_INSIDE
-        setPadding(dp(8), dp(8), dp(8), dp(8))
+        setBrandIcon(this, engine, 8)
+        scaleType = ImageView.ScaleType.FIT_CENTER
         isFocusable = true
         isClickable = true
         setOnClickListener {
@@ -3129,6 +3222,8 @@ class MainActivity : Activity() {
     }
 
     private fun sidebarEngineFilterDescription(engine: String, active: Boolean): String = when {
+        engine == ChatEngines.DEEPSEEK && active -> "取消 DeepSeek 筛选，显示全部聊天"
+        engine == ChatEngines.DEEPSEEK -> "只显示 DeepSeek 对话"
         engine == "claude-code" && active -> "取消 Claude 筛选，显示全部聊天"
         engine == "claude-code" -> "只显示 Claude 对话"
         active -> "取消 Codex 筛选，显示全部聊天"
@@ -3136,7 +3231,7 @@ class MainActivity : Activity() {
     }
 
     private fun updateSidebarEngineFilterButtons() {
-        listOf("codex" to sidebarCodexFilterButton, "claude-code" to sidebarClaudeFilterButton).forEach { (engine, button) ->
+        listOf("codex" to sidebarCodexFilterButton, "claude-code" to sidebarClaudeFilterButton, ChatEngines.DEEPSEEK to sidebarDeepseekFilterButton).forEach { (engine, button) ->
             val active = sidebarEngineFilter == engine
             val tint = brandIconTint(engine)
             val description = tr(sidebarEngineFilterDescription(engine, active))
@@ -3304,6 +3399,7 @@ class MainActivity : Activity() {
                         val engine = selectedModes[id] ?: "codex"
                         draftFilesByScope.remove(connectionScopedKey("draft_${engine}_$id"))
                         pendingUserMessages.remove(connectionScopedKey("draft_${engine}_$id"))
+                        prefs.edit().remove(connectionScopedKey("harness_question_replies_$id")).apply()
                     }
                     if (activeThreadId?.let { it in removed } == true) {
                         prefs.edit().remove(activeThreadStorageKey(currentMode)).apply()
@@ -3351,6 +3447,7 @@ class MainActivity : Activity() {
             query.isNotBlank() -> "搜索结果"
             sidebarEngineFilter == "codex" -> "Codex 对话"
             sidebarEngineFilter == "claude-code" -> "Claude 对话"
+            sidebarEngineFilter == ChatEngines.DEEPSEEK -> "DeepSeek 对话"
             else -> "聊天记录"
         }
         drawer.findViewWithTag<TextView>("sidebar_thread_heading")?.text = tr(heading)
@@ -3377,7 +3474,7 @@ class MainActivity : Activity() {
             }
             empty.addView(ImageView(this).apply {
                 val emptyEngine = sidebarEngineFilter ?: currentMode
-                setImageResource(if (emptyEngine == "claude-code") R.drawable.ic_brand_claude else R.drawable.ic_brand_codex)
+                setBrandIcon(this, emptyEngine)
                 setColorFilter(brandIconTint(emptyEngine))
                 alpha = .55f
             }, LinearLayout.LayoutParams(dp(24), dp(24)).apply { bottomMargin = dp(9) })
@@ -3406,7 +3503,7 @@ class MainActivity : Activity() {
                 gravity = Gravity.CENTER_VERTICAL
                 setPadding(if (pixelTheme) dp(8) else if (retroTheme) 0 else dp(9), if (retroTheme) dp(2) else dp(8), dp(5), if (retroTheme) dp(2) else dp(8))
                 minimumHeight = dp(if (pixelTheme) 48 else if (retroTheme) 44 else 0)
-                val selectedAccent = if (engine == "claude-code") CLAUDE_MODE_ACCENT else ACCENT
+                val selectedAccent = brandIconTint(engine)
                 background = if (retroTheme) {
                     if (pixelTheme && selected) pixelFrameBackground(R.drawable.pixel_frame_active, Color.rgb(25, 43, 64))
                     else if (selected) ColorDrawable(if (engine == "claude-code") Color.rgb(70, 45, 37) else LOLLIPOP_PRIMARY_LIGHT) else lollipopRipple()
@@ -3416,7 +3513,7 @@ class MainActivity : Activity() {
                 contentDescription = threadTitle(thread)
             }
             if (retroTheme && !pixelTheme) {
-                val selectedAccent = if (engine == "claude-code") brandIconTint(engine) else codexBrandAccent()
+                val selectedAccent = brandIconTint(engine)
                 row.addView(View(this).apply {
                     setBackgroundColor(if (selected) selectedAccent else Color.TRANSPARENT)
                 }, LinearLayout.LayoutParams(dp(3), MATCH).apply { rightMargin = dp(8) })
@@ -3431,11 +3528,11 @@ class MainActivity : Activity() {
                     // Branded marks remain in the mode switch and cross-mode completion notices.
                     setPixelAwareImageResource(iconResource("chat"))
                     imageTintList = null
-                    contentDescription = if (engine == "claude-code") "Claude Code 对话" else "Codex 对话"
+                    contentDescription = "${ChatEngines.label(engine)} 对话"
                 } else {
-                    setImageResource(if (engine == "claude-code") R.drawable.ic_brand_claude else R.drawable.ic_brand_codex)
-                    setColorFilter(if (engine == "claude-code") CLAUDE_MODE_ACCENT else codexBrandAccent())
-                    contentDescription = if (engine == "claude-code") "Claude Code" else "Codex"
+                    setBrandIcon(this, engine)
+                    setColorFilter(brandIconTint(engine))
+                    contentDescription = ChatEngines.label(engine)
                 }
             }
             val threadIconSize = 22
@@ -3583,6 +3680,10 @@ class MainActivity : Activity() {
         }
 
         override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+            if (browserScreen != null) {
+                clearSwipeTracking()
+                return super.dispatchTouchEvent(event)
+            }
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
                     sidebarLongPressActive = false
@@ -3641,6 +3742,7 @@ class MainActivity : Activity() {
 
         private fun beginSwipeIfNeeded(event: MotionEvent): Boolean {
             val target = swipeTarget ?: return false
+            if (browserDock?.isHandlingDragGesture == true) return false
             if (sidebarLongPressActive) return false
             if (selectableTextGesture && event.eventTime - event.downTime >= ViewConfiguration.getLongPressTimeout()) return false
             val dx = event.x - startX
@@ -3783,6 +3885,25 @@ class MainActivity : Activity() {
             runtime = result
             renderHeader()
         }, { error -> if (generation == connectionGeneration) showStatus(error.message ?: "Codex 连接失败") })
+    }
+
+    private fun refreshDeepseekStatus() {
+        if (token.isBlank() || deepseekStatusRefreshInFlight) return
+        val generation = connectionGeneration
+        val api = RemoteApi(endpoint, token)
+        deepseekStatusRefreshInFlight = true
+        io.execute {
+            val result = runCatching { api.get("/api/v1/deepseek/status") }
+            handler.post {
+                if (generation != connectionGeneration || isFinishing || isDestroyed) return@post
+                deepseekStatusRefreshInFlight = false
+                result.onSuccess { deepseekStatus = it }.onFailure {
+                    deepseekStatus = JSONObject().put("available", false).put("error",
+                        if (it is RemoteApiException && it.statusCode == 404) "电脑端版本暂不支持 DeepSeek，请先更新电脑端" else it.message)
+                }
+                renderHeader()
+            }
+        }
     }
 
     private fun refreshModels() {
@@ -4552,10 +4673,10 @@ class MainActivity : Activity() {
             return
         }
 
-        val text = if (currentMode == "claude-code") {
-            "与 Claude Code 完成一个伟大项目"
-        } else {
-            "与 Codex 完成一个伟大项目"
+        val text = when (currentMode) {
+            ChatEngines.DEEPSEEK -> "与 DeepSeek 完成一个伟大项目"
+            "claude-code" -> "与 Claude Code 完成一个伟大项目"
+            else -> "与 Codex 完成一个伟大项目"
         }
         welcomeTitleView.visibility = View.VISIBLE
         val localizedText = tr(text)
@@ -4624,7 +4745,18 @@ class MainActivity : Activity() {
         assistantChoiceFocusedField = null
         if (scrollToEnd) followMessageBottom = true
         val thread = activeThread
-        val turns = renderTurnsWithLiveReply(thread?.optJSONArray("turns") ?: JSONArray())
+        val replyStorageKey = activeThreadId?.let { connectionScopedKey("harness_question_replies_$it") }
+        val savedReplies = replyStorageKey?.let { runCatching { JSONArray(prefs.getString(it, "[]")) }.getOrNull() } ?: JSONArray()
+        val liveTurns = renderTurnsWithLiveReply(thread?.optJSONArray("turns") ?: JSONArray())
+        val questionOverlays = JSONArray(remoteUserMessageOverlays[activeThreadId]?.values.orEmpty()
+            .filter { it.optString("id").startsWith("user-question-") }
+            .map { shallowCopyObject(it).put("turnId", it.optString("_turnId")) })
+        val (withSavedReplies, remainingReplies) = HarnessQuestionReplies.merge(liveTurns, savedReplies)
+        val turns = HarnessQuestionReplies.merge(withSavedReplies, questionOverlays).first
+        if (replyStorageKey != null && savedReplies.length() != remainingReplies.length()) {
+            if (remainingReplies.length() == 0) prefs.edit().remove(replyStorageKey).apply()
+            else prefs.edit().putString(replyStorageKey, remainingReplies.toString()).apply()
+        }
         val runningTurnId = currentRunningTurnId()
         val incrementalTurnIndex = incrementalTurnId?.let { requestedId ->
             (0 until turns.length()).firstOrNull { turns.optJSONObject(it)?.optString("id") == requestedId }
@@ -4645,6 +4777,7 @@ class MainActivity : Activity() {
         }
         val messages = mutableListOf<Pair<String, JSONObject>>()
         val turnsById = mutableMapOf<String, JSONObject>()
+        val harnessMetricsByTurn = mutableMapOf<String, HarnessRunMetrics>()
         val assistantTextBuilders = java.util.IdentityHashMap<JSONObject, StringBuilder>()
         val timelineTextBuilders = java.util.IdentityHashMap<JSONObject, StringBuilder>()
         val firstVisibleTurnIndex = effectiveIncrementalTurnId?.let { incrementalTurnIndex!! }
@@ -4654,6 +4787,9 @@ class MainActivity : Activity() {
             val turn = turns.optJSONObject(turnIndex) ?: continue
             val turnId = turn.optString("id").takeIf { it.isNotBlank() && it != "null" } ?: "history-turn-$turnIndex"
             turnsById[turnId] = turn
+            val turnMessageStart = messages.size
+            val harnessMetrics = if (currentMode == ChatEngines.DEEPSEEK) HarnessRunMetrics.fromTurn(turn) else null
+            if (harnessMetrics != null) harnessMetricsByTurn[turnId] = harnessMetrics
             val items = turn.optJSONArray("items") ?: JSONArray()
             var assistantInTurn: JSONObject? = null
             for (itemIndex in 0 until items.length()) {
@@ -4703,7 +4839,8 @@ class MainActivity : Activity() {
                             if (message.optString("_model").isBlank()) message.putOpt("_model", messageModel)
                             if (message.optString("_effort").isBlank()) message.putOpt("_effort", messageEffort)
                             item.optString("_liveReplyItemId").takeIf { it.isNotBlank() && liveReplyTexts[it]?.completed == false }
-                                ?.let { message.put("_liveReplyItemId", it) }
+                                ?.let { message.put("_liveReplyItemId", it)
+                                    .put("_liveReplyPrefixLength", item.optInt("_liveReplyPrefixLength")) }
                             val assistantBuilder = assistantTextBuilders.getOrPut(message) { StringBuilder() }
                             if (assistantBuilder.isNotEmpty()) assistantBuilder.append("\n\n")
                             assistantBuilder.append(text)
@@ -4721,7 +4858,7 @@ class MainActivity : Activity() {
                             timelineBuilder.append(text)
                         }
                     }
-                    "reasoning", "plan" -> Unit
+                    "reasoning", "plan", "harnesstelemetry" -> Unit
                     else -> {
                         val operation = shallowCopyObject(item).put("_turnId", turnId).put("_activityIndex", itemIndex)
                         val assistantTimeline = assistantInTurn?.optJSONArray("_activityTimeline")
@@ -4732,6 +4869,14 @@ class MainActivity : Activity() {
                         }
                     }
                 }
+            }
+            if (harnessMetrics != null && (turnMessageStart until messages.size).none { messages[it].first == "assistant" }) {
+                messages += "assistant" to JSONObject().put("id", "harness-$turnId").put("_turnId", turnId)
+                    .put("text", "").put("_activityTimeline", JSONArray())
+                    .put("_displayTime", messageTime(JSONObject(), turn, true))
+                    .put("_duration", turn.optLong("durationMs", 0))
+                    .putOpt("_model", assistantMetadataField(JSONObject(), turn, "model"))
+                    .putOpt("_effort", assistantMetadataField(JSONObject(), turn, "effort", "reasoningEffort", "reasoning_effort"))
             }
         }
         messages.forEach { (role, message) ->
@@ -4745,6 +4890,8 @@ class MainActivity : Activity() {
         }
         appendRemoteUserMessageOverlays(messages)
         appendPendingUserMessages(messages)
+        val lastAssistantByTurn = mutableMapOf<String, JSONObject>()
+        messages.forEach { (role, item) -> if (role == "assistant") lastAssistantByTurn[item.optString("_turnId")] = item }
         val lastConversationMessageIndex = messages.indexOfLast { (role, _) -> role == "user" || role == "assistant" }
         val lastUserMessageIndex = messages.indexOfLast { (role, _) -> role == "user" }
         val hasConversationMessages = messages.any { it.first == "user" || it.first == "assistant" }
@@ -4868,8 +5015,7 @@ class MainActivity : Activity() {
                 orientation = LinearLayout.VERTICAL
                 setPadding(if (role == "user") dp(11) else dp(3), dp(7), if (role == "user") dp(11) else dp(3), dp(7))
                 if (role == "user") {
-                    val bubbleColor = if (currentMode == "claude-code") CLAUDE_USER_MESSAGE_SURFACE else CODEX_USER_MESSAGE_FILL
-                    background = rounded(bubbleColor, dp(if (retroTheme) 5 else 12))
+                    background = rounded(USER_MESSAGE_SURFACE, dp(if (retroTheme) 5 else 12))
                 }
             }
             if (role == "assistant") {
@@ -4878,7 +5024,7 @@ class MainActivity : Activity() {
                     gravity = Gravity.CENTER_VERTICAL
                 }
                 meta.addView(
-                    label(if (currentMode == "claude-code") "Claude" else "Codex", 11, ASSISTANT_NAME_ACCENT, true),
+                    assistantNameView(currentMode),
                     LinearLayout.LayoutParams(WRAP, WRAP),
                 )
                 item.optString("_displayTime").takeIf { it.isNotBlank() }?.let { displayTime ->
@@ -4936,7 +5082,7 @@ class MainActivity : Activity() {
                     }
                 } else {
                     addTextDocumentAttachmentCards(bubble, documentAttachments, maxBubbleWidth)
-                    val contentColor = if (currentMode == "claude-code") CLAUDE_USER_MESSAGE_FOREGROUND else CODEX_USER_MESSAGE_TEXT
+                    val contentColor = USER_MESSAGE_FOREGROUND
                     val visibleContent = when {
                         text.isNotBlank() -> text
                         documentAttachments.isNotEmpty() || hasImage -> ""
@@ -5035,9 +5181,14 @@ class MainActivity : Activity() {
                         restoreChoiceGroup.takeIf { restoreChoiceKey == choiceKey },
                         item.optString("_turnId"), item.optString("id"),
                         currentQuestion, explicitQuestions.isNotEmpty()),
-                        LinearLayout.LayoutParams(WRAP, WRAP).apply { topMargin = dp(8) })
+                        LinearLayout.LayoutParams(WRAP, WRAP).apply { topMargin = dp(8); gravity = Gravity.CENTER_HORIZONTAL })
                 }
                 val turnComplete = !running || item.optString("_turnId") != turns.optJSONObject(turns.length() - 1)?.optString("id")
+                val metricsTurnId = item.optString("_turnId")
+                if (lastAssistantByTurn[metricsTurnId] === item) harnessMetricsByTurn[metricsTurnId]?.let { metrics ->
+                    messageColumn.addView(harnessRunDetailsView(metricsTurnId, metrics),
+                        LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(3) })
+                }
                 if (turnComplete) {
                     val model = item.optString("_model").takeIf { it.isNotBlank() && it != "null" }
                     val effort = item.optString("_effort").takeIf { it.isNotBlank() && it != "null" }
@@ -5053,7 +5204,7 @@ class MainActivity : Activity() {
                         }, LinearLayout.LayoutParams(WRAP, WRAP))
                     }
                 }
-                row.addView(messageColumn, LinearLayout.LayoutParams(WRAP, WRAP))
+                row.addView(messageColumn, LinearLayout.LayoutParams(MATCH, WRAP))
             }
             val turnId = item.optString("_turnId")
             row.tag = "$TAG_MESSAGE_TURN_PREFIX$turnId"
@@ -5071,6 +5222,7 @@ class MainActivity : Activity() {
         val approval = pendingApproval
         if (approval != null) renderApproval(approval)
         claudePermissions.forThread(activeThreadId).forEach(::renderClaudePermission)
+        harnessQuestions.forThread(activeThreadId).forEach(::renderHarnessQuestion)
         activityShimmerAnimator?.cancel()
         activityShimmerAnimator = null
         val loadingActiveHistory = activeThreadId != null && historyLoadingThreadId == activeThreadId
@@ -5088,18 +5240,10 @@ class MainActivity : Activity() {
                 indeterminateTintList = ColorStateList.valueOf(activityColor)
                 contentDescription = "正在思考"
             }, LinearLayout.LayoutParams(dp(16), dp(16)).apply { rightMargin = dp(7) })
-            val lastTurn = turns.optJSONObject(turns.length() - 1)
-            val timerTurnId = "${activeThreadId.orEmpty()}:${lastTurn?.optString("id").orEmpty()}"
-            if (activeActivityTimerTurnId != timerTurnId) {
-                val nowWall = System.currentTimeMillis()
-                val startedAtWall = parseMessageInstant(firstJsonValue(lastTurn ?: JSONObject(), "startedAt", "started_at", "createdAt"))?.toEpochMilli()
-                    ?: nowWall
-                val elapsedBeforeRender = (nowWall - startedAtWall).coerceAtLeast(0L)
-                activeActivityStartedAt = SystemClock.elapsedRealtime() - elapsedBeforeRender
-                activeActivityTimerTurnId = timerTurnId
-            }
-            val lastItems = lastTurn?.optJSONArray("items") ?: JSONArray()
-            val turnId = lastTurn?.optString("id").orEmpty()
+            val lastTurn = TurnTiming.activeTurn(turns, pendingLiveTurnIds[activeThreadId])
+            val turnId = lastTurn.optString("id")
+            activeActivityTimerKey = observeTurnTimer(activeThreadId.orEmpty(), turnId, lastTurn)
+            val lastItems = lastTurn.optJSONArray("items") ?: JSONArray()
             val activityText = activityLineText(turnId, lastItems)
             activeActivityText = label(activityText, 12, activityColor).apply {
                 maxLines = 1
@@ -5119,8 +5263,7 @@ class MainActivity : Activity() {
             handler.removeCallbacks(activityTick)
             activeActivityText = null
             activeActivityTimer = null
-            activeActivityStartedAt = 0L
-            activeActivityTimerTurnId = null
+            activeActivityTimerKey = null
         }
         val renderedScroll = messageScroll
         val renderedList = messageList
@@ -5242,7 +5385,7 @@ class MainActivity : Activity() {
         val bubble = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(11), dp(7), dp(11), dp(7))
-            background = rounded(if (currentMode == "claude-code") CLAUDE_USER_MESSAGE_SURFACE else CODEX_USER_MESSAGE_FILL, dp(if (retroTheme) 5 else 12))
+            background = rounded(USER_MESSAGE_SURFACE, dp(if (retroTheme) 5 else 12))
         }
         val rawText = messageText(item, "user")
         val parsedText = parseUserMessageText(rawText)
@@ -5250,7 +5393,7 @@ class MainActivity : Activity() {
             ?: parsedText.visibleText else parsedText.visibleText
         addTextDocumentAttachmentCards(bubble, parsedText.documentAttachments, maxBubbleWidth)
         if (text.isNotBlank()) {
-            val content = label(text, 14, if (currentMode == "claude-code") CLAUDE_USER_MESSAGE_TEXT else CODEX_USER_MESSAGE_TEXT, translateUi = false).apply {
+            val content = label(text, 14, USER_MESSAGE_FOREGROUND, translateUi = false).apply {
                 setTextIsSelectable(true)
                 maxWidth = (maxBubbleWidth - dp(22)).coerceAtLeast(dp(120))
                 setLineSpacing(dp(2).toFloat(), 1.08f)
@@ -5352,6 +5495,7 @@ class MainActivity : Activity() {
                 val items = turns.optJSONObject(index)?.optJSONArray("items") ?: return@any false
                 (0 until items.length()).any { items.optJSONObject(it)?.optString("id") == itemId }
             }
+            if (itemId.startsWith("user-question-") && !confirmed) continue // Already inserted before assistant messages are grouped.
             if (confirmed || messages.any { (role, message) -> role == "user" && message.optString("id") == itemId }) {
                 iterator.remove()
                 continue
@@ -6165,6 +6309,7 @@ class MainActivity : Activity() {
         val userAgent: String?,
         val contentDisposition: String?,
         val mimeType: String?,
+        val referer: String?,
     )
 
     private data class WebDownloadRateSample(val bytes: Long, val timestamp: Long)
@@ -6174,79 +6319,62 @@ class MainActivity : Activity() {
         val title: TextView,
         val details: TextView,
         val progress: ProgressBar,
+        val deleteButton: ImageButton,
     )
 
     private fun showWebAddressDialog(currentAddress: String, onLoad: (String) -> Unit) {
-        val dialog = Dialog(this)
-        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
-        val layout = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(14), dp(16), dp(10))
-            background = rounded(OPAQUE_PANEL, dp(14), BORDER, dp(1))
-        }
-        layout.addView(label("输入网页地址", 15, TEXT, true), LinearLayout.LayoutParams(MATCH, WRAP).apply {
-            bottomMargin = dp(12)
-        })
         val addressInput = EditText(this).apply {
             setTextColor(TEXT)
             setHintTextColor(MUTED)
             textSize = adjustedTextSize(14)
             setTag(R.id.base_text_size, 14f)
+            typeface = themedTypeface()
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
             imeOptions = EditorInfo.IME_ACTION_GO
             setSingleLine(true)
             setSelectAllOnFocus(true)
-            hint = "https://example.com"
+            hint = tr("输入网址或搜索")
             setText(currentAddress)
-            background = rounded(PANEL_INSET, dp(8), BORDER, dp(1))
-            setPadding(dp(10), dp(8), dp(10), dp(8))
+            background = browserFieldBackground()
+            setPadding(dp(12), dp(8), dp(12), dp(8))
         }
-        layout.addView(addressInput, LinearLayout.LayoutParams(MATCH, dp(44)))
-        val actions = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.END or Gravity.CENTER_VERTICAL
-        }
-        val submit = {
-            val target = normalizeWebUrl(addressInput.text.toString())
-            if (target == null) {
-                addressInput.error = "请输入有效的网址"
-            } else {
-                onLoad(target)
-                dialog.dismiss()
+        val dialog = showBrowserDialog("输入网址或搜索") { body, sheet ->
+            body.addView(addressInput, LinearLayout.LayoutParams(MATCH, dp(48)))
+            val submit = {
+                val target = BrowserNavigation.resolve(addressInput.text.toString(), browserSearchEngine())
+                if (target == null) {
+                    addressInput.error = tr("请输入搜索词或有效的 HTTP(S) 网址")
+                } else {
+                    sheet.dismiss()
+                    onLoad(target)
+                }
+            }
+            body.addView(browserActionRow("chevron_right", "前往", ACCENT, trailing = null) { submit() },
+                LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(8) })
+            body.addView(browserActionRow("bookmark", "收藏夹") { sheet.dismiss(); showBrowserLibrary(true) }, LinearLayout.LayoutParams(MATCH, WRAP))
+            body.addView(browserActionRow("history", "浏览历史") { sheet.dismiss(); showBrowserLibrary(false) }, LinearLayout.LayoutParams(MATCH, WRAP))
+            addressInput.setOnEditorActionListener { _, action, _ ->
+                if (action == EditorInfo.IME_ACTION_GO) { submit(); true } else false
             }
         }
-        actions.addView(dialogTextButton("取消", MUTED) { dialog.dismiss() }, LinearLayout.LayoutParams(WRAP, dp(42)))
-        actions.addView(dialogTextButton("前往", ACCENT) { submit() }, LinearLayout.LayoutParams(WRAP, dp(42)))
-        layout.addView(actions, LinearLayout.LayoutParams(MATCH, dp(46)).apply { topMargin = dp(5) })
-        addressInput.setOnEditorActionListener { _, action, _ ->
-            if (action == EditorInfo.IME_ACTION_GO) {
-                submit()
-                true
-            } else false
-        }
-        dialog.setContentView(layout)
-        dialog.setCanceledOnTouchOutside(true)
-        dialog.show()
-        dialog.window?.apply {
-            setBackgroundDrawableResource(android.R.color.transparent)
-            setLayout((resources.displayMetrics.widthPixels - dp(32)).coerceAtLeast(dp(260)), WRAP)
-            setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE or WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
-        }
+        dialog.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE or WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
         addressInput.requestFocus()
         addressInput.post {
-            addressInput.selectAll()
-            (getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager)
-                ?.showSoftInput(addressInput, InputMethodManager.SHOW_IMPLICIT)
+            if (dialog.isShowing && addressInput.hasFocus()) {
+                addressInput.selectAll()
+                (getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager)
+                    ?.showSoftInput(addressInput, InputMethodManager.SHOW_IMPLICIT)
+            }
         }
     }
 
-    private fun beginWebDownload(url: String, userAgent: String?, contentDisposition: String?, mimeType: String?) {
+    private fun beginWebDownload(url: String, userAgent: String?, contentDisposition: String?, mimeType: String?, referer: String?) {
         val scheme = runCatching { Uri.parse(url).scheme?.lowercase(Locale.ROOT) }.getOrNull()
         if (scheme !in setOf("http", "https")) {
             showToast("此网页的下载链接暂不支持")
             return
         }
-        val download = PendingWebDownload(url, userAgent, contentDisposition, mimeType)
+        val download = PendingWebDownload(url, userAgent, contentDisposition, mimeType, referer)
         if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P &&
             checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED
         ) {
@@ -6274,7 +6402,7 @@ class MainActivity : Activity() {
             CookieManager.getInstance().getCookie(download.url)?.takeIf { it.isNotBlank() }?.let {
                 addRequestHeader("Cookie", it)
             }
-            webPreviewView?.url?.takeIf { it.isNotBlank() }?.let { addRequestHeader("Referer", it) }
+            download.referer?.takeIf { it.isNotBlank() }?.let { addRequestHeader("Referer", it) }
         }
         runCatching { manager.enqueue(request) }
             .onSuccess { showToast("已开始下载：$fileName") }
@@ -6287,40 +6415,14 @@ class MainActivity : Activity() {
             showToast("系统下载服务不可用")
             return
         }
-        val dialog = Dialog(this)
-        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
-        val content = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(14), dp(9), dp(14), dp(10))
-            background = rounded(OPAQUE_PANEL, dp(14), BORDER, dp(1))
-        }
-        val header = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        header.addView(label("下载", 16, TEXT, true), LinearLayout.LayoutParams(0, dp(42), 1f))
-        header.addView(iconButton("close", "关闭下载列表") { dialog.dismiss() }, LinearLayout.LayoutParams(dp(36), dp(36)))
-        content.addView(header, LinearLayout.LayoutParams(MATCH, dp(42)))
         val rows = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         val emptyState = label("暂无下载。打开网页并点击下载链接后会显示在这里。", 13, MUTED).apply {
             gravity = Gravity.CENTER
             setPadding(dp(18), dp(34), dp(18), dp(34))
         }
         rows.addView(emptyState, LinearLayout.LayoutParams(MATCH, WRAP))
-        val scroll = ScrollView(this).apply {
-            isVerticalScrollBarEnabled = false
-            overScrollMode = View.OVER_SCROLL_NEVER
-            addView(rows, ViewGroup.LayoutParams(MATCH, WRAP))
-        }
-        content.addView(scroll, LinearLayout.LayoutParams(MATCH, 0, 1f))
-        dialog.setContentView(content)
-        dialog.setCanceledOnTouchOutside(true)
-        dialog.show()
-        dialog.window?.apply {
-            setBackgroundDrawableResource(android.R.color.transparent)
-            setLayout((resources.displayMetrics.widthPixels - dp(28)).coerceAtLeast(dp(270)),
-                (resources.displayMetrics.heightPixels * .72f).toInt())
-            setGravity(Gravity.CENTER)
+        val dialog = showBrowserDialog("下载") { body, _ ->
+            body.addView(rows, LinearLayout.LayoutParams(MATCH, WRAP))
         }
 
         val rowViews = mutableMapOf<Long, WebDownloadRowUi>()
@@ -6330,12 +6432,13 @@ class MainActivity : Activity() {
                 if (!dialog.isShowing) return
                 val cursor = runCatching { manager.query(DownloadManager.Query()) }.getOrNull()
                 if (cursor == null) {
-                    emptyState.text = "无法读取下载列表"
+                    emptyState.text = tr("无法读取下载列表")
                     emptyState.visibility = View.VISIBLE
                     handler.postDelayed(this, 1000L)
                     return
                 }
                 val now = SystemClock.elapsedRealtime()
+                emptyState.text = tr("暂无下载。打开网页并点击下载链接后会显示在这里。")
                 val visibleIds = mutableSetOf<Long>()
                 cursor.use { result ->
                     val idColumn = result.getColumnIndexOrThrow(DownloadManager.COLUMN_ID)
@@ -6348,7 +6451,7 @@ class MainActivity : Activity() {
                     while (result.moveToNext()) {
                         val id = result.getLong(idColumn)
                         visibleIds += id
-                        val title = result.getString(titleColumn)?.takeIf { it.isNotBlank() } ?: "网页文件下载"
+                        val title = result.getString(titleColumn)?.takeIf { it.isNotBlank() } ?: tr("网页文件下载")
                         val status = result.getInt(statusColumn)
                         val reason = result.getInt(reasonColumn)
                         val bytes = result.getLong(bytesColumn).coerceAtLeast(0L)
@@ -6372,16 +6475,26 @@ class MainActivity : Activity() {
                                 progressTintList = ColorStateList.valueOf(ACCENT)
                                 progressBackgroundTintList = ColorStateList.valueOf(BORDER)
                             }
+                            val deleteButton = browserIconButton("delete", "删除下载文件") {}.apply {
+                                imageTintList = ColorStateList.valueOf(ERROR)
+                            }
+                            val heading = LinearLayout(this@MainActivity).apply {
+                                orientation = LinearLayout.HORIZONTAL
+                                gravity = Gravity.CENTER_VERTICAL
+                                minimumHeight = dp(44)
+                                addView(titleView, LinearLayout.LayoutParams(0, WRAP, 1f))
+                                addView(deleteButton, LinearLayout.LayoutParams(dp(44), dp(44)))
+                            }
                             val rowContent = LinearLayout(this@MainActivity).apply {
                                 orientation = LinearLayout.VERTICAL
-                                setPadding(dp(3), dp(10), dp(3), dp(10))
-                                addView(titleView, LinearLayout.LayoutParams(MATCH, WRAP))
+                                setPadding(dp(12), dp(12), dp(12), dp(12))
+                                background = browserControlBackground(blendColors(OPAQUE_PANEL, TEXT, .035f), 14)
+                                addView(heading, LinearLayout.LayoutParams(MATCH, WRAP))
                                 addView(detailsView, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(4) })
                                 addView(progressView, LinearLayout.LayoutParams(MATCH, dp(3)).apply { topMargin = dp(7) })
                             }
-                            rows.addView(rowContent, LinearLayout.LayoutParams(MATCH, WRAP))
-                            rows.addView(View(this@MainActivity).apply { setBackgroundColor(BORDER) }, LinearLayout.LayoutParams(MATCH, dp(1)))
-                            WebDownloadRowUi(rowContent, titleView, detailsView, progressView)
+                            rows.addView(rowContent, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(8) })
+                            WebDownloadRowUi(rowContent, titleView, detailsView, progressView, deleteButton)
                         }
                         row.title.text = title
                         val statusText = when (status) {
@@ -6394,20 +6507,33 @@ class MainActivity : Activity() {
                                 else -> "已暂停"
                             }
                             DownloadManager.STATUS_SUCCESSFUL -> "下载完成 · 点击打开"
-                            DownloadManager.STATUS_FAILED -> "下载失败（$reason）"
+                            DownloadManager.STATUS_FAILED -> "${tr("下载失败")} ($reason)"
                             else -> "状态未知"
                         }
-                        val totalText = if (total > 0L) formatDownloadSize(total) else "大小未知"
+                        val totalText = if (total > 0L) formatDownloadSize(total) else tr("大小未知")
                         val speedText = if (status == DownloadManager.STATUS_RUNNING) {
-                            if (previous != null) " · ${formatDownloadRate(rate)}" else " · 计算速度中…"
+                            if (previous != null) " · ${formatDownloadRate(rate)}" else " · ${tr("计算速度中…")}"
                         } else ""
-                        row.details.text = "$statusText · ${formatDownloadSize(bytes)} / $totalText$speedText"
+                        row.details.text = "${tr(statusText)} · ${formatDownloadSize(bytes)} / $totalText$speedText"
                         row.progress.isIndeterminate = total <= 0L && status in setOf(DownloadManager.STATUS_PENDING, DownloadManager.STATUS_RUNNING)
                         row.progress.progress = if (total > 0L) ((bytes * 100L / total).toInt()).coerceIn(0, 100) else 0
-                        row.container.contentDescription = if (status == DownloadManager.STATUS_SUCCESSFUL) "打开下载文件：$title" else title
+                        row.container.contentDescription = if (status == DownloadManager.STATUS_SUCCESSFUL) "${tr("打开下载文件")} · $title" else title
                         row.container.setOnClickListener(if (status == DownloadManager.STATUS_SUCCESSFUL) {
                             View.OnClickListener { openDownloadedWebFile(manager, id, mimeType) }
                         } else null)
+                        row.container.isClickable = status == DownloadManager.STATUS_SUCCESSFUL
+                        row.container.isFocusable = row.container.isClickable
+                        val historical = status == DownloadManager.STATUS_SUCCESSFUL || status == DownloadManager.STATUS_FAILED
+                        row.deleteButton.visibility = if (historical) View.VISIBLE else View.GONE
+                        row.deleteButton.isEnabled = historical
+                        row.deleteButton.contentDescription = "${tr("删除下载文件")} · $title"
+                        row.deleteButton.setOnClickListener {
+                            deleteDownloadedWebFile(manager, id, title) {
+                                rowViews.remove(id)?.let { rows.removeView(it.container) }
+                                samples.remove(id)
+                                if (rowViews.isEmpty()) emptyState.visibility = View.VISIBLE
+                            }
+                        }
                     }
                 }
                 emptyState.visibility = if (visibleIds.isEmpty()) View.VISIBLE else View.GONE
@@ -6420,6 +6546,30 @@ class MainActivity : Activity() {
         }
         dialog.setOnDismissListener { handler.removeCallbacks(updateDownloads) }
         handler.post(updateDownloads)
+    }
+
+    private fun deleteDownloadedWebFile(manager: DownloadManager, id: Long, title: String, onDeleted: () -> Unit) {
+        showConfirmDialog("删除下载文件", "${tr("将同时删除下载记录及已下载的文件，无法恢复。")}\n\n$title", "删除", destructive = true) {
+            // Re-read the app-owned record after confirmation; never cancel an active download here.
+            runCatching {
+                val cursor = manager.query(DownloadManager.Query().setFilterById(id))
+                    ?: throw IOException("Download service did not return a cursor")
+                val status = cursor.use {
+                    if (cursor.moveToFirst()) cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS)) else null
+                }
+                when (status) {
+                    null -> 0
+                    DownloadManager.STATUS_SUCCESSFUL, DownloadManager.STATUS_FAILED -> manager.remove(id)
+                    else -> -1
+                }
+            }.onSuccess { removed ->
+                when {
+                    removed > 0 -> { onDeleted(); showToast("已删除下载项") }
+                    removed == 0 -> { onDeleted(); showToast("下载项已不存在") }
+                    else -> showToast("下载仍在进行，请完成后再删除")
+                }
+            }.onFailure { showToast("删除下载失败，请稍后重试") }
+        }
     }
 
     private fun formatDownloadSize(bytes: Long): String {
@@ -6450,55 +6600,39 @@ class MainActivity : Activity() {
             .onFailure { showToast("没有可用的应用打开此文件") }
     }
 
-    private data class WebPreviewFrame(
-        val x: Int,
-        val y: Int,
-        val width: Int,
-        val height: Int,
-        val availableWidth: Int,
-        val availableHeight: Int,
-    )
-
-    private fun webPreviewFrame(): WebPreviewFrame {
-        val left = systemInsetLeft + dp(6)
-        val right = (root.width - systemInsetRight - dp(6)).coerceAtLeast(left + dp(160))
-        val availableWidth = (right - left).coerceAtLeast(dp(160))
-        val rootLocation = IntArray(2)
-        val composerLocation = IntArray(2)
-        root.getLocationOnScreen(rootLocation)
-        composerDock.getLocationOnScreen(composerLocation)
-        val composerTop = composerLocation[1] - rootLocation[1]
-        val top = systemInsetTop + dp(8)
-        val bottom = (composerTop - dp(8)).coerceAtLeast(top + dp(160))
-        val availableHeight = (bottom - top).coerceAtLeast(dp(160))
-        val widthRatio = prefs.getFloat(KEY_WEB_PREVIEW_WIDTH_RATIO, .94f).coerceIn(.45f, 1f)
-        val heightRatio = prefs.getFloat(KEY_WEB_PREVIEW_HEIGHT_RATIO, .76f).coerceIn(.4f, 1f)
-        val width = (availableWidth * widthRatio).roundToInt().coerceIn(dp(240).coerceAtMost(availableWidth), availableWidth)
-        val height = (availableHeight * heightRatio).roundToInt().coerceIn(dp(220).coerceAtMost(availableHeight), availableHeight)
-        val x = left + (availableWidth - width) / 2
-        val y = top + (availableHeight - height) / 2
-        return WebPreviewFrame(x, y, width, height, availableWidth, availableHeight)
+    private fun applyBrowserScreenInsets() {
+        val screen = browserScreen ?: return
+        // Older Android versions already fit this Activity inside the system bars and IME.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
+        val bottom = max(systemInsetBottom, browserBottomInset)
+        if (screen.paddingLeft != systemInsetLeft || screen.paddingTop != systemInsetTop ||
+            screen.paddingRight != systemInsetRight || screen.paddingBottom != bottom
+        ) screen.setPadding(systemInsetLeft, systemInsetTop, systemInsetRight, bottom)
     }
 
-    private fun openWebPreview(rawUrl: String) {
-        val url = normalizeWebUrl(rawUrl) ?: return openExternalChatLink(rawUrl)
-        if (webPreviewPopup?.isShowing == true) {
-            webPreviewView?.loadUrl(url)
-            return
-        }
-        if (!::root.isInitialized || !::composerDock.isInitialized || root.width <= 0) {
-            openExternalChatLink(url)
-            return
-        }
+    private fun browserSearchEngine(): BrowserSearchEngine = BrowserSearchEngine.entries.firstOrNull {
+        it.name == prefs.getString("browser_search_engine", BrowserSearchEngine.GOOGLE.name)
+    } ?: BrowserSearchEngine.GOOGLE
 
-        val focused = window.currentFocus
-        if (focused is EditText) {
-            (getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager)
-                ?.hideSoftInputFromWindow(focused.windowToken, 0)
-        }
-        parkActivityInputFocus()
+    private fun persistBrowserLibrary() {
+        prefs.edit().putString("browser_bookmarks", browserLibrary.encode(browserLibrary.bookmarks))
+            .putString("browser_history", browserLibrary.encode(browserLibrary.history)).apply()
+    }
 
-        val webView = WebView(this).apply {
+    private fun toggleBrowserBookmark(page: BrowserPage) {
+        if (page.disposed || BrowserNavigation.webUrl(page.address) == null) return
+        val added = browserLibrary.toggleBookmark(page.address, page.title)
+        persistBrowserLibrary()
+        webPreviewRefresh?.invoke()
+        showToast(if (added) "已收藏网页" else "已取消收藏")
+    }
+
+    private fun newBrowserPage(url: String, load: Boolean = true): BrowserPage? {
+        if (browserPages.items.size >= 8) {
+            showToast("最多保留 8 个网页，请先关闭不需要的页面")
+            return null
+        }
+        val view = WebView(this).apply {
             setBackgroundColor(Color.WHITE)
             scrollBarStyle = View.SCROLLBARS_INSIDE_OVERLAY
             settings.apply {
@@ -6507,243 +6641,1083 @@ class MainActivity : Activity() {
                 allowFileAccess = false
                 allowContentAccess = false
                 javaScriptCanOpenWindowsAutomatically = false
-                setSupportMultipleWindows(false)
+                setSupportMultipleWindows(true)
                 mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
             }
         }
-        webPreviewView = webView
-
-        val panel = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            background = rounded(OPAQUE_PANEL, dp(14), BORDER, dp(1))
-            clipToOutline = true
+        val page = BrowserPage(view, url)
+        browserPages.add(page)
+        fun refresh() {
+            if (page.disposed) return
+            if (browserPages.active === page) webPreviewRefresh?.invoke()
+            updateBrowserDock()
         }
-        val toolbar = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(5), dp(2), dp(5), dp(2))
-            background = if (retroTheme) lollipopActionBarBackground() else ColorDrawable(PANEL)
-        }
-        val addressView = label(url, 10, MUTED, translateUi = false).apply {
-            maxLines = 1
-            ellipsize = android.text.TextUtils.TruncateAt.MIDDLE
-            setPadding(dp(9), 0, dp(9), 0)
-            isClickable = true
-            contentDescription = "输入网页地址"
-        }
-        val progress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
-            max = 100
-            progress = 0
-            progressTintList = ColorStateList.valueOf(ACCENT)
-            progressBackgroundTintList = ColorStateList.valueOf(BORDER)
-            visibility = View.GONE
-        }
-        val backButton = iconButton("back", "网页后退") { if (webView.canGoBack()) webView.goBack() }
-        val forwardButton = iconButton("chevron_right", "网页前进") { if (webView.canGoForward()) webView.goForward() }
-        val refreshButton = iconButton("refresh", "刷新网页") { webView.reload() }
-        val downloadButton = iconButton("download", "查看下载") { showWebDownloadsDialog() }
-        val externalButton = iconButton("open", "用浏览器打开") {
-            openExternalChatLink(webView.url ?: url)
-        }
-        val closeButton = iconButton("close", "关闭网页预览") { closeWebPreview() }
-        listOf(backButton, forwardButton, refreshButton, downloadButton, externalButton, closeButton).forEach { button ->
-            button.minimumWidth = dp(34)
-            button.minimumHeight = dp(36)
-            toolbar.addView(button, LinearLayout.LayoutParams(dp(36), dp(38)))
-        }
-        toolbar.addView(addressView, LinearLayout.LayoutParams(0, dp(36), 1f))
-        addressView.setOnClickListener {
-            showWebAddressDialog(webView.url ?: url) { target -> webView.loadUrl(target) }
-        }
-
-        val resizeHeader = FrameLayout(this).apply {
-            isClickable = true
-            setOnClickListener { }
-            addView(View(this@MainActivity).apply {
-                background = rounded(MUTED, dp(3))
-                alpha = .72f
-            }, FrameLayout.LayoutParams(dp(38), dp(4), Gravity.CENTER))
-        }
-        panel.addView(resizeHeader, LinearLayout.LayoutParams(MATCH, dp(18)))
-        panel.addView(toolbar, LinearLayout.LayoutParams(MATCH, dp(42)))
-        panel.addView(progress, LinearLayout.LayoutParams(MATCH, dp(2)))
-        panel.addView(webView, LinearLayout.LayoutParams(MATCH, 0, 1f))
-
-        val resizeFooter = FrameLayout(this).apply {
-            isClickable = true
-            setOnClickListener { }
-            addView(View(this@MainActivity).apply {
-                background = rounded(MUTED, dp(3))
-                alpha = .72f
-            }, FrameLayout.LayoutParams(dp(38), dp(4), Gravity.CENTER))
-        }
-        panel.addView(resizeFooter, LinearLayout.LayoutParams(MATCH, dp(26)))
-        val popupContent = FrameLayout(this).apply {
-            addView(panel, FrameLayout.LayoutParams(MATCH, MATCH))
-        }
-        val widthResizeHandle = FrameLayout(this).apply {
-            isClickable = true
-            setOnClickListener { }
-            addView(View(this@MainActivity).apply {
-                background = rounded(MUTED, dp(3))
-                alpha = .72f
-            }, FrameLayout.LayoutParams(dp(4), dp(38), Gravity.CENTER))
-        }
-        popupContent.addView(widthResizeHandle, FrameLayout.LayoutParams(dp(24), dp(76), Gravity.END or Gravity.CENTER_VERTICAL))
-
-        val initialFrame = webPreviewFrame()
-        val popup = PopupWindow(popupContent, initialFrame.width, initialFrame.height, false).apply {
-            setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
-            elevation = dp(12).toFloat()
-            isTouchable = true
-            isFocusable = true
-            isOutsideTouchable = false
-            isClippingEnabled = true
-            inputMethodMode = PopupWindow.INPUT_METHOD_NEEDED
-            softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
-        }
-        webPreviewPopup = popup
-
-        val updateHistoryButtons = {
-            backButton.isEnabled = webView.canGoBack()
-            backButton.alpha = if (backButton.isEnabled) 1f else .45f
-            forwardButton.isEnabled = webView.canGoForward()
-            forwardButton.alpha = if (forwardButton.isEnabled) 1f else .45f
-        }
-        webView.webChromeClient = object : WebChromeClient() {
+        view.webChromeClient = object : WebChromeClient() {
             override fun onProgressChanged(view: WebView, newProgress: Int) {
-                progress.progress = newProgress
-                progress.visibility = if (newProgress >= 100) View.GONE else View.VISIBLE
+                if (page.disposed) return
+                page.progress = newProgress
+                if (newProgress == 100) page.loading = false
+                refresh()
+            }
+
+            override fun onReceivedTitle(view: WebView, title: String?) {
+                if (page.disposed) return
+                page.title = title.orEmpty()
+                refresh()
+            }
+
+            override fun onCreateWindow(view: WebView, isDialog: Boolean, isUserGesture: Boolean, resultMsg: android.os.Message): Boolean {
+                if (page.disposed || !isUserGesture) return false
+                val transport = resultMsg.obj as? WebView.WebViewTransport ?: return false
+                val child = newBrowserPage("about:blank", load = false) ?: return false
+                showWebPreview()
+                transport.webView = child.view
+                resultMsg.sendToTarget()
+                return true
+            }
+
+            override fun onCloseWindow(window: WebView) { closeBrowserPage(page) }
+
+            override fun onShowFileChooser(webView: WebView, callback: ValueCallback<Array<Uri>>, params: FileChooserParams): Boolean {
+                if (page.disposed) return false
+                // One system picker at a time: a late result must not reach another page.
+                if (browserFilePickerActive) { callback.onReceiveValue(null); return true }
+                browserFilePickerActive = true
+                browserFileCallback = callback
+                browserFilePage = page
+                try {
+                    startActivityForResult(params.createIntent(), REQUEST_BROWSER_FILE)
+                } catch (_: ActivityNotFoundException) {
+                    browserFileCallback = null
+                    browserFilePage = null
+                    browserFilePickerActive = false
+                    callback.onReceiveValue(null)
+                    showToast("没有可用的文件选择器")
+                }
+                return true
             }
         }
-        webView.webViewClient = object : WebViewClient() {
-            override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean =
-                routeWebPreviewNavigation(request.url)
+        view.webViewClient = object : WebViewClient() {
+            override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                if (page.disposed) return true
+                if (request.url.scheme?.lowercase(Locale.ROOT) in setOf("http", "https")) return false
+                if (!request.isForMainFrame || !request.hasGesture()) return true
+                return routeWebPreviewNavigation(request.url)
+            }
 
             override fun onPageStarted(view: WebView, address: String?, favicon: Bitmap?) {
-                address?.let { addressView.text = it }
-                progress.progress = 0
-                progress.visibility = View.VISIBLE
-                updateHistoryButtons()
+                if (page.disposed) return
+                page.address = address ?: page.address
+                page.error = null
+                page.loading = true
+                page.progress = 0
+                refresh()
             }
 
             override fun onPageFinished(view: WebView, address: String?) {
-                addressView.text = view.url ?: address.orEmpty()
-                updateHistoryButtons()
+                if (page.disposed) return
+                if (page.error == null) page.address = view.url ?: address ?: page.address
+                page.title = view.title.orEmpty()
+                page.loading = false
+                page.progress = 100
+                if (page.error == null) {
+                    browserLibrary.visit(page.address, page.title)
+                    persistBrowserLibrary()
+                }
+                refresh()
+            }
+
+            override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
+                if (page.disposed || !request.isForMainFrame) return
+                page.address = request.url.toString()
+                page.error = tr("网页加载失败，请检查网络后重试")
+                page.loading = false
+                refresh()
             }
 
             override fun onReceivedSslError(view: WebView, handler: SslErrorHandler, error: android.net.http.SslError) {
                 handler.cancel()
-                showToast("网页证书验证失败，已停止加载")
+                if (page.disposed || error.url != page.address) return
+                page.error = tr("网页证书验证失败，已停止加载")
+                page.loading = false
+                refresh()
             }
         }
-        webView.setDownloadListener { downloadUrl, userAgent, contentDisposition, mimeType, _ ->
-            beginWebDownload(downloadUrl, userAgent, contentDisposition, mimeType)
+        view.setDownloadListener { downloadUrl, userAgent, contentDisposition, mimeType, _ ->
+            if (!page.disposed) beginWebDownload(downloadUrl, userAgent, contentDisposition, mimeType, page.address)
+        }
+        if (load) view.loadUrl(url)
+        return page
+    }
+
+    private fun disposeBrowserPage(page: BrowserPage) {
+        if (page.disposed) return
+        page.disposed = true
+        if (browserFilePage === page) {
+            browserFileCallback?.onReceiveValue(null)
+            browserFileCallback = null
+            browserFilePage = null
+        }
+        (page.view.parent as? ViewGroup)?.removeView(page.view)
+        page.view.onPause()
+        page.view.stopLoading()
+        page.view.setDownloadListener(null)
+        page.view.webChromeClient = null
+        page.view.webViewClient = WebViewClient()
+        page.view.removeAllViews()
+        page.view.destroy()
+    }
+
+    private fun closeBrowserPage(page: BrowserPage) {
+        if (!browserPages.remove(page)) return
+        if (webPreviewView === page.view) webPreviewView = null
+        disposeBrowserPage(page)
+        if (browserPages.active == null) closeWebPreview() else {
+            webPreviewRefresh?.invoke()
+            updateBrowserDock()
+        }
+    }
+
+    private fun removeBrowserDock() {
+        browserDock?.let { (it.parent as? ViewGroup)?.removeView(it) }
+        browserDock = null
+        browserDockLayoutListener?.let {
+            root.removeOnLayoutChangeListener(it)
+            composerDock.removeOnLayoutChangeListener(it)
+        }
+        browserDockLayoutListener = null
+    }
+
+    /** Keep the larger touch target invisible; feedback belongs only to the narrow edge face. */
+    private inner class BrowserEdgeHandle(icon: String, description: String, action: () -> Unit) : FrameLayout(this@MainActivity) {
+        var isHandlingDragGesture = false
+            private set
+        private var repositionAction: (() -> Unit)? = null
+        private val glyph = browserIconView(icon)
+        private val face = FrameLayout(this@MainActivity).apply {
+            background = android.graphics.drawable.StateListDrawable().apply {
+                addState(intArrayOf(-android.R.attr.state_enabled), rounded(OPAQUE_PANEL, dp(14), BORDER, dp(1)))
+                addState(intArrayOf(android.R.attr.state_pressed), rounded(blendColors(OPAQUE_PANEL, ACCENT, .08f), dp(14), BORDER, dp(1)))
+                addState(intArrayOf(android.R.attr.state_focused), rounded(blendColors(OPAQUE_PANEL, ACCENT, .04f), dp(14), ACCENT, dp(1)))
+                addState(intArrayOf(), rounded(OPAQUE_PANEL, dp(14), BORDER, dp(1)))
+            }
+            isDuplicateParentStateEnabled = true
+            elevation = 0f
+            translationZ = 0f
+            stateListAnimator = null
+            outlineProvider = null
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+            addView(glyph, FrameLayout.LayoutParams(dp(18), dp(18), Gravity.CENTER))
         }
 
-        var popupX = initialFrame.x
-        var popupY = initialFrame.y
-        fun applySavedFrame(anchorX: Int? = null, anchorY: Int? = null) {
-            if (!popup.isShowing) return
-            val frame = webPreviewFrame()
-            val rootLocation = IntArray(2)
-            val composerLocation = IntArray(2)
-            root.getLocationOnScreen(rootLocation)
-            composerDock.getLocationOnScreen(composerLocation)
-            val composerTop = composerLocation[1] - rootLocation[1]
-            val minX = systemInsetLeft + dp(6)
-            val maxX = (root.width - systemInsetRight - dp(6) - frame.width).coerceAtLeast(minX)
-            val minY = systemInsetTop + dp(8)
-            val maxY = (composerTop - dp(8) - frame.height).coerceAtLeast(minY)
-            popupX = (anchorX ?: popupX).coerceIn(minX, maxX)
-            popupY = (anchorY ?: popupY).coerceIn(minY, maxY)
-            popup.update(popupX, popupY, frame.width, frame.height)
-        }
-        webPreviewRelayout = { applySavedFrame() }
-
-        fun resizeHandler(
-            resizeWidth: Boolean,
-            resizeHeight: Boolean,
-            anchorBottom: Boolean = false,
-        ): View.OnTouchListener {
-            var startX = 0f
-            var startY = 0f
-            var startWidth = 0
-            var startHeight = 0
-            var startPopupX = 0
-            var startPopupY = 0
-            return View.OnTouchListener { view, event ->
-                when (event.actionMasked) {
-                    MotionEvent.ACTION_DOWN -> {
-                        startX = event.rawX
-                        startY = event.rawY
-                        startWidth = popup.width
-                        startHeight = popup.height
-                        startPopupX = popupX
-                        startPopupY = popupY
-                        true
-                    }
-                    MotionEvent.ACTION_MOVE -> {
-                        val available = webPreviewFrame()
-                        val width = if (resizeWidth) {
-                            (startWidth + (event.rawX - startX).roundToInt())
-                                .coerceIn(dp(240).coerceAtMost(available.availableWidth), available.availableWidth)
-                        } else startWidth
-                        val height = if (resizeHeight) {
-                            val deltaY = (event.rawY - startY).roundToInt()
-                            (startHeight + (if (anchorBottom) -deltaY else deltaY))
-                                .coerceIn(dp(220).coerceAtMost(available.availableHeight), available.availableHeight)
-                        } else startHeight
-                        val editor = prefs.edit()
-                        if (resizeWidth) editor.putFloat(KEY_WEB_PREVIEW_WIDTH_RATIO, width.toFloat() / available.availableWidth)
-                        if (resizeHeight) editor.putFloat(KEY_WEB_PREVIEW_HEIGHT_RATIO, height.toFloat() / available.availableHeight)
-                        editor.apply()
-                        applySavedFrame(
-                            anchorX = if (resizeWidth) startPopupX else popupX,
-                            anchorY = if (resizeHeight && anchorBottom) {
-                                startPopupY + startHeight - height
-                            } else if (resizeHeight) startPopupY else popupY,
-                        )
-                        true
-                    }
-                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                        view.performClick()
-                        true
-                    }
-                    else -> false
+        init {
+            background = ColorDrawable(Color.TRANSPARENT)
+            elevation = 0f
+            translationZ = 0f
+            stateListAnimator = null
+            outlineProvider = null
+            setDefaultFocusHighlightEnabled(false)
+            minimumWidth = dp(44)
+            minimumHeight = dp(56)
+            isFocusable = true
+            isClickable = true
+            contentDescription = tr(description)
+            tooltipText = contentDescription
+            setOnClickListener { action() }
+            addView(face, FrameLayout.LayoutParams(dp(26), dp(44), Gravity.LEFT or Gravity.CENTER_VERTICAL))
+            accessibilityDelegate = object : View.AccessibilityDelegate() {
+                override fun onInitializeAccessibilityNodeInfo(host: View, info: AccessibilityNodeInfo) {
+                    super.onInitializeAccessibilityNodeInfo(host, info)
+                    info.className = Button::class.java.name
+                }
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                addOnLayoutChangeListener { view, _, _, _, _, _, _, _, _ ->
+                    view.systemGestureExclusionRects = listOf(Rect(0, 0, view.width, view.height))
                 }
             }
         }
-        widthResizeHandle.setOnTouchListener(resizeHandler(resizeWidth = true, resizeHeight = false))
-        resizeFooter.setOnTouchListener(resizeHandler(resizeWidth = false, resizeHeight = true))
-        resizeHeader.setOnTouchListener(resizeHandler(resizeWidth = false, resizeHeight = true, anchorBottom = true))
 
+        fun alignToEdge(right: Boolean) {
+            val params = face.layoutParams as FrameLayout.LayoutParams
+            val gravity = (if (right) Gravity.RIGHT else Gravity.LEFT) or Gravity.CENTER_VERTICAL
+            if (params.gravity != gravity) { params.gravity = gravity; face.layoutParams = params }
+        }
+
+        fun setHandleIcon(icon: String) { glyph.setPixelAwareImageResource(iconResource(icon)) }
+
+        fun reposition() { repositionAction?.invoke() }
+
+        fun enableDragging(
+            preferencePrefix: String,
+            defaultFraction: Float = .5f,
+            bounds: () -> Rect,
+            onEdgeChanged: (Boolean) -> Unit = {},
+        ) {
+            var onRight = prefs.getBoolean("${preferencePrefix}_right", false)
+            var fraction = prefs.getFloat("${preferencePrefix}_fraction", defaultFraction)
+                .takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: defaultFraction
+            var appliedSide: Boolean? = null
+            var dragging = false
+            var cancelled = false
+            var downX = 0f
+            var downY = 0f
+            var startLeft = 0
+            var startTop = 0
+            val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
+
+            fun limits(): Rect {
+                val area = bounds()
+                val container = parent as View
+                val params = layoutParams as FrameLayout.LayoutParams
+                val maxX = (container.width - params.width).coerceAtLeast(0)
+                val maxY = (container.height - params.height).coerceAtLeast(0)
+                val left = area.left.coerceIn(0, maxX)
+                val top = area.top.coerceIn(0, maxY)
+                return Rect(left, top, (area.right - params.width).coerceIn(left, maxX),
+                    (area.bottom - params.height).coerceIn(top, maxY))
+            }
+
+            fun position() {
+                val container = parent as? View ?: return
+                if (container.width == 0 || container.height == 0 || dragging) return
+                val area = limits()
+                val params = layoutParams as FrameLayout.LayoutParams
+                val left = if (onRight) area.right else area.left
+                val top = area.top + ((area.bottom - area.top) * fraction).roundToInt()
+                if (params.leftMargin != left || params.topMargin != top) {
+                    params.leftMargin = left
+                    params.topMargin = top
+                    layoutParams = params
+                }
+                alignToEdge(onRight)
+                if (appliedSide != onRight) { appliedSide = onRight; onEdgeChanged(onRight) }
+            }
+
+            fun cancelNativePress(event: MotionEvent) {
+                val cancel = MotionEvent.obtain(event)
+                cancel.action = MotionEvent.ACTION_CANCEL
+                onTouchEvent(cancel)
+                cancel.recycle()
+            }
+
+            repositionAction = ::position
+            setOnTouchListener { view, event ->
+                when (event.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> {
+                        val params = view.layoutParams as FrameLayout.LayoutParams
+                        downX = event.rawX
+                        downY = event.rawY
+                        startLeft = params.leftMargin
+                        startTop = params.topMargin
+                        dragging = false
+                        cancelled = false
+                        isHandlingDragGesture = true
+                        view.parent?.requestDisallowInterceptTouchEvent(true)
+                        false // Native handling preserves both tap and long-press behavior.
+                    }
+                    MotionEvent.ACTION_MOVE -> {
+                        val dx = event.rawX - downX
+                        val dy = event.rawY - downY
+                        if (!cancelled && !dragging && (abs(dx) > touchSlop || abs(dy) > touchSlop)) {
+                            dragging = true
+                            cancelNativePress(event)
+                        }
+                        if (dragging && !cancelled) {
+                            val area = limits()
+                            val params = view.layoutParams as FrameLayout.LayoutParams
+                            params.leftMargin = (startLeft + dx).roundToInt().coerceIn(area.left, area.right)
+                            params.topMargin = (startTop + dy).roundToInt().coerceIn(area.top, area.bottom)
+                            view.layoutParams = params
+                        }
+                        dragging || cancelled
+                    }
+                    MotionEvent.ACTION_POINTER_DOWN -> {
+                        cancelled = true
+                        dragging = false
+                        cancelNativePress(event)
+                        position()
+                        true
+                    }
+                    MotionEvent.ACTION_UP -> {
+                        val consumed = dragging || cancelled
+                        if (dragging && !cancelled) {
+                            val area = limits()
+                            val params = view.layoutParams as FrameLayout.LayoutParams
+                            onRight = params.leftMargin > (area.left + area.right) / 2f
+                            fraction = if (area.bottom > area.top) ((params.topMargin - area.top).toFloat() / (area.bottom - area.top)).coerceIn(0f, 1f) else defaultFraction
+                            prefs.edit().putBoolean("${preferencePrefix}_right", onRight).putFloat("${preferencePrefix}_fraction", fraction).apply()
+                        }
+                        dragging = false
+                        isHandlingDragGesture = false
+                        position()
+                        view.parent?.requestDisallowInterceptTouchEvent(false)
+                        consumed
+                    }
+                    MotionEvent.ACTION_CANCEL -> {
+                        dragging = false
+                        cancelled = true
+                        isHandlingDragGesture = false
+                        position()
+                        view.parent?.requestDisallowInterceptTouchEvent(false)
+                        false
+                    }
+                    else -> cancelled
+                }
+            }
+            position()
+        }
+    }
+
+    private fun updateBrowserDock() {
+        if (!::root.isInitialized || !::composerDock.isInitialized) return
+        if (browserPages.active == null || browserScreen != null) {
+            removeBrowserDock()
+            return
+        }
+        val chip = browserDock ?: BrowserEdgeHandle("chevron_right", "恢复网页") { showWebPreview() }.apply {
+            setOnLongClickListener { showBrowserPages(); true }
+            browserDock = this
+            root.addView(this, FrameLayout.LayoutParams(dp(44), dp(56), Gravity.TOP or Gravity.LEFT))
+            enableDragging("browser_chat_handle", defaultFraction = 1f, bounds = { browserDockBounds() }) { right ->
+                setHandleIcon(if (right) "back" else "chevron_right")
+            }
+            val listener = View.OnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> positionBrowserDock() }
+            browserDockLayoutListener = listener
+            root.addOnLayoutChangeListener(listener)
+            composerDock.addOnLayoutChangeListener(listener)
+        }
+        val page = browserPages.active ?: return
+        chip.contentDescription = "${tr("恢复网页")} · ${browserPages.items.size} · ${page.title.ifBlank { page.address }} · ${tr("拖动调整位置，松手贴边")}"
+        chip.tooltipText = "${tr("恢复网页")} · ${tr("拖动调整位置，松手贴边")}"
+        positionBrowserDock()
+    }
+
+    private fun positionBrowserDock() {
+        browserDock?.reposition()
+    }
+
+    private fun browserDockBounds(): Rect {
+        val rootLocation = IntArray(2)
+        val composerLocation = IntArray(2)
+        root.getLocationOnScreen(rootLocation)
+        composerDock.getLocationOnScreen(composerLocation)
+        val bottom = min(root.height - systemInsetBottom - dp(8), composerLocation[1] - rootLocation[1] - dp(8))
+        return Rect(systemInsetLeft, systemInsetTop + dp(8), root.width - systemInsetRight, bottom)
+    }
+
+    private fun minimizeWebPreview() {
+        browserScreenCleanup?.invoke()
+        updateBrowserDock()
+    }
+
+    private fun openWebPreview(rawUrl: String) {
+        val url = BrowserNavigation.webUrl(normalizeWebUrl(rawUrl) ?: "") ?: return openExternalChatLink(rawUrl)
+        val existing = browserPages.items.firstOrNull { it.address == url }
+        if (existing != null) browserPages.select(existing) else if (newBrowserPage(url) == null) return
+        showWebPreview()
+    }
+
+    private fun browserControlBackground(fill: Int = Color.TRANSPARENT, radius: Int = 12): Drawable {
+        val states = android.graphics.drawable.StateListDrawable().apply {
+            addState(intArrayOf(-android.R.attr.state_enabled), rounded(fill, dp(radius)))
+            addState(intArrayOf(android.R.attr.state_pressed), rounded(blendColors(OPAQUE_PANEL, ACCENT, .18f), dp(radius)))
+            addState(intArrayOf(android.R.attr.state_focused), rounded(blendColors(OPAQUE_PANEL, ACCENT, .12f), dp(radius), ACCENT, dp(1)))
+            addState(intArrayOf(android.R.attr.state_selected), rounded(blendColors(OPAQUE_PANEL, ACCENT, .12f), dp(radius)))
+            addState(intArrayOf(), rounded(fill, dp(radius)))
+        }
+        return if (pixelTheme) states else android.graphics.drawable.RippleDrawable(
+            ColorStateList.valueOf(colorWithAlpha(ACCENT, .16f)), states, rounded(Color.WHITE, dp(radius)),
+        )
+    }
+
+    private fun browserFieldBackground(): Drawable = android.graphics.drawable.StateListDrawable().apply {
+        addState(intArrayOf(android.R.attr.state_focused), rounded(blendColors(OPAQUE_PANEL, ACCENT, .04f), dp(12), ACCENT, dp(1)))
+        addState(intArrayOf(), rounded(blendColors(OPAQUE_PANEL, TEXT, .04f), dp(12), BORDER, dp(1)))
+    }
+
+    private fun browserIconView(icon: String, tint: Int = SUBTLE): ImageView = ImageView(this).apply {
+        val resource = when {
+            !retroTheme && icon == "history" -> R.drawable.ic_browser_history
+            !retroTheme && icon == "share" -> R.drawable.ic_browser_share
+            !retroTheme && icon == "alert" -> R.drawable.ic_alert
+            else -> iconResource(if (icon == "share") "open" else icon)
+        }
+        setPixelAwareImageResource(resource)
+        imageTintList = if (retroTheme && resource !in setOf(R.drawable.ic_browser_bookmark, R.drawable.ic_browser_bookmark_filled)) null
+            else ColorStateList.valueOf(tint)
+        scaleType = ImageView.ScaleType.FIT_CENTER
+        importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+    }
+
+    private fun browserIconButton(icon: String, description: String, action: () -> Unit): ImageButton =
+        iconButton(icon, description, action).apply {
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+            background = browserControlBackground()
+            minimumWidth = dp(44)
+            minimumHeight = dp(44)
+            tooltipText = tr(description)
+        }
+
+    private fun browserAddressLabel(address: String): String =
+        if (address == "about:blank" || address.isBlank()) tr("输入网址或搜索")
+        else address.removePrefix("https://").removePrefix("http://")
+
+    private fun showWebPreview() {
+        if (browserPages.active == null) return
+        if (browserScreen != null) {
+            webPreviewRefresh?.invoke()
+            return
+        }
+        if (!::root.isInitialized || root.width <= 0) {
+            return
+        }
+
+        dismissComposerPreferences()
+        val focused = window.currentFocus
+        if (focused is EditText) {
+            (getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager)
+                ?.hideSoftInputFromWindow(focused.windowToken, 0)
+        }
+        parkActivityInputFocus()
+
+        val panel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = ColorDrawable(OPAQUE_PANEL)
+            isFocusableInTouchMode = true
+        }
+        val toolbar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            minimumHeight = dp(52)
+        }
+        val addressTitle = label("", 13, TEXT, true, translateUi = false).apply {
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            includeFontPadding = false
+        }
+        val addressView = label("", 11, SUBTLE, translateUi = false).apply {
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.MIDDLE
+            includeFontPadding = false
+        }
+        val addressDisplay = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(10), dp(6), dp(10), dp(6))
+            minimumHeight = dp(52)
+            background = browserControlBackground(blendColors(OPAQUE_PANEL, TEXT, .045f), 16)
+            isClickable = true
+            isFocusable = true
+            contentDescription = tr("输入网址或搜索")
+            addView(browserIconView("globe", MUTED), LinearLayout.LayoutParams(dp(20), dp(20)).apply { marginEnd = dp(9) })
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+                addView(addressTitle, LinearLayout.LayoutParams(MATCH, WRAP))
+                addView(addressView, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(3) })
+            }, LinearLayout.LayoutParams(0, WRAP, 1f))
+        }
+        val addressInput = EditText(this).apply {
+            setTextColor(TEXT)
+            setHintTextColor(MUTED)
+            textSize = adjustedTextSize(14)
+            setTag(R.id.base_text_size, 14f)
+            typeface = themedTypeface(false)
+            gravity = Gravity.CENTER_VERTICAL
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+            imeOptions = EditorInfo.IME_ACTION_GO or EditorInfo.IME_FLAG_NO_EXTRACT_UI
+            setSingleLine(true)
+            setSelectAllOnFocus(true)
+            hint = tr("输入网址或搜索")
+            contentDescription = tr("输入网址或搜索")
+            background = rounded(blendColors(OPAQUE_PANEL, ACCENT, .06f), dp(16), ACCENT, dp(1))
+            setPadding(dp(12), dp(6), dp(12), dp(6))
+            visibility = View.GONE
+        }
+        val addressArea = FrameLayout(this).apply {
+            minimumHeight = dp(52)
+            addView(addressDisplay, FrameLayout.LayoutParams(MATCH, WRAP))
+            addView(addressInput, FrameLayout.LayoutParams(MATCH, MATCH))
+        }
+        var editingPage: BrowserPage? = null
+        val progress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 100
+            progress = 0
+            progressTintList = ColorStateList.valueOf(ACCENT)
+            progressBackgroundTintList = ColorStateList.valueOf(Color.TRANSPARENT)
+            visibility = View.INVISIBLE
+        }
+        val backButton = browserIconButton("back", "网页后退") { webPreviewView?.let { if (it.canGoBack()) it.goBack() } }
+        val forwardButton = browserIconButton("chevron_right", "网页前进") { webPreviewView?.let { if (it.canGoForward()) it.goForward() } }
+        val refreshButton = browserIconButton("refresh", "刷新网页") {
+            browserPages.active?.let { page ->
+                if (page.loading) {
+                    page.view.stopLoading()
+                    page.loading = false
+                    page.progress = 100
+                    webPreviewRefresh?.invoke()
+                } else {
+                    val retryFailedAddress = page.error != null
+                    page.error = null
+                    if (retryFailedAddress) page.view.loadUrl(page.address) else page.view.reload()
+                }
+            }
+        }
+        val downloadButton = browserIconButton("download", "查看下载") { showWebDownloadsDialog() }
+        val bookmarkButton = browserIconButton("bookmark", "收藏网页") {
+            browserPages.active?.let(::toggleBrowserBookmark)
+        }
+        val moreButton = browserIconButton("more", "网页工具") { showBrowserTools() }
+        val tabsCount = label("1", 11, TEXT, true, translateUi = false).apply {
+            gravity = Gravity.CENTER
+            includeFontPadding = false
+            background = rounded(blendColors(OPAQUE_PANEL, TEXT, .02f), dp(5), SUBTLE, dp(2))
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+        }
+        val tabsButton = FrameLayout(this).apply {
+            background = browserControlBackground()
+            isFocusable = true
+            contentDescription = tr("切换网页")
+            tooltipText = tr("切换网页")
+            setOnClickListener { showBrowserPages() }
+            addView(tabsCount, FrameLayout.LayoutParams(dp(23), dp(25), Gravity.CENTER))
+        }
+        val minimizeButton = browserIconButton("chevron_down", "收起网页") { minimizeWebPreview() }
+        val closeButton = browserIconButton("close", "关闭当前网页") { browserPages.active?.let(::closeBrowserPage) }
+        val cancelAddressButton = browserIconButton("close", "取消编辑网址") {}.apply { visibility = View.GONE }
+        val goAddressButton = browserIconButton("chevron_right", "前往") {}.apply {
+            visibility = View.GONE
+            imageTintList = ColorStateList.valueOf(ACCENT)
+        }
+        toolbar.addView(addressArea, LinearLayout.LayoutParams(0, WRAP, 1f).apply { marginEnd = dp(4) })
+        toolbar.addView(minimizeButton, LinearLayout.LayoutParams(dp(44), dp(44)))
+        toolbar.addView(closeButton, LinearLayout.LayoutParams(dp(44), dp(44)))
+        toolbar.addView(cancelAddressButton, LinearLayout.LayoutParams(dp(44), dp(44)))
+        toolbar.addView(goAddressButton, LinearLayout.LayoutParams(dp(44), dp(44)))
+        val navigation = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val navigationButtons = listOf(backButton, forwardButton, refreshButton, bookmarkButton, tabsButton, downloadButton, moreButton)
+        navigation.minimumWidth = dp(44 * navigationButtons.size)
+        navigationButtons.forEach { button ->
+            button.minimumWidth = dp(44)
+            navigation.addView(button, LinearLayout.LayoutParams(0, dp(48), 1f))
+        }
+        val navigationScroll = HorizontalScrollView(this).apply {
+            isFillViewport = true
+            isHorizontalScrollBarEnabled = false
+            addView(navigation, FrameLayout.LayoutParams(WRAP, MATCH))
+        }
+        val browserControls = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = ColorDrawable(OPAQUE_PANEL)
+            addView(View(this@MainActivity).apply { setBackgroundColor(blendColors(OPAQUE_PANEL, TEXT, .1f)) }, LinearLayout.LayoutParams(MATCH, dp(1)))
+            addView(progress, LinearLayout.LayoutParams(MATCH, dp(2)))
+            addView(toolbar, LinearLayout.LayoutParams(MATCH, WRAP).apply {
+                setMargins(dp(10), dp(5), dp(6), dp(2))
+            })
+            addView(navigationScroll, LinearLayout.LayoutParams(MATCH, dp(48)).apply {
+                setMargins(dp(6), 0, dp(6), dp(4))
+            })
+        }
+        val controlsToggle = BrowserEdgeHandle("chevron_down", "收起浏览器工具栏") {}
+        fun finishAddressEditing() {
+            if (editingPage == null) return
+            editingPage = null
+            (getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager)
+                ?.hideSoftInputFromWindow(addressInput.windowToken, 0)
+            addressInput.error = null
+            addressInput.clearFocus()
+            addressInput.visibility = View.GONE
+            addressDisplay.visibility = View.VISIBLE
+            minimizeButton.visibility = View.VISIBLE
+            closeButton.visibility = View.VISIBLE
+            cancelAddressButton.visibility = View.GONE
+            goAddressButton.visibility = View.GONE
+            addressView.text = browserAddressLabel(browserPages.active?.address.orEmpty())
+            panel.requestFocus()
+        }
+        fun setControlsCollapsed(collapsed: Boolean) {
+            if (collapsed) finishAddressEditing()
+            browserControlsCollapsed = collapsed
+            browserControls.visibility = if (collapsed) View.GONE else View.VISIBLE
+            controlsToggle.setHandleIcon(if (collapsed) "chevron_up" else "chevron_down")
+            val description = tr(if (collapsed) "展开浏览器工具栏" else "收起浏览器工具栏")
+            controlsToggle.contentDescription = "$description · ${tr("可拖动到两侧，避开网页按钮")}"
+            controlsToggle.tooltipText = controlsToggle.contentDescription
+        }
+        controlsToggle.setOnClickListener { setControlsCollapsed(!browserControlsCollapsed) }
+        setControlsCollapsed(browserControlsCollapsed)
+        browserScreenBack = {
+            when {
+                editingPage != null -> finishAddressEditing()
+                webPreviewView?.canGoBack() == true -> webPreviewView?.goBack()
+                browserControlsCollapsed -> setControlsCollapsed(false)
+                else -> showToast("已经是第一个网页")
+            }
+        }
+        fun submitAddress() {
+            val page = editingPage ?: return
+            if (page.disposed || browserPages.active !== page) {
+                finishAddressEditing()
+                return
+            }
+            val target = BrowserNavigation.resolve(addressInput.text.toString(), browserSearchEngine())
+            if (target == null) {
+                addressInput.error = tr("请输入搜索词或有效的 HTTP(S) 网址")
+                return
+            }
+            finishAddressEditing()
+            page.address = target
+            page.error = null
+            page.view.loadUrl(target)
+            webPreviewRefresh?.invoke()
+        }
+        addressDisplay.setOnClickListener {
+            val page = browserPages.active ?: return@setOnClickListener
+            editingPage = page
+            addressInput.setText(page.address.takeUnless { it == "about:blank" }.orEmpty())
+            addressDisplay.visibility = View.GONE
+            addressInput.visibility = View.VISIBLE
+            minimizeButton.visibility = View.GONE
+            closeButton.visibility = View.GONE
+            cancelAddressButton.visibility = View.VISIBLE
+            goAddressButton.visibility = View.VISIBLE
+            addressInput.requestFocus()
+            addressInput.selectAll()
+            addressInput.post {
+                if (editingPage === page && addressInput.hasFocus() && browserScreen != null) {
+                    (getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager)
+                        ?.showSoftInput(addressInput, InputMethodManager.SHOW_IMPLICIT)
+                }
+            }
+        }
+        cancelAddressButton.setOnClickListener { finishAddressEditing() }
+        goAddressButton.setOnClickListener { submitAddress() }
+        addressInput.setOnEditorActionListener { _, action, event ->
+            if (action == EditorInfo.IME_ACTION_GO || event?.keyCode == KeyEvent.KEYCODE_ENTER) {
+                if (event == null || event.action == KeyEvent.ACTION_UP) submitAddress()
+                true
+            } else false
+        }
+        addressInput.setOnKeyListener { _, key, event ->
+            if (key == KeyEvent.KEYCODE_ESCAPE) {
+                if (event.action == KeyEvent.ACTION_UP) finishAddressEditing()
+                true
+            } else false
+        }
+        val webContent = FrameLayout(this)
+        val pageContent = FrameLayout(this).apply {
+            addView(webContent, FrameLayout.LayoutParams(MATCH, MATCH))
+            addView(controlsToggle, FrameLayout.LayoutParams(dp(44), dp(56), Gravity.TOP or Gravity.LEFT))
+        }
+        controlsToggle.enableDragging("browser_handle", bounds = { Rect(0, 0, pageContent.width, pageContent.height) })
+        pageContent.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> controlsToggle.reposition() }
+        val failureContent = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(dp(28), dp(16), dp(28), dp(16))
+            background = ColorDrawable(OPAQUE_PANEL)
+        }
+        failureContent.addView(FrameLayout(this).apply {
+            background = rounded(blendColors(OPAQUE_PANEL, ACCENT, .09f), dp(20))
+            addView(browserIconView("globe", ACCENT), FrameLayout.LayoutParams(dp(28), dp(28), Gravity.CENTER))
+        }, LinearLayout.LayoutParams(dp(64), dp(64)).apply { bottomMargin = dp(18) })
+        failureContent.addView(label("暂时无法打开网页", 17, TEXT, true).apply { gravity = Gravity.CENTER }, LinearLayout.LayoutParams(MATCH, WRAP))
+        val failureText = label("", 13, SUBTLE).apply { gravity = Gravity.CENTER; maxLines = 4 }
+        failureContent.addView(failureText, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(8) })
+        failureContent.addView(label("重新加载", 13, ACCENT, true).apply {
+            gravity = Gravity.CENTER
+            setPadding(dp(24), 0, dp(24), 0)
+            background = browserControlBackground(blendColors(OPAQUE_PANEL, ACCENT, .12f))
+            isFocusable = true
+            setOnClickListener {
+                browserPages.active?.let { it.error = null; it.view.loadUrl(it.address) }
+            }
+        }, LinearLayout.LayoutParams(WRAP, dp(44)).apply { topMargin = dp(20) })
+        val failurePanel = ScrollView(this).apply {
+            isFillViewport = true
+            isVerticalScrollBarEnabled = false
+            background = ColorDrawable(OPAQUE_PANEL)
+            visibility = View.GONE
+            addView(failureContent, FrameLayout.LayoutParams(MATCH, WRAP))
+        }
+
+        panel.addView(pageContent, LinearLayout.LayoutParams(MATCH, 0, 1f))
+        panel.addView(browserControls, LinearLayout.LayoutParams(MATCH, WRAP))
+
+        val screenRoot = root
+        val screen = FrameLayout(this).apply {
+            setBackgroundColor(OPAQUE_PANEL)
+            elevation = dp(24).toFloat()
+            isClickable = true
+            isFocusableInTouchMode = true
+            addView(panel, FrameLayout.LayoutParams(MATCH, MATCH))
+        }
+        browserScreen = screen
+        val platformBackCallback = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            android.window.OnBackInvokedCallback { browserScreenBack?.invoke() }
+        } else null
+
+        val refresh: () -> Unit = refresh@{
+            val page = browserPages.active ?: return@refresh
+            if (editingPage != null && editingPage !== page) finishAddressEditing()
+            val webView = page.view
+            if (webPreviewView !== webView) {
+                webPreviewView?.apply { clearMatches(); onPause() }
+                webContent.removeAllViews()
+                (webView.parent as? ViewGroup)?.removeView(webView)
+                webContent.addView(webView, FrameLayout.LayoutParams(MATCH, MATCH))
+                webContent.addView(failurePanel, FrameLayout.LayoutParams(MATCH, MATCH))
+                webPreviewView = webView
+                if (foreground) webView.onResume() else webView.onPause()
+            }
+            addressTitle.text = page.title.takeIf { it.isNotBlank() && it != "about:blank" } ?: tr("网页浏览")
+            addressView.text = browserAddressLabel(page.address)
+            addressDisplay.contentDescription = "${tr("输入网址或搜索")} · ${addressTitle.text} · ${page.address}"
+            val bookmarked = browserLibrary.isBookmarked(page.address)
+            bookmarkButton.setPixelAwareImageResource(iconResource(if (bookmarked) "bookmark_filled" else "bookmark"))
+            bookmarkButton.imageTintList = ColorStateList.valueOf(if (bookmarked) ACCENT else SUBTLE)
+            bookmarkButton.isSelected = bookmarked
+            bookmarkButton.contentDescription = tr(if (bookmarked) "取消收藏网页" else "收藏网页")
+            bookmarkButton.tooltipText = bookmarkButton.contentDescription
+            bookmarkButton.isEnabled = BrowserNavigation.webUrl(page.address) != null
+            bookmarkButton.alpha = if (bookmarkButton.isEnabled) 1f else .45f
+            tabsCount.text = browserPages.items.size.toString()
+            tabsButton.contentDescription = "${tr("切换网页")} · ${browserPages.items.size}"
+            backButton.isEnabled = webView.canGoBack()
+            backButton.alpha = if (backButton.isEnabled) 1f else .45f
+            forwardButton.isEnabled = webView.canGoForward()
+            forwardButton.alpha = if (forwardButton.isEnabled) 1f else .45f
+            refreshButton.setPixelAwareImageResource(iconResource(if (page.loading) "stop" else "refresh"))
+            refreshButton.contentDescription = tr(if (page.loading) "停止加载" else "刷新网页")
+            refreshButton.tooltipText = refreshButton.contentDescription
+            progress.progress = page.progress
+            progress.visibility = if (page.loading) View.VISIBLE else View.INVISIBLE
+            failurePanel.visibility = if (page.error == null) View.GONE else View.VISIBLE
+            failureText.text = page.error.orEmpty()
+        }
+        webPreviewRefresh = refresh
+
+        removeBrowserDock()
+        val underlays = (0 until screenRoot.childCount).map { index ->
+            val child = screenRoot.getChildAt(index)
+            Triple(child, child.visibility, child.importantForAccessibility)
+        }
+        underlays.forEach { (view, visibility, _) ->
+            if (visibility == View.VISIBLE) view.visibility = View.INVISIBLE
+            view.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+        }
         var cleanedUp = false
-        val rootLayoutListener = View.OnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> applySavedFrame() }
-        root.addOnLayoutChangeListener(rootLayoutListener)
         val cleanup = {
             if (!cleanedUp) {
                 cleanedUp = true
-                root.removeOnLayoutChangeListener(rootLayoutListener)
-                webView.stopLoading()
-                webView.loadUrl("about:blank")
-                webView.removeAllViews()
-                webView.destroy()
-                if (webPreviewView === webView) webPreviewView = null
-                if (webPreviewPopup === popup) webPreviewPopup = null
-                webPreviewRelayout = null
-                webPreviewCleanup = null
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && platformBackCallback != null) {
+                    onBackInvokedDispatcher.unregisterOnBackInvokedCallback(platformBackCallback)
+                }
+                (getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager)
+                    ?.hideSoftInputFromWindow(screen.windowToken, 0)
+                finishAddressEditing()
+                webPreviewView?.apply {
+                    (parent as? ViewGroup)?.removeView(this)
+                    clearMatches()
+                    onPause()
+                }
+                (screen.parent as? ViewGroup)?.removeView(screen)
+                underlays.forEach { (view, visibility, accessibility) ->
+                    if (view.parent === screenRoot) {
+                        if (visibility == View.VISIBLE && view.visibility == View.INVISIBLE) view.visibility = View.VISIBLE
+                        view.importantForAccessibility = accessibility
+                    }
+                }
+                if (browserScreen === screen) {
+                    webPreviewView = null
+                    browserScreen = null
+                    browserScreenBack = null
+                    browserScreenCleanup = null
+                    webPreviewRefresh = null
+                }
+                screenRoot.requestFocus()
+                screenRoot.requestApplyInsets()
             }
         }
-        webPreviewCleanup = cleanup
-        popup.setOnDismissListener { cleanup() }
+        browserScreenCleanup = cleanup
+        screenRoot.addView(screen, FrameLayout.LayoutParams(MATCH, MATCH))
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && platformBackCallback != null) {
+            onBackInvokedDispatcher.registerOnBackInvokedCallback(android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT, platformBackCallback)
+        }
+        applyBrowserScreenInsets()
+        screen.requestApplyInsets()
+        panel.requestFocus()
+        refresh()
+    }
 
-        popup.showAtLocation(root, Gravity.TOP or Gravity.START, initialFrame.x, initialFrame.y)
-        backButton.isEnabled = false
-        backButton.alpha = .45f
-        forwardButton.isEnabled = false
-        forwardButton.alpha = .45f
-        webView.loadUrl(url)
+    private fun showBrowserDialog(title: String, populate: (LinearLayout, Dialog) -> Unit): Dialog {
+        val dialog = Dialog(this)
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(12), dp(16), dp(16))
+            background = rounded(OPAQUE_PANEL, dp(24), BORDER, dp(1))
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                minimumHeight = dp(52)
+                addView(label(title, 18, TEXT, true).apply {
+                    maxLines = 2
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) isAccessibilityHeading = true
+                }, LinearLayout.LayoutParams(0, WRAP, 1f))
+                addView(browserIconButton("close", "关闭") { dialog.dismiss() }, LinearLayout.LayoutParams(dp(44), dp(44)))
+            }, LinearLayout.LayoutParams(MATCH, WRAP).apply { bottomMargin = dp(8) })
+        }
+        val body = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val scroll = object : ScrollView(this) {
+            override fun onMeasure(widthSpec: Int, heightSpec: Int) {
+                val viewportHeight = root.height.takeIf { it > 0 } ?: resources.displayMetrics.heightPixels
+                val maxHeight = (viewportHeight * .62f).roundToInt()
+                val available = if (View.MeasureSpec.getMode(heightSpec) == View.MeasureSpec.UNSPECIFIED) maxHeight
+                    else min(maxHeight, View.MeasureSpec.getSize(heightSpec))
+                super.onMeasure(widthSpec, View.MeasureSpec.makeMeasureSpec(available, View.MeasureSpec.AT_MOST))
+            }
+        }.apply {
+            isVerticalScrollBarEnabled = false
+            clipToPadding = false
+            addView(body)
+        }
+        card.addView(scroll, LinearLayout.LayoutParams(MATCH, WRAP))
+        populate(body, dialog)
+        dialog.setContentView(card)
+        dialog.setCanceledOnTouchOutside(true)
+        dialog.show()
+        dialog.window?.apply {
+            setBackgroundDrawableResource(android.R.color.transparent)
+            setLayout(min(dp(520), resources.displayMetrics.widthPixels - systemInsetLeft - systemInsetRight - dp(16)), WRAP)
+            setGravity(Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL)
+            attributes = attributes.apply { y = dp(8); dimAmount = .38f }
+            addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+            setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+        }
+        return dialog
+    }
+
+    private fun browserActionRow(
+        icon: String,
+        title: String,
+        color: Int = TEXT,
+        selected: Boolean = false,
+        trailing: String? = "chevron_right",
+        onClick: () -> Unit,
+    ): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.HORIZONTAL
+        gravity = Gravity.CENTER_VERTICAL
+        minimumHeight = dp(52)
+        setPadding(dp(10), dp(8), dp(10), dp(8))
+        background = browserControlBackground()
+        isFocusable = true
+        isSelected = selected
+        contentDescription = tr(title)
+        setOnClickListener { onClick() }
+        addView(FrameLayout(this@MainActivity).apply {
+            background = rounded(blendColors(OPAQUE_PANEL, color, .065f), dp(10))
+            addView(browserIconView(icon, if (selected) ACCENT else color), FrameLayout.LayoutParams(dp(18), dp(18), Gravity.CENTER))
+        }, LinearLayout.LayoutParams(dp(32), dp(32)).apply { marginEnd = dp(12) })
+        addView(label(title, 14, if (selected) ACCENT else color, selected).apply {
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+        }, LinearLayout.LayoutParams(0, WRAP, 1f))
+        trailing?.let {
+            addView(browserIconView(it, if (selected) ACCENT else MUTED), LinearLayout.LayoutParams(dp(18), dp(18)).apply { marginStart = dp(8) })
+        }
+    }
+
+    private fun browserEmptyState(bookmarks: Boolean): View = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        gravity = Gravity.CENTER
+        setPadding(dp(16), dp(24), dp(16), dp(28))
+        addView(FrameLayout(this@MainActivity).apply {
+            background = rounded(blendColors(OPAQUE_PANEL, ACCENT, .08f), dp(18))
+            addView(browserIconView(if (bookmarks) "bookmark" else "history", ACCENT), FrameLayout.LayoutParams(dp(26), dp(26), Gravity.CENTER))
+        }, LinearLayout.LayoutParams(dp(56), dp(56)))
+        addView(label(if (bookmarks) "还没有收藏网页" else "还没有浏览记录", 15, TEXT, true).apply {
+            gravity = Gravity.CENTER
+        }, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(16) })
+        addView(label(if (bookmarks) "点底部的星标，常用网页就在这里" else "打开过的网页会显示在这里", 13, SUBTLE).apply {
+            gravity = Gravity.CENTER
+        }, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(6) })
+    }
+
+    private fun browserEntryRow(title: String, url: String, active: Boolean = false, onOpen: () -> Unit): LinearLayout =
+        LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = rounded(blendColors(OPAQUE_PANEL, if (active) ACCENT else TEXT, if (active) .09f else .035f), dp(14),
+                if (active) colorWithAlpha(ACCENT, .4f) else colorWithAlpha(BORDER, .65f), dp(1))
+            val text = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                minimumHeight = dp(68)
+                setPadding(dp(12), dp(10), dp(8), dp(10))
+                background = browserControlBackground()
+                isClickable = true
+                isFocusable = true
+                isSelected = active
+                contentDescription = "${title.ifBlank { url }} $url"
+                setOnClickListener { onOpen() }
+                addView(FrameLayout(this@MainActivity).apply {
+                    background = rounded(blendColors(OPAQUE_PANEL, if (active) ACCENT else TEXT, .07f), dp(11))
+                    addView(browserIconView(if (active) "check" else "globe", if (active) ACCENT else MUTED),
+                        FrameLayout.LayoutParams(dp(19), dp(19), Gravity.CENTER))
+                }, LinearLayout.LayoutParams(dp(36), dp(36)).apply { marginEnd = dp(10) })
+                addView(LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.VERTICAL
+                    importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+                    addView(label(title.takeIf { it.isNotBlank() && it != "about:blank" } ?: browserAddressLabel(url), 14, TEXT, active, translateUi = false).apply {
+                        maxLines = 1
+                        ellipsize = android.text.TextUtils.TruncateAt.END
+                        includeFontPadding = false
+                    }, LinearLayout.LayoutParams(MATCH, WRAP))
+                    addView(label(browserAddressLabel(url), 11, SUBTLE, translateUi = false).apply {
+                        maxLines = 1
+                        ellipsize = android.text.TextUtils.TruncateAt.MIDDLE
+                        includeFontPadding = false
+                    }, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(5) })
+                }, LinearLayout.LayoutParams(0, WRAP, 1f))
+            }
+            addView(text, LinearLayout.LayoutParams(0, WRAP, 1f))
+        }
+
+    private fun showBrowserPages() {
+        showBrowserDialog("网页列表") { body, dialog ->
+            body.addView(browserActionRow("add", "新建网页", ACCENT) {
+                dialog.dismiss()
+                showWebAddressDialog("") { url -> if (newBrowserPage(url) != null) showWebPreview() }
+            }, LinearLayout.LayoutParams(MATCH, WRAP).apply { bottomMargin = dp(4) })
+            browserPages.items.toList().forEach { page ->
+                val row = browserEntryRow(page.title, page.address, page === browserPages.active) {
+                    dialog.dismiss()
+                    if (browserPages.select(page)) showWebPreview()
+                }
+                row.addView(browserIconButton("close", "关闭当前网页") {
+                    dialog.dismiss()
+                    closeBrowserPage(page)
+                    if (browserPages.items.isNotEmpty()) showBrowserPages()
+                }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { marginEnd = dp(4) })
+                body.addView(row, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(8) })
+            }
+            if (browserPages.items.isNotEmpty()) body.addView(browserActionRow("delete", "关闭全部网页", ERROR, trailing = null) {
+                dialog.dismiss()
+                showConfirmDialog("关闭全部网页", "关闭后将丢失网页中的未提交内容", "关闭全部网页", true) { closeWebPreview() }
+            }, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(12) })
+        }
+    }
+
+    private fun showBrowserLibrary(bookmarks: Boolean) {
+        val entries = if (bookmarks) browserLibrary.bookmarks else browserLibrary.history
+        showBrowserDialog(if (bookmarks) "收藏夹" else "浏览历史") { body, dialog ->
+            if (entries.isEmpty()) body.addView(browserEmptyState(bookmarks), LinearLayout.LayoutParams(MATCH, WRAP))
+            entries.toList().forEach { entry ->
+                val row = browserEntryRow(entry.title, entry.url) { dialog.dismiss(); openWebPreview(entry.url) }
+                row.addView(browserIconButton("delete", "删除记录") {
+                    entries.remove(entry)
+                    persistBrowserLibrary()
+                    webPreviewRefresh?.invoke()
+                    body.removeView(row)
+                    if (entries.isEmpty()) {
+                        body.removeAllViews()
+                        body.addView(browserEmptyState(bookmarks), LinearLayout.LayoutParams(MATCH, WRAP))
+                    }
+                }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { marginEnd = dp(4) })
+                body.addView(row, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(8) })
+            }
+            if (entries.isNotEmpty()) body.addView(browserActionRow("delete", if (bookmarks) "清空收藏夹" else "清空浏览历史", ERROR, trailing = null) {
+                dialog.dismiss()
+                showConfirmDialog(if (bookmarks) "清空收藏夹" else "清空浏览历史", "记录仅保存在这台设备上，清空后无法恢复", "清空", true) {
+                    entries.clear()
+                    persistBrowserLibrary()
+                    webPreviewRefresh?.invoke()
+                }
+            }, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(12) })
+        }
+    }
+
+    private fun showBrowserTools() {
+        val page = browserPages.active ?: return
+        val actions = listOf(
+            if (browserLibrary.isBookmarked(page.address)) "取消收藏网页" else "收藏网页",
+            "收藏夹", "浏览历史", "页内查找", "复制网址", "分享网页", "用浏览器打开", "搜索引擎",
+        )
+        val bookmarked = browserLibrary.isBookmarked(page.address)
+        val icons = listOf(if (bookmarked) "bookmark_filled" else "bookmark", "bookmark", "history", "search", "copy", "share", "open", "settings")
+        showBrowserDialog("网页工具") { body, dialog ->
+            actions.forEachIndexed { index, title ->
+                if (index == 3) body.addView(View(this).apply { setBackgroundColor(colorWithAlpha(BORDER, .6f)) },
+                    LinearLayout.LayoutParams(MATCH, dp(1)).apply { setMargins(dp(10), dp(8), dp(10), dp(8)) })
+                body.addView(browserActionRow(icons[index], title, if (index == 0 && bookmarked) ACCENT else TEXT) action@{
+                    dialog.dismiss()
+                    if (page.disposed) return@action
+                    when (index) {
+                        0 -> toggleBrowserBookmark(page)
+                        1 -> showBrowserLibrary(true)
+                        2 -> showBrowserLibrary(false)
+                        3 -> showBrowserFind(page)
+                        4 -> copyChatText("网页地址", page.address)
+                        5 -> runCatching {
+                            startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
+                                type = "text/plain"
+                                putExtra(Intent.EXTRA_TEXT, page.address)
+                                putExtra(Intent.EXTRA_SUBJECT, page.title)
+                            }, tr("分享网页")))
+                        }.onFailure { showToast("没有可用的应用打开此链接") }
+                        6 -> openExternalChatLink(page.address)
+                        7 -> showBrowserDialog("搜索引擎") { choices, engineDialog ->
+                            BrowserSearchEngine.entries.forEach { engine ->
+                                val selected = engine == browserSearchEngine()
+                                choices.addView(browserActionRow("search", engine.label, selected = selected, trailing = if (selected) "check" else null) {
+                                    prefs.edit().putString("browser_search_engine", engine.name).apply()
+                                    engineDialog.dismiss()
+                                }, LinearLayout.LayoutParams(MATCH, WRAP))
+                            }
+                        }
+                    }
+                }, LinearLayout.LayoutParams(MATCH, WRAP))
+            }
+        }
+    }
+
+    private fun showBrowserFind(page: BrowserPage) {
+        val input = editField("页内查找", "", InputType.TYPE_CLASS_TEXT).apply {
+            setSingleLine(true)
+            imeOptions = EditorInfo.IME_ACTION_SEARCH
+            background = browserFieldBackground()
+        }
+        val status = label("", 12, MUTED)
+        val dialog = showBrowserDialog("页内查找") { body, _ ->
+            body.addView(input, LinearLayout.LayoutParams(MATCH, dp(48)))
+            body.addView(status, LinearLayout.LayoutParams(MATCH, dp(32)))
+            val controls = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            controls.addView(browserActionRow("back", "上一个", trailing = null) { if (!page.disposed) page.view.findNext(false) }, LinearLayout.LayoutParams(0, WRAP, 1f))
+            controls.addView(browserActionRow("chevron_right", "下一个", trailing = null) { if (!page.disposed) page.view.findNext(true) }, LinearLayout.LayoutParams(0, WRAP, 1f))
+            body.addView(controls)
+        }
+        page.view.setFindListener { active, total, done ->
+            if (!page.disposed && dialog.isShowing && done) status.text = "${tr("匹配")} · ${if (total > 0) active + 1 else 0} / $total"
+        }
+        input.addTextChangedListener(object : android.text.TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
+                if (!page.disposed) page.view.findAllAsync(s.toString())
+            }
+            override fun afterTextChanged(s: android.text.Editable?) {}
+        })
+        input.setOnEditorActionListener { _, action, _ ->
+            if (action == EditorInfo.IME_ACTION_SEARCH && !page.disposed) { page.view.findNext(true); true } else false
+        }
+        dialog.setOnDismissListener {
+            if (!page.disposed) { page.view.setFindListener(null); page.view.clearMatches() }
+        }
+        input.requestFocus()
+        dialog.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE or WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
     }
 
     private fun routeWebPreviewNavigation(uri: Uri): Boolean {
@@ -6766,8 +7740,11 @@ class MainActivity : Activity() {
     }
 
     private fun closeWebPreview() {
-        val popup = webPreviewPopup
-        if (popup?.isShowing == true) popup.dismiss() else webPreviewCleanup?.invoke()
+        browserScreenCleanup?.invoke()
+        browserPages.clear().forEach(::disposeBrowserPage)
+        webPreviewView = null
+        browserControlsCollapsed = false
+        removeBrowserDock()
     }
 
     private val assistantMarkdown: Markwon
@@ -6828,10 +7805,67 @@ class MainActivity : Activity() {
     }
 
     private fun isEditingAssistantAnswer(): Boolean {
+        val harnessField = harnessQuestionFocusedField
+        val harnessKey = harnessQuestionFocusedKey
+        if (harnessField?.isAttachedToWindow == true && harnessField.hasFocus() && imeInsetVisible &&
+            harnessQuestionFocusedConnection == connectionGeneration && harnessKey != null && harnessKey.threadId == activeThreadId &&
+            harnessQuestions.request(harnessKey) != null && !harnessQuestions.isSubmitting(harnessKey)) return true
         val field = assistantChoiceFocusedField ?: return false
         return field.isAttachedToWindow && field.hasFocus() && imeInsetVisible &&
             assistantChoiceFocusedScope == draftStorageKey() &&
             assistantChoiceStates[assistantChoiceFocusedKey]?.delivery in setOf(ChoiceDelivery.READY, ChoiceDelivery.FAILED)
+    }
+
+    private fun questionCard(heading: String = "快速选择") = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(12), dp(11), dp(12), dp(11))
+        background = rounded(PANEL_INSET, dp(10), BORDER, dp(1))
+        contentDescription = tr("助手提出的选择题")
+        addView(label(heading, 12, TEXT, true), LinearLayout.LayoutParams(MATCH, WRAP).apply { bottomMargin = dp(8) })
+    }
+
+    private fun questionOption(option: String, description: String?, onClick: () -> Unit): Pair<LinearLayout, ImageView> {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            minimumHeight = dp(44)
+            setPadding(dp(9), dp(6), dp(9), dp(6))
+            isFocusable = true
+            isClickable = true
+            setOnClickListener { onClick() }
+        }
+        val check = ImageView(this).apply {
+            val resource = iconResource("check")
+            setPixelAwareImageResource(resource)
+            if (!pixelTheme || resource !in pixelIconResourceIds) imageTintList = ColorStateList.valueOf(ACCENT)
+        }
+        row.addView(check, LinearLayout.LayoutParams(dp(16), dp(16)).apply { rightMargin = dp(7) })
+        val copy = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        copy.addView(label(option, 13, TEXT, translateUi = false).apply {
+            setLineSpacing(dp(2).toFloat(), 1.15f)
+        }, LinearLayout.LayoutParams(MATCH, WRAP))
+        description?.takeIf { it.isNotBlank() }?.let {
+            copy.addView(label(it, 11, MUTED, translateUi = false), LinearLayout.LayoutParams(MATCH, WRAP))
+        }
+        row.addView(copy, LinearLayout.LayoutParams(0, WRAP, 1f))
+        return row to check
+    }
+
+    private fun updateQuestionOption(row: LinearLayout, check: ImageView, option: String, selected: Boolean, editable: Boolean) {
+        row.background = rounded(if (selected) blendColors(PANEL_INSET, ACCENT, .15f) else PANEL,
+            dp(7), if (selected) ACCENT else BORDER, dp(1))
+        row.isEnabled = editable
+        row.isSelected = selected
+        check.visibility = if (selected) View.VISIBLE else View.INVISIBLE
+        row.contentDescription = if (selected) "${tr("已选择")} $option" else option
+    }
+
+    private fun questionSubmitButton(title: String = "发送并继续") = label(title, 12, TEXT, true).apply {
+        gravity = Gravity.CENTER
+        setPadding(dp(12), dp(7), dp(12), dp(7))
+        minHeight = dp(44)
+        isFocusable = true
+        background = rounded(blendColors(PANEL_INSET, ACCENT, .17f), dp(7), ACCENT, dp(1))
     }
 
     private fun isAssistantQuestionCurrent(threadId: String, turnId: String, itemId: String): Boolean {
@@ -6858,24 +7892,10 @@ class MainActivity : Activity() {
                     assistantChoiceStates[key] = it
                     if (assistantChoiceStates.size > 64) assistantChoiceStates.remove(assistantChoiceStates.keys.first())
                 }
-        val card = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(12), dp(11), dp(12), dp(11))
-            background = rounded(PANEL_INSET, dp(10), BORDER, dp(1))
-            minimumWidth = maximumWidth
-            contentDescription = tr("助手提出的选择题")
-        }
-        card.addView(label("快速选择", 12, TEXT, true), LinearLayout.LayoutParams(MATCH, WRAP).apply {
-            bottomMargin = dp(8)
-        })
+        val card = questionCard().apply { minimumWidth = maximumWidth }
         val optionRows = mutableListOf<List<Pair<LinearLayout, ImageView>>>()
         val customFields = mutableListOf<EditText>()
-        val submitButton = label("发送并继续", 12, TEXT, true).apply {
-            gravity = Gravity.CENTER
-            setPadding(dp(12), dp(7), dp(12), dp(7))
-            minHeight = dp(40)
-            isFocusable = true
-        }
+        val submitButton = questionSubmitButton()
         val notice = label("发送后 AI 会继续回复", 11, MUTED)
 
         fun updateSelection() {
@@ -6885,14 +7905,7 @@ class MainActivity : Activity() {
             optionRows.forEachIndexed { groupIndex, rows ->
                 rows.forEachIndexed { optionIndex, (row, check) ->
                     val selected = state.selected[groupIndex] == optionIndex
-                    row.background = rounded(
-                        if (selected) blendColors(PANEL_INSET, ACCENT, .15f) else PANEL,
-                        dp(7), if (selected) ACCENT else BORDER, dp(1),
-                    )
-                    row.isEnabled = editable
-                    check.visibility = if (selected) View.VISIBLE else View.INVISIBLE
-                    row.contentDescription = if (selected) "${tr("已选择")} ${groups[groupIndex].options[optionIndex]}"
-                        else groups[groupIndex].options[optionIndex]
+                    updateQuestionOption(row, check, groups[groupIndex].options[optionIndex], selected, editable)
                 }
             }
             customFields.forEachIndexed { index, field ->
@@ -6925,38 +7938,16 @@ class MainActivity : Activity() {
             })
             val rows = mutableListOf<Pair<LinearLayout, ImageView>>()
             group.options.forEachIndexed { optionIndex, option ->
-                val row = LinearLayout(this).apply {
-                    orientation = LinearLayout.HORIZONTAL
-                    gravity = Gravity.CENTER_VERTICAL
-                    minimumHeight = dp(40)
-                    setPadding(dp(9), dp(6), dp(9), dp(6))
-                    isFocusable = true
-                    isClickable = true
-                    setOnClickListener {
-                        if (!currentQuestion || state.pendingPayload != null ||
-                            state.delivery !in setOf(ChoiceDelivery.READY, ChoiceDelivery.FAILED)) return@setOnClickListener
-                        val deselect = state.selected[groupIndex] == optionIndex
-                        customFields.getOrNull(groupIndex)?.clearFocus()
-                        customFields.getOrNull(groupIndex)?.setText("")
-                        state.selected[groupIndex] = if (deselect) -1 else optionIndex
-                        state.delivery = ChoiceDelivery.READY
-                        updateSelection()
-                    }
+                val (row, check) = questionOption(option, group.descriptions.getOrNull(optionIndex)) {
+                    if (!currentQuestion || state.pendingPayload != null ||
+                        state.delivery !in setOf(ChoiceDelivery.READY, ChoiceDelivery.FAILED)) return@questionOption
+                    val deselect = state.selected[groupIndex] == optionIndex
+                    customFields.getOrNull(groupIndex)?.clearFocus()
+                    customFields.getOrNull(groupIndex)?.setText("")
+                    state.selected[groupIndex] = if (deselect) -1 else optionIndex
+                    state.delivery = ChoiceDelivery.READY
+                    updateSelection()
                 }
-                val check = ImageView(this).apply {
-                    val resource = iconResource("check")
-                    setPixelAwareImageResource(resource)
-                    if (!pixelTheme || resource !in pixelIconResourceIds) imageTintList = ColorStateList.valueOf(ACCENT)
-                }
-                row.addView(check, LinearLayout.LayoutParams(dp(16), dp(16)).apply { rightMargin = dp(7) })
-                val copy = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-                copy.addView(label(option, 13, TEXT, translateUi = false).apply {
-                    setLineSpacing(dp(2).toFloat(), 1.15f)
-                }, LinearLayout.LayoutParams(MATCH, WRAP))
-                group.descriptions.getOrNull(optionIndex)?.takeIf { it.isNotBlank() }?.let { description ->
-                    copy.addView(label(description, 11, MUTED, translateUi = false), LinearLayout.LayoutParams(MATCH, WRAP))
-                }
-                row.addView(copy, LinearLayout.LayoutParams(0, WRAP, 1f))
                 card.addView(row, LinearLayout.LayoutParams(MATCH, WRAP).apply { bottomMargin = dp(6) })
                 rows += row to check
             }
@@ -7075,7 +8066,7 @@ class MainActivity : Activity() {
                     flushOperations()
                     val text = block.optString("text")
                     if (text.isBlank() || hideMessageText) continue
-                    val visible = liveReply?.visibleText.orEmpty()
+                    val visible = liveReply?.visibleText?.drop(message.optInt("_liveReplyPrefixLength")).orEmpty()
                     if (index == lastMessageIndex && visible.isNotEmpty() && text.endsWith(visible)) {
                         val previous = text.dropLast(visible.length)
                         if (previous.isNotBlank()) addAssistantMarkdown(container, previous, maximumWidth)
@@ -7093,6 +8084,79 @@ class MainActivity : Activity() {
             }
         }
         flushOperations()
+    }
+
+    private fun harnessRunDetailsView(turnId: String, metrics: HarnessRunMetrics): LinearLayout {
+        val key = listOf(activeConnectionId, activeThreadId.orEmpty(), turnId).joinToString("\u0000")
+        val container = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(3), 0, dp(3), 0) }
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            minimumHeight = dp(40)
+            isFocusable = true
+            setPadding(0, dp(3), dp(5), dp(3))
+        }
+        val arrow = ImageView(this).apply { imageTintList = retroIconTint(MUTED) }
+        header.addView(arrow, LinearLayout.LayoutParams(dp(14), dp(14)).apply { rightMargin = dp(4) })
+        header.addView(label("运行详情", 11, MUTED, true), LinearLayout.LayoutParams(WRAP, WRAP))
+        container.addView(header, LinearLayout.LayoutParams(WRAP, WRAP))
+        var details: LinearLayout? = null
+        fun refreshDetails() {
+            val expanded = key in expandedHarnessMetricsIds
+            arrow.setPixelAwareImageResource(iconResource(if (expanded) "chevron_up" else "chevron_right"))
+            header.contentDescription = "${tr("运行详情")}，${tr(if (expanded) "收起" else "展开")}"
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) header.stateDescription = tr(if (expanded) "已展开" else "已收起")
+            if (expanded && details == null) {
+                val body = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(6), 0, dp(3), dp(5)) }
+                fun line(text: String, color: Int = SUBTLE) {
+                    body.addView(label(text, 11, color, translateUi = false).apply {
+                        setPadding(0, dp(2), 0, dp(2))
+                        setHorizontallyScrolling(false)
+                    }, LinearLayout.LayoutParams(MATCH, WRAP))
+                }
+                line(tr(HarnessRunMetrics.phaseLabels.getValue(metrics.phase)))
+                when (metrics.continuity) {
+                    "reused" -> line(tr("进程已复用"), MUTED)
+                    "restored" -> line(tr("进程已重建"), MUTED)
+                }
+                val numbers = java.text.NumberFormat.getIntegerInstance(if (appLanguage == "en") Locale.US else Locale.SIMPLIFIED_CHINESE)
+                HarnessRunMetrics.usageLabels.forEach { (name, title) ->
+                    metrics.usage[name]?.let { line("${tr(title)}  ${numbers.format(it)}") }
+                }
+                if (metrics.usage.isNotEmpty()) {
+                    if (metrics.usagePartial) line(tr("部分请求未报告用量"), MUTED)
+                    line(tr("主 Agent 本轮已报告的用量；子任务单独统计。思考 Token 已包含在输出中。"), MUTED)
+                }
+                metrics.pressureTokens?.let { pressure ->
+                    val capacity = metrics.contextWindow?.takeIf { it > 0 }?.let {
+                        " / ${numbers.format(it)} (${metrics.contextPercent}%)"
+                    }.orEmpty()
+                    line("${tr("最近请求上下文")}  ${numbers.format(pressure)}$capacity Token")
+                }
+                details = body
+                container.addView(body, LinearLayout.LayoutParams(MATCH, WRAP))
+            }
+            details?.visibility = if (expanded) View.VISIBLE else View.GONE
+        }
+        header.setOnClickListener {
+            val scroll = messageScroll
+            val previousY = scroll.scrollY
+            followMessageBottom = false
+            imeFollowMessageBottom = false
+            pendingInitialBottomThreadId = null
+            messageRenderScrollGeneration++
+            val touchGeneration = ++messageScrollTouchGeneration
+            if (!expandedHarnessMetricsIds.add(key)) expandedHarnessMetricsIds.remove(key)
+            refreshDetails()
+            scroll.post {
+                if (header.isAttachedToWindow && messageScroll === scroll && messageScrollTouchGeneration == touchGeneration) {
+                    scroll.scrollTo(scroll.scrollX, previousY)
+                    updateScrollToBottomButton()
+                }
+            }
+        }
+        refreshDetails()
+        return container
     }
 
     private fun addOperationLog(turnId: String, operations: List<JSONObject>) {
@@ -8255,8 +9319,8 @@ class MainActivity : Activity() {
     private fun renderClaudePermission(request: ClaudePermissionRequest) {
         val box = approvalCard()
         val connection = connectionGeneration
-        box.addView(label("Claude 需要你的批准", 13, WARNING, true), widthWrap())
-        box.addView(label(request.reason.ifBlank { tr("Claude Code 请求执行一项需要批准的操作。") }, 12, TEXT,
+        box.addView(label(if (ChatEngines.fromThreadId(request.key.threadId) == ChatEngines.DEEPSEEK) "DeepSeek 需要你的批准" else "Claude 需要你的批准", 13, WARNING, true), widthWrap())
+        box.addView(label(request.reason.ifBlank { "${ChatEngines.label(ChatEngines.fromThreadId(request.key.threadId))} ${tr("请求执行一项需要批准的操作。")}" }, 12, TEXT,
             translateUi = false).apply {
             setPadding(0, dp(5), 0, dp(5))
             setTextIsSelectable(true)
@@ -8304,6 +9368,145 @@ class MainActivity : Activity() {
         actions.addView(action("允许一次", "check", true), LinearLayout.LayoutParams(WRAP, dp(38)))
         box.addView(actions, widthWrap())
         messageList.addView(box, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(7); bottomMargin = dp(7) })
+    }
+
+    private fun renderHarnessQuestion(request: HarnessQuestionRequest) {
+        val connection = connectionGeneration
+        val questions = request.questions()
+        val planReview = (0 until questions.length()).any {
+            questions.getJSONObject(it).optJSONObject("intent")?.optString("kind") == "plan-review"
+        }
+        val box = questionCard(if (planReview) "DeepSeek 计划审核" else "快速选择")
+        val submitting = harnessQuestions.isSubmitting(request.key)
+        fun isCurrent() = connection == connectionGeneration && activeThreadId == request.key.threadId &&
+            harnessQuestions.request(request.key) != null && !harnessQuestions.isSubmitting(request.key)
+        fun finishEditing() {
+            harnessQuestionFocusedField?.takeIf { it.hasFocus() }?.let { field ->
+                android.view.inputmethod.BaseInputConnection.removeComposingSpans(field.text)
+                (getSystemService(INPUT_METHOD_SERVICE) as? InputMethodManager)?.hideSoftInputFromWindow(field.windowToken, 0)
+                field.clearFocus()
+            }
+        }
+        val submit = questionSubmitButton(if (submitting) "正在发送答案…" else if (planReview) "提交审核结果" else "发送并继续")
+        submit.setOnClickListener {
+            if (isCurrent()) harnessQuestions.response(request.key)?.let { response ->
+                finishEditing()
+                respondHarnessQuestion(request.key, response)
+            }
+        }
+        fun updateSubmit() {
+            submit.isEnabled = !submitting && harnessQuestions.response(request.key) != null
+            submit.alpha = if (submit.isEnabled) 1f else .5f
+        }
+        for (i in 0 until questions.length()) {
+            val question = questions.getJSONObject(i)
+            val answer = harnessQuestions.answer(request.key, question.getString("id"))
+            val multiple = question.optBoolean("multiSelect")
+            val heading = question.optString("header").ifBlank { question.optString("question") }
+            box.addView(label(heading, 13, TEXT, true, translateUi = false).apply {
+                setLineSpacing(dp(2).toFloat(), 1.15f)
+            }, LinearLayout.LayoutParams(MATCH, WRAP).apply {
+                topMargin = if (i == 0) 0 else dp(10)
+                bottomMargin = dp(6)
+            })
+            if (question.optString("header").isNotBlank()) box.addView(
+                label(question.optString("question"), 12, SUBTLE, translateUi = false).apply { setTextIsSelectable(true) },
+                LinearLayout.LayoutParams(MATCH, WRAP).apply { bottomMargin = dp(6) })
+            question.optString("detail").takeIf { it.isNotBlank() }?.let { detail ->
+                box.addView(label(detail, 12, SUBTLE, translateUi = false).apply { setTextIsSelectable(true) },
+                    LinearLayout.LayoutParams(MATCH, WRAP).apply { bottomMargin = dp(6) })
+            }
+            val options = question.optJSONArray("options") ?: JSONArray()
+            val rows = mutableListOf<Triple<String, LinearLayout, ImageView>>()
+            var customInput: EditText? = null
+            var changing = false
+            fun updateSelection() {
+                val selected = answer.optJSONArray("selected") ?: JSONArray()
+                rows.forEach { (value, row, check) ->
+                    updateQuestionOption(row, check, value, (0 until selected.length()).any { selected.optString(it) == value }, !submitting)
+                }
+                customInput?.background = rounded(PANEL, dp(7), if (answer.optString("custom").isNotBlank()) ACCENT else BORDER, dp(1))
+                updateSubmit()
+            }
+            for (j in 0 until options.length()) {
+                val option = options.getJSONObject(j)
+                val value = option.getString("label")
+                val (row, check) = questionOption(value, option.optString("description")) {
+                    if (!isCurrent()) return@questionOption
+                    val selected = answer.optJSONArray("selected") ?: JSONArray()
+                    val values = (0 until selected.length()).map { selected.getString(it) }.toMutableList()
+                    val deselect = value in values
+                    if (!multiple) {
+                        values.clear()
+                        changing = true
+                        customInput?.clearFocus()
+                        customInput?.setText("")
+                        answer.remove("custom")
+                        changing = false
+                    }
+                    if (deselect) values.remove(value) else values.add(value)
+                    answer.put("selected", JSONArray(values))
+                    updateSelection()
+                }
+                rows += Triple(value, row, check)
+                box.addView(row, LinearLayout.LayoutParams(MATCH, WRAP).apply { bottomMargin = dp(6) })
+            }
+            if (question.optJSONObject("intent")?.optString("kind") != "approval") {
+                customInput = editField(if (options.length() == 0) "填写你的回答…" else "其他答案（没有合适选项时填写）",
+                    answer.optString("custom"), InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE).apply {
+                    minHeight = dp(44)
+                    maxLines = 4
+                    filters = arrayOf(android.text.InputFilter.LengthFilter(30_000))
+                    isEnabled = !submitting
+                    setOnFocusChangeListener { _, hasFocus ->
+                        if (hasFocus) {
+                            harnessQuestionFocusedField = this
+                            harnessQuestionFocusedKey = request.key
+                            harnessQuestionFocusedConnection = connection
+                        } else handler.post { if (!isEditingAssistantAnswer()) flushDeferredMessageRender() }
+                    }
+                    addTextChangedListener(SimpleTextWatcher { value ->
+                        if (!changing && isCurrent()) {
+                            answer.put("custom", value)
+                            if (!multiple && value.isNotBlank()) answer.put("selected", JSONArray())
+                            updateSelection()
+                        }
+                    })
+                }
+                box.addView(customInput, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(1) })
+            }
+            updateSelection()
+        }
+        val actions = LinearLayout(this).apply { gravity = Gravity.END; orientation = LinearLayout.HORIZONTAL }
+        actions.addView(label("取消", 12, TEXT).apply {
+            gravity = Gravity.CENTER
+            minHeight = dp(44)
+            setPadding(dp(12), dp(7), dp(12), dp(7))
+            background = rounded(PANEL, dp(7), BORDER, dp(1))
+            isEnabled = !submitting
+            setOnClickListener {
+                if (isCurrent()) {
+                    finishEditing()
+                    respondHarnessQuestion(request.key, JSONObject().put("cancelled", true))
+                }
+            }
+        }, LinearLayout.LayoutParams(WRAP, WRAP).apply { rightMargin = dp(8) })
+        actions.addView(submit, LinearLayout.LayoutParams(WRAP, WRAP))
+        box.addView(actions, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(10) })
+        box.addView(label(if (submitting) "正在发送答案…" else "发送后 AI 会继续回复", 11, MUTED),
+            LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(7) })
+        updateSubmit()
+        val viewportWidth = messageScroll.width.takeIf { it > 0 } ?: resources.displayMetrics.widthPixels
+        val maximumWidth = ((viewportWidth - messageScroll.paddingLeft - messageScroll.paddingRight - dp(4)) * .92f).toInt()
+        val column = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            tag = TAG_MESSAGE_DYNAMIC
+            addView(assistantNameView(ChatEngines.DEEPSEEK), widthWrap())
+            addView(box, LinearLayout.LayoutParams(maximumWidth.coerceAtLeast(dp(120)), WRAP).apply {
+                topMargin = dp(8); gravity = Gravity.CENTER_HORIZONTAL
+            })
+        }
+        messageList.addView(column, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(7); bottomMargin = dp(7) })
     }
 
     private fun renderQueue() {
@@ -8844,7 +10047,7 @@ class MainActivity : Activity() {
                     val created = RemoteApi(sendEndpoint, sendToken).post("/api/v1/codex/threads", JSONObject()
                         .put("engine", sendMode)
                         .put("request_id", requestId)
-                        .putOpt("model", payload.optString(if (sendMode == "codex") "model" else "claudeModel").takeIf { it.isNotBlank() })
+                        .putOpt("model", payload.optString(if (sendMode == "claude-code") "claudeModel" else "model").takeIf { it.isNotBlank() })
                         .putOpt("approval_policy", if (sendMode == "codex") payload.optString("approvalPolicy") else null))
                     handler.post {
                         val id = created.optString("id")
@@ -8943,7 +10146,7 @@ class MainActivity : Activity() {
                     val created = RemoteApi(sendEndpoint, sendToken).post("/api/v1/codex/threads", JSONObject()
                         .put("engine", sendMode)
                         .put("request_id", requestId)
-                        .putOpt("model", payload.optString(if (sendMode == "codex") "model" else "claudeModel").takeIf { it.isNotBlank() })
+                        .putOpt("model", payload.optString(if (sendMode == "claude-code") "claudeModel" else "model").takeIf { it.isNotBlank() })
                         .putOpt("approval_policy", if (sendMode == "codex") payload.optString("approvalPolicy") else null))
                     handler.post {
                         val createdScope = outgoingScope.removeSuffix("_new") + "_${created.optString("id")}"
@@ -9013,13 +10216,7 @@ class MainActivity : Activity() {
             .put("images", images)
             .put("documents", documents)
             .put("createdAt", java.time.Instant.now().toString())
-        val model = preference(if (currentMode == "codex") "model" else "claudeModel")
-        val effort = preference(if (currentMode == "codex") "effort" else "claudeEffort")
-        if (!model.isNullOrBlank() && model != "default") payload.put(if (currentMode == "codex") "model" else "claudeModel", model)
-        if (!effort.isNullOrBlank() && effort != "default") payload.put(if (currentMode == "codex") "effort" else "claudeEffort", effort)
-        if (currentMode == "codex") payload.put("approvalPolicy", preference("approvalPolicy") ?: "on-request")
-        else payload.put("claudePermissionMode", preference("claudePermissionMode") ?: "default")
-        return payload
+        return ChatEngines.applyPreferences(payload, currentMode, ::preference, selectedDeepseekAgent())
     }
 
     private fun submitPayload(threadId: String, payload: JSONObject, outgoingFiles: List<JSONObject>,
@@ -9192,7 +10389,7 @@ class MainActivity : Activity() {
         val threadId = activeThreadId ?: return
         val key = threadTitleKey(threadId)
         if (key !in pausedThreadKeys) return
-        val payload = if (threadId.startsWith("claude:")) {
+        val payload = if (ChatEngines.fromThreadId(threadId) != "codex") {
             val text = if (appLanguage == "en")
                 "Continue the interrupted reply from where it stopped. Do not repeat earlier content. Keep the conversation's language."
             else "请继续刚才被中断的回复，从停止处接着回答，避免重复已经说过的内容，并保持原对话语言。"
@@ -9315,8 +10512,8 @@ class MainActivity : Activity() {
                     queueEditDraft = composerInput.text.toString()
                     queueEditDraftFiles = selectedFiles.toMutableList()
                     queueEditPreferences.clear()
-                    listOf("model", "effort", "claudeModel", "claudeEffort", "approvalPolicy", "claudePermissionMode").forEach { key ->
-                        queueEditPreferences[key] = item.optString(key).takeIf { it.isNotBlank() }
+                    ChatEngines.preferenceKeys.forEach { key ->
+                        queueEditPreferences[key] = item.optString(ChatEngines.queueKey(key)).takeIf { it.isNotBlank() && it != "null" }
                     }
                     composerInput.setText(item.optString("originalText").ifBlank { item.optString("text") })
                     composerInput.setSelection(composerInput.text.length)
@@ -9373,7 +10570,7 @@ class MainActivity : Activity() {
                 if (outgoingText != text) put("originalText", text) else remove("originalText")
                 put("images", payload.optJSONArray("images"))
                 put("documents", payload.optJSONArray("documents"))
-                listOf("model", "effort", "claudeModel", "claudeEffort", "approvalPolicy", "claudePermissionMode").forEach { key ->
+                ChatEngines.preferenceKeys.forEach { key ->
                     if (payload.has(key)) put(key, payload.opt(key)) else remove(key)
                 }
                 remove("editing")
@@ -9474,7 +10671,7 @@ class MainActivity : Activity() {
         val api = RemoteApi(endpoint, token)
         val requestId = UUID.randomUUID().toString()
         val body = JSONObject().put("engine", currentMode).put("request_id", requestId)
-            .putOpt("model", preference(if (currentMode == "codex") "model" else "claudeModel"))
+            .putOpt("model", preference(ChatEngines.modelKey(currentMode)))
         if (currentMode == "codex") body.put("approval_policy", preference("approvalPolicy") ?: "on-request")
         io.execute {
             try {
@@ -9493,10 +10690,10 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun switchMode() {
+    private fun switchMode(targetMode: String) {
         if (queueEditPending || queueEditItem != null) { showStatus("请先保存或取消排队消息编辑"); return }
         val previousMode = currentMode
-        val targetMode = if (currentMode == "codex") "claude-code" else "codex"
+        if (targetMode == currentMode || targetMode !in ChatEngines.all) return
         if (targetMode == "claude-code" && !claudeAvailable) {
             showToast(claudeStatusMessage)
             return
@@ -9672,6 +10869,7 @@ class MainActivity : Activity() {
                 clearKnownEmptyThread(id)
                 draftFilesByScope.remove(connectionScopedKey("draft_${thread.optString("engine", currentMode)}_$id"))
                 pendingUserMessages.remove(connectionScopedKey("draft_${thread.optString("engine", currentMode)}_$id"))
+                prefs.edit().remove(connectionScopedKey("harness_question_replies_$id")).apply()
                 displayedThreadTitles.remove(threadTitleKey(id))
                 pausedThreadKeys.remove(threadTitleKey(id))
                 refreshThreads(false)
@@ -9717,11 +10915,16 @@ class MainActivity : Activity() {
     }
 
     private fun composerPreferenceLabels(): Triple<String, String, String> {
-        val modelKey = if (currentMode == "codex") "model" else "claudeModel"
-        val effortKey = if (currentMode == "codex") "effort" else "claudeEffort"
+        val modelKey = ChatEngines.modelKey(currentMode)
+        val effortKey = ChatEngines.effortKey(currentMode)
         val selectedModel = preference(modelKey)
-        val model = if (currentMode == "codex") modelLabel(selectedModel) else claudeModelLabel(selectedModel)
+        val model = when (currentMode) {
+            ChatEngines.DEEPSEEK -> selectedModel ?: deepseekStatus.optString("model").ifBlank { "DeepSeek" }
+            "claude-code" -> claudeModelLabel(selectedModel)
+            else -> modelLabel(selectedModel)
+        }
         val permission = when (currentMode) {
+            ChatEngines.DEEPSEEK -> ChatEngines.permissions.firstOrNull { it.first == (preference("deepseekPermissionMode") ?: "workspace-write") }?.second ?: "工作区写入"
             "codex" -> approvalLabel(preference("approvalPolicy"))
             else -> claudePermissionLabel(preference("claudePermissionMode"))
         }
@@ -9752,7 +10955,7 @@ class MainActivity : Activity() {
     }
 
     private fun savePreference(key: String, value: String?) {
-        if (queueEditItem != null && key in listOf("model", "effort", "claudeModel", "claudeEffort", "approvalPolicy", "claudePermissionMode")) {
+        if (queueEditItem != null && key in ChatEngines.preferenceKeys) {
             queueEditPreferences[key] = value
             updateComposerPreferences()
             return
@@ -9782,7 +10985,7 @@ class MainActivity : Activity() {
             addView(tabRow, LinearLayout.LayoutParams(MATCH, dp(36)).apply { bottomMargin = dp(4) })
             addView(scroll, LinearLayout.LayoutParams(MATCH, 0, 1f))
         }
-        ComposerPreferenceSection.values().forEach { section ->
+        ComposerPreferenceSection.values().filter { it != ComposerPreferenceSection.AGENT || currentMode == ChatEngines.DEEPSEEK }.forEach { section ->
             val tab = label(section.title, 11, SUBTLE, true).apply {
                 gravity = Gravity.CENTER
                 maxLines = 1
@@ -9828,6 +11031,7 @@ class MainActivity : Activity() {
         menu.tabs.forEach { (section, tab) ->
             val active = section == menu.section
             val value = when (section) {
+                ComposerPreferenceSection.AGENT -> selectedDeepseekAgent()
                 ComposerPreferenceSection.MODEL -> model
                 ComposerPreferenceSection.EFFORT -> effort
                 ComposerPreferenceSection.PERMISSION -> permission
@@ -9856,7 +11060,8 @@ class MainActivity : Activity() {
                             menu.displayedChoices.none { it.first == value }) return@setOnClickListener
                         if (selectedComposerPreference(section) != value) applyComposerPreference(section, value)
                         val nextSection = when (section) {
-                            ComposerPreferenceSection.MODEL -> ComposerPreferenceSection.EFFORT
+                            ComposerPreferenceSection.MODEL -> if (currentMode == ChatEngines.DEEPSEEK) ComposerPreferenceSection.AGENT else ComposerPreferenceSection.EFFORT
+                            ComposerPreferenceSection.AGENT -> ComposerPreferenceSection.EFFORT
                             ComposerPreferenceSection.EFFORT -> ComposerPreferenceSection.PERMISSION
                             ComposerPreferenceSection.PERMISSION -> null
                         }
@@ -9896,57 +11101,92 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun selectedDeepseekAgent(): String =
+        activeThread?.takeIf { it.optBoolean("deepseekAgentPresetLocked") }?.optString("deepseekAgentPreset")
+            ?.takeIf { it.isNotBlank() } ?: preference("deepseekAgentPreset") ?: "standard"
+
     private fun selectedComposerPreference(section: ComposerPreferenceSection): String = when (section) {
-        ComposerPreferenceSection.MODEL -> preference(if (currentMode == "codex") "model" else "claudeModel") ?: "default"
-        ComposerPreferenceSection.EFFORT -> preference(if (currentMode == "codex") "effort" else "claudeEffort") ?: "default"
-        ComposerPreferenceSection.PERMISSION -> if (currentMode == "codex") preference("approvalPolicy") ?: "on-request"
-            else preference("claudePermissionMode") ?: "default"
+        ComposerPreferenceSection.MODEL -> preference(ChatEngines.modelKey(currentMode)) ?: "default"
+        ComposerPreferenceSection.AGENT -> selectedDeepseekAgent()
+        ComposerPreferenceSection.EFFORT -> preference(ChatEngines.effortKey(currentMode)) ?: "default"
+        ComposerPreferenceSection.PERMISSION -> when (currentMode) {
+            ChatEngines.DEEPSEEK -> preference("deepseekPermissionMode") ?: "workspace-write"
+            "codex" -> preference("approvalPolicy") ?: "on-request"
+            else -> preference("claudePermissionMode") ?: "default"
+        }
     }
 
     private fun composerPreferenceChoices(section: ComposerPreferenceSection): List<Pair<String, String>> = when (section) {
-        ComposerPreferenceSection.MODEL -> if (currentMode == "codex") {
-            listOf("default" to "默认") + (0 until models.length()).mapNotNull { index ->
+        ComposerPreferenceSection.MODEL -> when (currentMode) {
+            ChatEngines.DEEPSEEK -> (listOf("default" to ("${tr("电脑端默认模型")} · ${deepseekStatus.optString("model").ifBlank { "DeepSeek" }}")) +
+                listOfNotNull(preference("deepseekModel"), "deepseek-v4-flash", "deepseek-v4-pro").distinct().map { it to it })
+            "codex" -> listOf("default" to "默认") + (0 until models.length()).mapNotNull { index ->
                 val model = models.optJSONObject(index) ?: return@mapNotNull null
                 val value = model.optString("model").ifBlank { model.optString("id") }
                 if (value.isBlank() || value == "default") null else value to model.optString("displayName").ifBlank { value }
             }
-        } else listOf("default" to "本机默认模型", "opus" to "Claude Opus", "sonnet" to "Claude Sonnet", "fable" to "Claude Fable")
+            else -> listOf("default" to "本机默认模型", "opus" to "Claude Opus", "sonnet" to "Claude Sonnet", "fable" to "Claude Fable")
+        }
+        ComposerPreferenceSection.AGENT -> {
+            val locked = activeThread?.optBoolean("deepseekAgentPresetLocked") == true
+            val supported = deepseekStatus.optJSONArray("agentPresets")
+            if (locked) listOf(selectedDeepseekAgent() to "${selectedDeepseekAgent()} · ${tr("已绑定当前对话")}")
+            else ChatEngines.agents.filter { supported == null || (0 until supported.length()).any { i -> supported.optString(i) == it.first } }
+        }
         ComposerPreferenceSection.EFFORT -> {
-            val values = if (currentMode == "codex") {
-                val selected = preference("model")
-                val model = (0 until models.length()).mapNotNull { models.optJSONObject(it) }.firstOrNull {
-                    it.optString("model").ifBlank { it.optString("id") } == selected
+            val values = when (currentMode) {
+                ChatEngines.DEEPSEEK -> {
+                    val model = preference("deepseekModel") ?: deepseekStatus.optString("model")
+                    val supported = deepseekStatus.optJSONObject("reasoningEffortsByModel")?.optJSONArray(model)
+                    (if (supported != null) (0 until supported.length()).map { supported.getString(it) }
+                        else listOf("default", "high", "max")).map { it to effortLabel(it) }
                 }
-                val efforts = model?.optJSONArray("supportedReasoningEfforts")
-                if (efforts != null && efforts.length() > 0) (0 until efforts.length()).mapNotNull { index ->
-                    val effort = efforts.optJSONObject(index)?.optString("reasoningEffort") ?: return@mapNotNull null
-                    effort to effortLabel(effort)
-                } else listOf("minimal" to "Minimal", "low" to "Low", "medium" to "Medium", "high" to "High", "xhigh" to "Extra High")
-            } else listOf("low" to "Low", "medium" to "Medium", "high" to "High", "xhigh" to "Extra High", "max" to "Max")
+                "codex" -> {
+                    val selected = preference("model")
+                    val model = (0 until models.length()).mapNotNull { models.optJSONObject(it) }.firstOrNull {
+                        it.optString("model").ifBlank { it.optString("id") } == selected
+                    }
+                    val efforts = model?.optJSONArray("supportedReasoningEfforts")
+                    if (efforts != null && efforts.length() > 0) (0 until efforts.length()).mapNotNull { index ->
+                        val effort = efforts.optJSONObject(index)?.optString("reasoningEffort") ?: return@mapNotNull null
+                        effort to effortLabel(effort)
+                    } else listOf("minimal" to "Minimal", "low" to "Low", "medium" to "Medium", "high" to "High", "xhigh" to "xhigh")
+                }
+                else -> listOf("low" to "Low", "medium" to "Medium", "high" to "High", "xhigh" to "xhigh", "max" to "Max")
+            }
             (listOf("default" to "Default") + values).distinctBy { it.first }
         }
-        ComposerPreferenceSection.PERMISSION -> if (currentMode == "codex") {
-            listOf("on-request" to "请求批准", "untrusted" to "帮我批准", "never" to "完全访问")
-        } else listOf(
-            "default" to "本机默认权限", "manual" to "手动确认", "acceptEdits" to "自动接受编辑",
-            "auto" to "自动模式", "dontAsk" to "不询问（拒绝需授权操作）", "plan" to "计划模式",
-        )
+        ComposerPreferenceSection.PERMISSION -> when (currentMode) {
+            ChatEngines.DEEPSEEK -> ChatEngines.permissions.filter { it.first != "plan" || selectedDeepseekAgent() != "minimal" }
+            "codex" -> listOf("on-request" to "请求批准", "untrusted" to "帮我批准", "never" to "完全访问")
+            else -> listOf("default" to "本机默认权限", "manual" to "手动确认", "acceptEdits" to "自动接受编辑",
+                "auto" to "自动模式", "dontAsk" to "不询问（拒绝需授权操作）", "plan" to "计划模式")
+        }
     }
 
     private fun applyComposerPreference(section: ComposerPreferenceSection, value: String) {
         when (section) {
             ComposerPreferenceSection.MODEL -> {
-                savePreference(if (currentMode == "codex") "model" else "claudeModel", value.takeIf { it != "default" })
+                savePreference(ChatEngines.modelKey(currentMode), value.takeIf { it != "default" })
                 if (currentMode == "codex") savePreference("effort", modelDefaultEffort(value))
+                if (currentMode == ChatEngines.DEEPSEEK) savePreference("deepseekEffort", null)
             }
-            ComposerPreferenceSection.EFFORT -> savePreference(
-                if (currentMode == "codex") "effort" else "claudeEffort", value.takeIf { it != "default" },
-            )
-            ComposerPreferenceSection.PERMISSION -> if (currentMode == "codex") {
-                savePreference("approvalPolicy", value)
-                val threadId = activeThreadId
-                if (threadId != null && queueEditItem == null) runApi({ RemoteApi(endpoint, token).post("/api/v1/codex/threads/${RemoteApi.encodePath(threadId)}/settings", JSONObject().put("approval_policy", value)) })
-            } else savePreference("claudePermissionMode", value)
+            ComposerPreferenceSection.AGENT -> {
+                if (activeThread?.optBoolean("deepseekAgentPresetLocked") != true) {
+                    savePreference("deepseekAgentPreset", value)
+                    if (value == "minimal" && preference("deepseekPermissionMode") == "plan") savePreference("deepseekPermissionMode", "workspace-write")
+                }
+            }
+            ComposerPreferenceSection.EFFORT -> savePreference(ChatEngines.effortKey(currentMode), value.takeIf { it != "default" })
+            ComposerPreferenceSection.PERMISSION -> when (currentMode) {
+                ChatEngines.DEEPSEEK -> savePreference("deepseekPermissionMode", value)
+                "codex" -> {
+                    savePreference("approvalPolicy", value)
+                    val threadId = activeThreadId
+                    if (threadId != null && queueEditItem == null) runApi({ RemoteApi(endpoint, token).post("/api/v1/codex/threads/${RemoteApi.encodePath(threadId)}/settings", JSONObject().put("approval_policy", value)) })
+                }
+                else -> savePreference("claudePermissionMode", value)
+            }
         }
     }
 
@@ -10004,7 +11244,7 @@ class MainActivity : Activity() {
         val availableAbove = anchorLocation[1] - rootLocation[1] - systemInsetTop - dp(11)
         val maxHeight = min(dp(244), availableAbove.coerceAtLeast(dp(118)))
         val menuHeight = min(preferredHeight, maxHeight)
-        val popupWidth = min(dp(224), (root.width - dp(28)).coerceAtLeast(dp(190)))
+        val popupWidth = min(dp(if (composerMenu && currentMode == ChatEngines.DEEPSEEK) 288 else 224), (root.width - dp(28)).coerceAtLeast(dp(190)))
         val x = (anchorLocation[0] - rootLocation[0])
             .coerceIn(dp(10), (root.width - popupWidth - dp(10)).coerceAtLeast(dp(10)))
         val anchorTop = anchorLocation[1] - rootLocation[1]
@@ -10077,6 +11317,7 @@ class MainActivity : Activity() {
                 imageTintList = when (action.icon) {
                     "codex" -> ColorStateList.valueOf(brandIconTint("codex"))
                     "claude" -> ColorStateList.valueOf(brandIconTint("claude-code"))
+                    "deepseek" -> ColorStateList.valueOf(brandIconTint(ChatEngines.DEEPSEEK))
                     else -> retroIconTint(if (action.destructive) ERROR else SUBTLE)
                 }
             }, LinearLayout.LayoutParams(dp(17), dp(17)).apply { rightMargin = dp(9) })
@@ -10926,6 +12167,14 @@ class MainActivity : Activity() {
 
     private fun checkForUpdates() {
         if (updateCheckDialog?.isShowing == true) return
+        if (prefs.getLong(KEY_UPDATE_DOWNLOAD_ID, -1L) > 0L &&
+            compareAppVersions(prefs.getString(KEY_UPDATE_DOWNLOAD_VERSION, "").orEmpty(), BuildConfig.VERSION_NAME) > 0
+        ) {
+            updateDownloadHidden = false
+            updateDownloadPromptedId = -1L
+            checkPendingUpdateDownload()
+            return
+        }
         val updateEndpoint = endpoint
         val updateToken = token
         if (updateEndpoint.isBlank() || updateToken.isBlank()) {
@@ -10966,8 +12215,8 @@ class MainActivity : Activity() {
                             compareAppVersions(latest.version, BuildConfig.VERSION_NAME) <= 0 -> showToast("当前已是最新版本")
                             prefs.getString(KEY_UPDATE_DOWNLOAD_VERSION, "") == latest.version &&
                                 prefs.getLong(KEY_UPDATE_DOWNLOAD_ID, -1L) > 0L -> {
+                                updateDownloadHidden = false
                                 updateDownloadPromptedId = -1L
-                                showToast("正在查看已下载的更新")
                                 checkPendingUpdateDownload()
                             }
                             else -> {
@@ -11033,40 +12282,207 @@ class MainActivity : Activity() {
     }
 
     private fun startAndroidUpdateDownload(updateEndpoint: String, updateToken: String, update: LocalAndroidUpdate) {
-        if (endpoint != updateEndpoint || token != updateToken) return
-        val manager = getSystemService(Context.DOWNLOAD_SERVICE) as? DownloadManager
-        if (manager == null) {
-            showToast("系统下载服务不可用")
+        if (endpoint != updateEndpoint || token != updateToken) {
+            showToast("连接已切换，请重新检查更新")
             return
         }
-        val destination = "devwisp-android-${update.version}-${System.currentTimeMillis()}.apk"
-        val request = DownloadManager.Request(Uri.parse(
-            "$updateEndpoint/api/v1/android/update/${Uri.encode(update.filename)}"
-        )).apply {
-            setTitle("$appDisplayName ${update.version}")
-            setDescription(tr("正在下载更新安装包"))
-            setMimeType("application/vnd.android.package-archive")
-            setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-            setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, destination)
-            addRequestHeader("Authorization", "Bearer $updateToken")
+        if (prefs.getLong(KEY_UPDATE_DOWNLOAD_ID, -1L) > 0L &&
+            compareAppVersions(prefs.getString(KEY_UPDATE_DOWNLOAD_VERSION, "").orEmpty(), BuildConfig.VERSION_NAME) > 0
+        ) {
+            updateDownloadHidden = false
+            updateDownloadPromptedId = -1L
+            checkPendingUpdateDownload()
+            return
         }
-        runCatching { manager.enqueue(request) }
-            .onSuccess { id ->
-                prefs.edit().putLong(KEY_UPDATE_DOWNLOAD_ID, id)
-                    .putString(KEY_UPDATE_DOWNLOAD_VERSION, update.version)
-                    .putString(KEY_UPDATE_DOWNLOAD_SHA256, update.sha256).apply()
-                updateDownloadPromptedId = -1L
-                showToast("已开始下载更新，请查看系统下载通知")
-                handler.post(updateDownloadPoll)
+        val id = System.currentTimeMillis().coerceAtLeast(1L)
+        prefs.edit().putLong(KEY_UPDATE_DOWNLOAD_ID, id)
+            .putString(KEY_UPDATE_DOWNLOAD_VERSION, update.version)
+            .putString(KEY_UPDATE_DOWNLOAD_SHA256, update.sha256)
+            .putLong(KEY_UPDATE_DOWNLOAD_SIZE, update.sizeBytes)
+            .putString(KEY_UPDATE_DOWNLOAD_FILENAME, update.filename)
+            .putString(KEY_UPDATE_DOWNLOAD_ENDPOINT, updateEndpoint)
+            .putBoolean(KEY_UPDATE_DOWNLOAD_IN_APP, true).apply()
+        updateDownloadHidden = false
+        updateDownloadPromptedId = -1L
+        resumeAppUpdateDownload(id)
+        checkPendingUpdateDownload()
+    }
+
+    private fun appUpdateSpec(): AppUpdateSpec = AppUpdateSpec(
+        prefs.getString(KEY_UPDATE_DOWNLOAD_VERSION, "").orEmpty(),
+        prefs.getString(KEY_UPDATE_DOWNLOAD_FILENAME, "").orEmpty(),
+        prefs.getLong(KEY_UPDATE_DOWNLOAD_SIZE, -1),
+        prefs.getString(KEY_UPDATE_DOWNLOAD_SHA256, "").orEmpty(),
+        prefs.getString(KEY_UPDATE_DOWNLOAD_ENDPOINT, "").orEmpty().trimEnd('/') +
+            "/api/v1/android/update/" + Uri.encode(prefs.getString(KEY_UPDATE_DOWNLOAD_FILENAME, "").orEmpty()),
+    )
+
+    private fun resumeAppUpdateDownload(id: Long, retry: Boolean = false) {
+        if (prefs.getLong(KEY_UPDATE_DOWNLOAD_ID, -1L) != id) return
+        val source = prefs.getString(KEY_UPDATE_DOWNLOAD_ENDPOINT, "").orEmpty()
+        val sourceToken = connectionProfiles.firstOrNull { it.endpoint == source }?.token?.takeIf(String::isNotBlank)
+            ?: token.takeIf { endpoint == source && it.isNotBlank() }
+        if (sourceToken == null) {
+            updateDownloadPromptedId = id
+            showToast("请连接原电脑后重试更新")
+            return
+        }
+        runCatching {
+            AppUpdateDownloads.start(id, appUpdateSpec(), File(filesDir, "updates"), "Bearer $sourceToken", retry)
+            updateDownloadPromptedId = -1L
+        }.onFailure {
+            clearPendingUpdateDownload()
+            showToast("更新下载启动失败")
+        }
+    }
+
+    private fun checkAppUpdateDownload(id: Long, version: String) {
+        var progress = AppUpdateDownloads.progress(id)
+        if (progress == null && updateDownloadPromptedId != id) {
+            resumeAppUpdateDownload(id)
+            progress = AppUpdateDownloads.progress(id)
+        }
+        if (progress == null) return
+        when (progress.phase) {
+            AppUpdatePhase.FAILED -> if (updateDownloadPromptedId != id && !updateDownloadHidden) {
+                dismissUpdateDownloadDialog()
+                updateDownloadPromptedId = id
+                showConfirmDialog(tr("更新下载失败"), tr(progress.error ?: "下载中断，请检查网络后重试"), tr("重试")) {
+                    if (prefs.getLong(KEY_UPDATE_DOWNLOAD_ID, -1L) == id) {
+                        resumeAppUpdateDownload(id, retry = true)
+                        checkPendingUpdateDownload()
+                    }
+                }
             }
-            .onFailure { showToast("更新下载启动失败") }
+            AppUpdatePhase.READY -> if (updateDownloadPromptedId != id) showAndroidUpdateReady(id, version)
+            else -> {
+                val status = when (progress.phase) {
+                    AppUpdatePhase.CONNECTING -> DownloadManager.STATUS_PENDING
+                    AppUpdatePhase.VERIFYING -> DownloadManager.STATUS_SUCCESSFUL
+                    else -> DownloadManager.STATUS_RUNNING
+                }
+                renderUpdateDownloadProgress(id, version, AndroidUpdateDownloadSnapshot(status, 0, progress.bytes, progress.total))
+                handler.postDelayed(updateDownloadPoll, 500L)
+            }
+        }
+    }
+
+    private fun showAndroidUpdateReady(id: Long, version: String) {
+        dismissUpdateDownloadDialog()
+        updateDownloadPromptedId = id
+        val message = if (appLanguage == "en") "Version $version is ready. Install it now?"
+            else "版本 $version 已下载完成，现在安装？"
+        showConfirmDialog(tr("下载完成"), message, tr("安装")) {
+            if (prefs.getLong(KEY_UPDATE_DOWNLOAD_ID, -1L) == id) openDownloadedAndroidUpdate(id)
+        }
     }
 
     private fun clearPendingUpdateDownload() {
+        val id = prefs.getLong(KEY_UPDATE_DOWNLOAD_ID, -1L)
         prefs.edit().remove(KEY_UPDATE_DOWNLOAD_ID).remove(KEY_UPDATE_DOWNLOAD_VERSION)
-            .remove(KEY_UPDATE_DOWNLOAD_SHA256).apply()
+            .remove(KEY_UPDATE_DOWNLOAD_SHA256).remove(KEY_UPDATE_DOWNLOAD_SIZE)
+            .remove(KEY_UPDATE_DOWNLOAD_FILENAME).remove(KEY_UPDATE_DOWNLOAD_ENDPOINT).remove(KEY_UPDATE_DOWNLOAD_IN_APP).apply()
         handler.removeCallbacks(updateDownloadPoll)
+        if (updateDownloadVerifyingId == id) updateDownloadVerifyingId = -1L
+        if (pendingUpdateInstallId == id) pendingUpdateInstallId = -1L
         updateDownloadPromptedId = -1L
+        dismissUpdateDownloadDialog()
+    }
+
+    private fun dismissUpdateDownloadDialog() {
+        val ui = updateDownloadUi ?: return
+        updateDownloadUi = null
+        ui.dialog.dismiss()
+    }
+
+    private fun cancelAndroidUpdateDownload(id: Long) {
+        if (prefs.getLong(KEY_UPDATE_DOWNLOAD_ID, -1L) != id) return
+        if (prefs.getBoolean(KEY_UPDATE_DOWNLOAD_IN_APP, false)) {
+            AppUpdateDownloads.cancel(id)
+            clearPendingUpdateDownload()
+            showToast("已取消更新下载")
+            return
+        }
+        val manager = getSystemService(Context.DOWNLOAD_SERVICE) as? DownloadManager
+        if (manager == null || runCatching { manager.remove(id) }.isFailure) {
+            showToast("取消下载失败，请重试")
+            return
+        }
+        clearPendingUpdateDownload()
+        showToast("已取消更新下载")
+    }
+
+    private fun createUpdateDownloadDialog(id: Long, version: String): AndroidUpdateDownloadUi {
+        dismissUpdateDownloadDialog()
+        val dialog = Dialog(this)
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(18), dp(15), dp(18), dp(12))
+            background = rounded(OPAQUE_PANEL, dp(14), BORDER, dp(1))
+        }
+        card.addView(label("下载更新", 15, TEXT, true), widthWrap())
+        card.addView(label("$appDisplayName $version", 12, SUBTLE, translateUi = false),
+            LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(7) })
+        val status = label("等待下载", 12, TEXT)
+        card.addView(status, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(14) })
+        val progress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 100
+            progressTintList = ColorStateList.valueOf(ACCENT)
+            progressBackgroundTintList = ColorStateList.valueOf(BORDER)
+            indeterminateTintList = ColorStateList.valueOf(ACCENT)
+        }
+        card.addView(progress, LinearLayout.LayoutParams(MATCH, dp(6)).apply { topMargin = dp(9) })
+        val details = label("", 12, SUBTLE, translateUi = false)
+        card.addView(details, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(7) })
+        card.addView(label("收起后可在“检查更新”查看进度", 11, MUTED),
+            LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(10) })
+        val actions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.END }
+        actions.addView(dialogTextButton("取消下载", ERROR) { cancelAndroidUpdateDownload(id) },
+            LinearLayout.LayoutParams(WRAP, dp(44)))
+        actions.addView(dialogTextButton("收起", ACCENT) {
+            updateDownloadHidden = true
+            dialog.dismiss()
+        }, LinearLayout.LayoutParams(WRAP, dp(44)).apply { leftMargin = dp(8) })
+        card.addView(actions, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(7) })
+        dialog.setContentView(card)
+        dialog.setCanceledOnTouchOutside(false)
+        dialog.setOnCancelListener { updateDownloadHidden = true }
+        dialog.setOnDismissListener { if (updateDownloadUi?.dialog === dialog) updateDownloadUi = null }
+        val ui = AndroidUpdateDownloadUi(id, dialog, status, progress, details)
+        updateDownloadUi = ui
+        dialog.show()
+        dialog.window?.apply {
+            setBackgroundDrawableResource(android.R.color.transparent)
+            setLayout(min(dp(360), resources.displayMetrics.widthPixels - dp(28)), WRAP)
+            setGravity(Gravity.CENTER)
+        }
+        return ui
+    }
+
+    private fun renderUpdateDownloadProgress(id: Long, version: String, snapshot: AndroidUpdateDownloadSnapshot) {
+        if (updateDownloadHidden || !foreground || isFinishing || isDestroyed) return
+        val ui = updateDownloadUi?.takeIf { it.id == id } ?: createUpdateDownloadDialog(id, version)
+        val total = snapshot.total.takeIf { it > 0L } ?: prefs.getLong(KEY_UPDATE_DOWNLOAD_SIZE, -1L)
+        val bytes = snapshot.bytes.coerceAtLeast(0L)
+        val percent = if (total > 0L) (bytes.toDouble() / total * 100).toInt().coerceIn(0, 100) else 0
+        val verifying = snapshot.status == DownloadManager.STATUS_SUCCESSFUL
+        ui.status.text = tr(when (snapshot.status) {
+            DownloadManager.STATUS_PENDING -> if (prefs.getBoolean(KEY_UPDATE_DOWNLOAD_IN_APP, false)) "正在连接下载…" else "等待下载"
+            DownloadManager.STATUS_PAUSED -> when (snapshot.reason) {
+                DownloadManager.PAUSED_WAITING_TO_RETRY -> "网络波动，稍后重试"
+                DownloadManager.PAUSED_WAITING_FOR_NETWORK -> "等待网络"
+                DownloadManager.PAUSED_QUEUED_FOR_WIFI -> "等待 Wi-Fi"
+                else -> "下载已暂停"
+            }
+            DownloadManager.STATUS_SUCCESSFUL -> "正在校验更新安装包…"
+            else -> "正在下载更新安装包"
+        })
+        ui.progress.isIndeterminate = verifying || total <= 0L
+        ui.progress.progress = percent
+        ui.details.text = if (total > 0L) "$percent% · ${formatDownloadSize(bytes)} / ${formatDownloadSize(total)}"
+            else formatDownloadSize(bytes)
+        ui.progress.contentDescription = "${ui.status.text}, ${ui.details.text}"
     }
 
     private fun checkPendingUpdateDownload() {
@@ -11079,26 +12495,41 @@ class MainActivity : Activity() {
             clearPendingUpdateDownload()
             return
         }
+        if (prefs.getBoolean(KEY_UPDATE_DOWNLOAD_IN_APP, false)) {
+            checkAppUpdateDownload(id, version)
+            return
+        }
         val manager = getSystemService(Context.DOWNLOAD_SERVICE) as? DownloadManager ?: return
-        val status = runCatching {
+        val snapshot = runCatching {
             manager.query(DownloadManager.Query().setFilterById(id))?.use { result ->
-                if (result.moveToFirst()) result.getInt(result.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS)) else null
+                if (!result.moveToFirst()) null else AndroidUpdateDownloadSnapshot(
+                    result.getInt(result.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS)),
+                    result.getInt(result.getColumnIndexOrThrow(DownloadManager.COLUMN_REASON)),
+                    result.getLong(result.getColumnIndexOrThrow(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR)),
+                    result.getLong(result.getColumnIndexOrThrow(DownloadManager.COLUMN_TOTAL_SIZE_BYTES)),
+                )
             }
         }.getOrNull()
-        when (status) {
-            DownloadManager.STATUS_SUCCESSFUL -> verifyDownloadedAndroidUpdate(manager, id, version)
+        when (snapshot?.status) {
+            DownloadManager.STATUS_SUCCESSFUL -> {
+                if (updateDownloadPromptedId != id) renderUpdateDownloadProgress(id, version, snapshot)
+                verifyDownloadedAndroidUpdate(manager, id, version)
+            }
             DownloadManager.STATUS_FAILED, null -> {
                 clearPendingUpdateDownload()
                 showToast("更新下载失败，请重新检查更新")
             }
-            else -> handler.postDelayed(updateDownloadPoll, 1_000L)
+            else -> {
+                renderUpdateDownloadProgress(id, version, snapshot)
+                handler.postDelayed(updateDownloadPoll, 500L)
+            }
         }
     }
 
     private fun verifyDownloadedAndroidUpdate(manager: DownloadManager, id: Long, version: String) {
-        if (updateDownloadVerifying || updateDownloadPromptedId == id) return
+        if (updateDownloadVerifyingId == id || updateDownloadPromptedId == id) return
         val expected = prefs.getString(KEY_UPDATE_DOWNLOAD_SHA256, "").orEmpty()
-        updateDownloadVerifying = true
+        updateDownloadVerifyingId = id
         io.execute {
             val valid = runCatching {
                 val uri = manager.getUriForDownloadedFile(id) ?: throw IOException("Missing downloaded APK")
@@ -11114,25 +12545,31 @@ class MainActivity : Activity() {
                 digest.digest().joinToString("") { byte -> "%02x".format(byte) } == expected
             }.getOrDefault(false)
             handler.post {
-                updateDownloadVerifying = false
+                if (updateDownloadVerifyingId == id) updateDownloadVerifyingId = -1L
                 if (isFinishing || isDestroyed || prefs.getLong(KEY_UPDATE_DOWNLOAD_ID, -1L) != id) return@post
                 if (!valid) {
                     manager.remove(id)
                     clearPendingUpdateDownload()
                     showToast("更新包校验失败，请重新下载")
                 } else if (foreground) {
-                    updateDownloadPromptedId = id
-                    val message = if (appLanguage == "en") "Version $version is ready. Install it now?"
-                        else "版本 $version 已下载完成，现在安装？"
-                    showConfirmDialog(tr("下载完成"), message, tr("安装")) { openDownloadedAndroidUpdate(id) }
+                    showAndroidUpdateReady(id, version)
                 }
             }
         }
     }
 
     private fun openDownloadedAndroidUpdate(id: Long) {
-        val manager = getSystemService(Context.DOWNLOAD_SERVICE) as? DownloadManager ?: return
-        val uri = manager.getUriForDownloadedFile(id)
+        if (prefs.getLong(KEY_UPDATE_DOWNLOAD_ID, -1L) != id) return
+        val uri = if (prefs.getBoolean(KEY_UPDATE_DOWNLOAD_IN_APP, false)) {
+            runCatching {
+                val spec = appUpdateSpec()
+                val file = resolveUpdateApk(File(filesDir, "updates"), spec.file(File(filesDir, "updates")).name)
+                file?.let { Uri.Builder().scheme("content").authority("$packageName.updates").appendPath("apk").appendPath(it.name).build() }
+            }.getOrNull()
+        } else {
+            val manager = getSystemService(Context.DOWNLOAD_SERVICE) as? DownloadManager ?: return
+            manager.getUriForDownloadedFile(id)
+        }
         if (uri == null) {
             clearPendingUpdateDownload()
             showToast("找不到已下载的文件")
@@ -11550,7 +12987,7 @@ class MainActivity : Activity() {
         val code = editField("电脑终端显示的匹配码", "", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD).apply { setSingleLine(true) }
         form.addView(label("连接名称", 11, SUBTLE, true), widthWrap())
         form.addView(name, LinearLayout.LayoutParams(MATCH, dp(48)).apply { topMargin = dp(4); bottomMargin = dp(12) })
-        form.addView(label("电脑网页地址 · 只填 IP 时默认使用 4173 端口", 11, SUBTLE, true), widthWrap())
+        form.addView(label("电脑网页地址 · 只填 IP 时默认使用 26546 端口", 11, SUBTLE, true), widthWrap())
         form.addView(address, LinearLayout.LayoutParams(MATCH, dp(48)).apply { topMargin = dp(4); bottomMargin = dp(12) })
         form.addView(label("匹配码", 11, SUBTLE, true), widthWrap())
         form.addView(code, LinearLayout.LayoutParams(MATCH, dp(48)).apply { topMargin = dp(4) })
@@ -11631,6 +13068,7 @@ class MainActivity : Activity() {
                     refreshThreads(true)
                     refreshPins()
                     refreshClaudeStatus()
+                    refreshDeepseekStatus()
                     refreshModels()
                     if (activeThreadId != null) {
                         refreshActiveThread(false)
@@ -12248,7 +13686,7 @@ class MainActivity : Activity() {
         if (isDirectory) actions += MenuAction("加入终端", "terminal")
         if (!isDirectory && isRunnableScriptPath(path)) actions += MenuAction("终端运行", "play")
         if (absolutePath.isNotBlank() && !composerInput.text.toString().contains(absolutePath)) {
-            actions += MenuAction("加入输入框", if (currentMode == "claude-code") "claude" else "codex")
+            actions += MenuAction("加入输入框", engineIcon(currentMode))
         }
         if (isDirectory) actions += listOf(MenuAction("新建文件", "file_add"), MenuAction("新建文件夹", "folder_add"))
         actions += listOf(
@@ -12975,6 +14413,7 @@ class MainActivity : Activity() {
         terminalScreen.prepareForReconnect()
         terminalColumns = terminalScreen.columnCount
         terminalRows = terminalScreen.rowCount
+        terminalRenderedHistoryDrop = terminalScreen.discardedHistoryLines
         val shell = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(if (retroTheme) 0 else dp(10), 0, if (retroTheme) 0 else dp(10), dp(4))
@@ -12994,12 +14433,17 @@ class MainActivity : Activity() {
         header.addView(ImageView(this).apply {
             setPixelAwareImageResource(iconResource("terminal"))
             imageTintList = retroIconTint(SUBTLE)
-            contentDescription = "本机终端"
+            contentDescription = tr("本机终端")
         }, LinearLayout.LayoutParams(dp(if (retroTheme) 22 else 18), dp(if (retroTheme) 22 else 18)).apply { rightMargin = dp(7) })
         header.addView(label("本机终端", if (retroTheme) 18 else 13, if (retroTheme) ANDROID1_TITLE_TEXT else TEXT, true).apply {
             maxLines = 1
             ellipsize = android.text.TextUtils.TruncateAt.END
         }, LinearLayout.LayoutParams(0, dp(48), 1f))
+        terminalRestartButton = smallButton("重启") { restartTerminal() }.apply {
+            contentDescription = tr("重启终端")
+            tooltipText = tr("重启终端连接")
+        }
+        header.addView(terminalRestartButton, LinearLayout.LayoutParams(WRAP, dp(32)).apply { rightMargin = dp(5) })
         terminalHandoffButton = smallButton("正在查询…") { toggleTerminalHandoff() }.apply {
             visibility = if (terminalThreadId == null) View.GONE else View.VISIBLE
             minWidth = dp(70)
@@ -13029,20 +14473,20 @@ class MainActivity : Activity() {
             setTag(R.id.base_text_size, 12f)
             setTextColor(if (lightTheme) SUBTLE else Color.rgb(207, 214, 226))
             typeface = Typeface.MONOSPACE
-            setTextIsSelectable(false)
             setHorizontallyScrolling(true)
             includeFontPadding = false
             setPadding(dp(9), dp(9), dp(9), dp(9))
             gravity = Gravity.TOP or Gravity.START
-            setOnClickListener { focusTerminalInput() }
-            setOnLongClickListener {
-                setTextIsSelectable(true)
-                false
+            setOnClickListener { if (!isSelecting) focusTerminalInput() }
+            onSelectionStarted = {
+                terminalInputSink?.clearFocus()
+                terminalInputSink?.visibility = View.INVISIBLE
+                (getSystemService(INPUT_METHOD_SERVICE) as? InputMethodManager)?.hideSoftInputFromWindow(windowToken, 0)
             }
-            setOnFocusChangeListener { _, hasFocus ->
-                if (hasFocus && terminalImeVisible && !terminalScrollGestureActive) {
-                    terminalInputSink?.post { terminalInputSink?.requestFocus() }
-                }
+            onSelectionFinished = {
+                terminalInputSink?.visibility = View.VISIBLE
+                updateTerminalDimensions()
+                scheduleTerminalRender()
             }
         }
         val registerTerminalScrollTouch: (MotionEvent) -> Unit = { event ->
@@ -13061,17 +14505,12 @@ class MainActivity : Activity() {
             registerTerminalScrollTouch(event)
             false
         }
-        val outputScroll = ScrollView(this).apply {
-            isFillViewport = true; isVerticalScrollBarEnabled = false; overScrollMode = View.OVER_SCROLL_NEVER
+        val outputScroll = FrameLayout(this).apply {
             background = rounded(if (lightTheme) Color.rgb(244, 246, 248) else Color.rgb(8, 10, 12), dp(8))
-            addView(terminalOutput, FrameLayout.LayoutParams(MATCH, WRAP))
-            setOnTouchListener { _, event ->
-                registerTerminalScrollTouch(event)
-                false
-            }
+            addView(terminalOutput, FrameLayout.LayoutParams(MATCH, MATCH))
         }
         outputScroll.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> updateTerminalDimensions() }
-        terminalOutputScroll = outputScroll
+        terminalOutputViewport = outputScroll
         val terminalContent = FrameLayout(this).apply {
             addView(outputScroll, FrameLayout.LayoutParams(MATCH, MATCH))
         }
@@ -13084,21 +14523,26 @@ class MainActivity : Activity() {
         }
         shell.addView(arrows, widthWrap())
         val transferRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
-        transferRow.addView(textIconAction("复制到输入框", "paste", "复制到输入框") {
+        val transferActions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        transferActions.addView(textIconAction("复制到输入框", "paste", "复制到输入框") {
             val output = terminalOutput ?: return@textIconAction
-            val fullText = output.text.toString()
-            val start = output.selectionStart
-            val end = output.selectionEnd
-            val value = if (start >= 0 && end > start && end <= fullText.length) fullText.substring(start, end) else fullText
+            val value = output.selectedOrAllText()
             if (value.isNotBlank()) {
                 composerInput.append(value.takeLast(120_000))
                 closeTerminal()
             }
-        }, LinearLayout.LayoutParams(WRAP, dp(32)))
-        transferRow.addView(View(this), LinearLayout.LayoutParams(0, MATCH, 1f))
-        terminalKeyboardButton = smallButton("键盘") { focusTerminalInput() }
-        transferRow.addView(terminalKeyboardButton, LinearLayout.LayoutParams(dp(50), dp(36)))
-        shell.addView(transferRow, LinearLayout.LayoutParams(MATCH, dp(36)))
+        }, LinearLayout.LayoutParams(WRAP, dp(40)))
+        terminalPasteButton = textIconAction("粘贴到终端", "paste", "粘贴到终端") { pasteClipboardToTerminal() }.apply {
+            contentDescription = tr("粘贴到终端")
+        }
+        transferActions.addView(terminalPasteButton, LinearLayout.LayoutParams(WRAP, dp(40)).apply { leftMargin = dp(6) })
+        transferRow.addView(HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            addView(transferActions)
+        }, LinearLayout.LayoutParams(0, dp(44), 1f))
+        terminalKeyboardButton = smallButton("键盘") { focusTerminalInput() }.apply { contentDescription = tr("键盘") }
+        transferRow.addView(terminalKeyboardButton, LinearLayout.LayoutParams(WRAP, dp(40)).apply { leftMargin = dp(6) })
+        shell.addView(transferRow, LinearLayout.LayoutParams(MATCH, dp(44)))
         shell.addView(createTerminalResizeHandle(shell), LinearLayout.LayoutParams(MATCH, dp(28)))
         terminalInputSink = TerminalInputSink(this, ::sendTerminalInput).apply {
             importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
@@ -13130,6 +14574,31 @@ class MainActivity : Activity() {
         refreshTerminalHandoffStatus()
     }
 
+    private fun pasteClipboardToTerminal() {
+        if (!terminalReady) {
+            showToast("终端连接中，请稍等")
+            return
+        }
+        val value = try {
+            getSystemService(ClipboardManager::class.java)?.primaryClip
+                ?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(this)?.toString()
+        } catch (_: Exception) {
+            showToast("无法读取剪贴板")
+            return
+        }
+        if (value.isNullOrEmpty()) {
+            showToast("剪贴板为空")
+            return
+        }
+        if (sendTerminalInput(terminalScreen.pasteInput(value))) {
+            terminalOutput?.finishSelection()
+            terminalOutput?.scrollToBottom()
+        } else {
+            renderTerminalHandoffControl()
+            showToast("粘贴失败，请重连终端后重试")
+        }
+    }
+
     private fun focusTerminalInput() {
         val input = terminalInputSink ?: return
         if (!terminalReady) {
@@ -13139,8 +14608,8 @@ class MainActivity : Activity() {
         }
         terminalInputFocusPending = false
         composerInput.clearFocus()
-        terminalOutput?.setTextIsSelectable(false)
-        terminalOutput?.scrollTo(0, 0)
+        terminalOutput?.finishSelection()
+        terminalOutput?.scrollToBottom()
         if (!input.hasFocus()) input.setText("")
         if (!input.requestFocus()) {
             input.isFocusableInTouchMode = true
@@ -13227,6 +14696,7 @@ class MainActivity : Activity() {
         }
         terminalInputSink?.isEnabled = allowManualInput
         terminalKeyboardButton?.apply { isEnabled = allowManualInput; alpha = if (allowManualInput) 1f else 0.45f }
+        terminalPasteButton?.apply { isEnabled = allowManualInput; alpha = if (allowManualInput) 1f else 0.45f }
         terminalShortcutButtons.forEach { shortcut ->
             shortcut.isEnabled = allowManualInput
             shortcut.alpha = if (allowManualInput) 1f else 0.45f
@@ -13369,7 +14839,7 @@ class MainActivity : Activity() {
             terminalLockedContentBottom
         } else measuredBottom
         terminalAvailableHeightPx = contentBottom
-        val viewport = terminalOutputScroll?.parent as? View
+        val viewport = terminalOutputViewport?.parent as? View
         val chromeHeight = if (viewport != null && shell.height > 0) shell.height - viewport.height else 0
         val rowsHeight = ceil((terminalOutput?.paint?.fontSpacing ?: dp(16).toFloat()) * 5).toInt() + dp(24)
         terminalMinimumHeightPx = max(systemInsetTop + dp(240), chromeHeight + rowsHeight).coerceAtMost(contentBottom)
@@ -13394,8 +14864,9 @@ class MainActivity : Activity() {
     }
 
     private fun updateTerminalDimensions(forceSend: Boolean = false) {
-        val scroll = terminalOutputScroll ?: return
+        val scroll = terminalOutputViewport ?: return
         val output = terminalOutput ?: return
+        if (output.isSelecting) return
         if (scroll.width <= 0 || scroll.height <= 0) return
         val usableWidth = (scroll.width - output.paddingLeft - output.paddingRight - dp(4)).coerceAtLeast(1)
         val usableHeight = (scroll.height - output.paddingTop - output.paddingBottom - dp(6)).coerceAtLeast(1)
@@ -13409,7 +14880,7 @@ class MainActivity : Activity() {
         terminalResizeRunnable = null
         val apply = Runnable {
             terminalResizeRunnable = null
-            if (terminalOutputScroll !== scroll || terminalOutput !== output) return@Runnable
+            if (terminalOutputViewport !== scroll || terminalOutput !== output || output.isSelecting) return@Runnable
             val dimensionChanged = columns != terminalColumns || rows != terminalRows
             if (dimensionChanged) {
                 terminalColumns = columns
@@ -13433,6 +14904,9 @@ class MainActivity : Activity() {
 
     private fun closeTerminal() {
         val shell = terminalOverlay ?: return
+        terminalConnectTimeout?.let(handler::removeCallbacks)
+        terminalConnectTimeout = null
+        terminalConnecting = false
         terminalHandoffGeneration++
         handler.removeCallbacks(terminalHandoffPoll)
         terminalScreenKey?.let { key ->
@@ -13470,11 +14944,13 @@ class MainActivity : Activity() {
         terminalMinimumHeightPx = 0
         terminalInputSink = null
         terminalOutput = null
-        terminalOutputScroll = null
+        terminalOutputViewport = null
         terminalStatusView = null
         terminalHandoffButton = null
         terminalHandoffHint = null
         terminalKeyboardButton = null
+        terminalPasteButton = null
+        terminalRestartButton = null
         terminalShortcutButtons.clear()
         terminalHandoffLoaded = false
         terminalHandoffSupported = false
@@ -13489,87 +14965,133 @@ class MainActivity : Activity() {
         terminalInputFocusPending = false
     }
 
+    private fun restartTerminal() {
+        if (terminalOverlay == null || terminalConnecting) return
+        val previous = terminalSocket
+        terminalSocket = null
+        terminalReady = false
+        previous?.cancel()
+        terminalScreen.prepareForReconnect()
+        connectTerminal()
+    }
+
+    private fun finishTerminalConnectionAttempt() {
+        terminalConnecting = false
+        terminalConnectTimeout?.let(handler::removeCallbacks)
+        terminalConnectTimeout = null
+        terminalRestartButton?.apply { text = tr("重启"); isEnabled = true; alpha = 1f }
+        renderTerminalHandoffControl()
+    }
+
     private fun connectTerminal() {
+        if (terminalOverlay == null || terminalConnecting) return
+        terminalConnecting = true
+        terminalReady = false
+        terminalConnectionError = false
+        terminalRestartButton?.apply { text = tr("连接中…"); isEnabled = false; alpha = .5f }
+        renderTerminalHandoffControl()
         updateTerminalStatus("正在连接电脑终端…", MUTED)
         val url = endpoint.replaceFirst(Regex("^http"), "ws") + "/api/v1/codex/terminal"
         val request = Request.Builder().url(url).build()
         val thread = terminalThreadId
         val cwd = terminalRunCwd ?: activeThread?.optString("cwd")?.takeIf { it.isNotBlank() && it != "null" } ?: runtime.optString("workspace", "")
-        terminalSocket = socketClient.newWebSocket(request, object : WebSocketListener() {
-            override fun onOpen(webSocket: WebSocket, response: Response) {
-                if (terminalSocket !== webSocket) return
-                updateTerminalStatus("连接成功，正在恢复终端会话…", MUTED)
+        val socket = socketClient.newWebSocket(request, object : WebSocketListener() {
+            override fun onOpen(webSocket: WebSocket, response: Response) { handler.post {
+                if (terminalSocket !== webSocket || terminalConnectionError) return@post
+                updateTerminalStatus("连接成功，正在恢复终端会话…", MUTED, webSocket)
                 val sent = webSocket.send(JSONObject().put("type", "terminal.connect").put("token", token)
                     .putOpt("threadId", thread).putOpt("cwd", cwd.takeIf { it.isNotBlank() })
                     .put("compactPrompt", true)
                     .put("columns", terminalColumns).put("rows", terminalRows).toString())
-                if (!sent) updateTerminalStatus("终端连接信息发送失败", ERROR)
-            }
+                if (!sent) {
+                    terminalConnectionError = true
+                    finishTerminalConnectionAttempt()
+                    updateTerminalStatus("终端连接信息发送失败", ERROR, webSocket)
+                }
+            } }
 
-            override fun onMessage(webSocket: WebSocket, text: String) {
-                if (terminalSocket !== webSocket) return
+            override fun onMessage(webSocket: WebSocket, text: String) { handler.post {
+                if (terminalSocket !== webSocket || terminalConnectionError) return@post
                 try {
                     val event = JSONObject(text)
                     when (event.optString("type")) {
                         "ready" -> {
                             terminalReady = true
                             val shellName = event.optString("shell")
-                            handler.post {
-                                if (terminalSocket !== webSocket) return@post
-                                terminalShellName = shellName
-                                terminalPersistent = event.optBoolean("persistent")
-                                renderTerminalHandoffControl()
-                                refreshTerminalHandoffStatus()
-                                updateTerminalDimensions(forceSend = true)
-                                scheduleTerminalRender()
-                                if (terminalInputFocusPending) focusTerminalInput()
-                                pendingTerminalDirectory?.let { path ->
-                                    val command = terminalChangeDirectoryCommand(shellName, path)
-                                    if (sendTerminalInput(command)) pendingTerminalDirectory = null
-                                }
-                                pendingTerminalRun?.let { path ->
-                                    pendingTerminalRun = null
-                                    val command = terminalRunScriptCommand(shellName, path)
-                                    if (command == null) showToast("当前终端不支持此脚本类型或路径")
-                                    else if (!sendTerminalInput("$command\r")) showToast("脚本命令发送失败")
-                                }
+                            finishTerminalConnectionAttempt()
+                            terminalShellName = shellName
+                            terminalPersistent = event.optBoolean("persistent")
+                            renderTerminalHandoffControl()
+                            refreshTerminalHandoffStatus()
+                            updateTerminalDimensions(forceSend = true)
+                            scheduleTerminalRender()
+                            if (terminalInputFocusPending) focusTerminalInput()
+                            pendingTerminalDirectory?.let { path ->
+                                val command = terminalChangeDirectoryCommand(shellName, path)
+                                if (sendTerminalInput(command)) pendingTerminalDirectory = null
                             }
-                            updateTerminalStatus("${event.optString("shell")} · ${event.optString("cwd")}", if (retroTheme) ANDROID1_ADDED_COLOR else if (lightTheme) Color.rgb(44, 126, 70) else Color.rgb(119, 174, 132))
+                            pendingTerminalRun?.let { path ->
+                                pendingTerminalRun = null
+                                val command = terminalRunScriptCommand(shellName, path)
+                                if (command == null) showToast("当前终端不支持此脚本类型或路径")
+                                else if (!sendTerminalInput("$command\r")) showToast("脚本命令发送失败")
+                            }
+                            updateTerminalStatus("${event.optString("shell")} · ${event.optString("cwd")}", if (retroTheme) ANDROID1_ADDED_COLOR else if (lightTheme) Color.rgb(44, 126, 70) else Color.rgb(119, 174, 132), webSocket)
                         }
                         "error" -> {
                             terminalReady = false
+                            terminalConnectionError = true
+                            finishTerminalConnectionAttempt()
                             val message = event.optString("message", "终端连接失败")
-                            updateTerminalStatus(message, ERROR)
+                            updateTerminalStatus(message, ERROR, webSocket)
                             appendTerminal("$message\n", webSocket)
                         }
                         "exit" -> {
                             terminalReady = false
-                            updateTerminalStatus("终端会话已结束", WARNING)
+                            terminalConnectionError = true
+                            finishTerminalConnectionAttempt()
+                            updateTerminalStatus("终端会话已结束", WARNING, webSocket)
                             appendTerminal("\n[终端已退出]\n", webSocket)
                             handler.post { if (terminalSocket === webSocket) refreshTerminalHandoffStatus() }
                         }
                     }
                 } catch (_: JSONException) { }
-            }
+            } }
 
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) { appendTerminal(bytes.utf8(), webSocket) }
-            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                if (terminalSocket !== webSocket) return
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) { handler.post {
+                if (terminalSocket !== webSocket) return@post
                 terminalReady = false
-                val message = "终端连接失败：${t.message ?: "未知错误"}"
-                updateTerminalStatus(message, ERROR)
-                appendTerminal("\n$message\n", webSocket)
-            }
+                finishTerminalConnectionAttempt()
+                if (!terminalConnectionError) {
+                    terminalConnectionError = true
+                    val message = "终端连接失败：${t.message ?: "未知错误"}"
+                    updateTerminalStatus(message, ERROR, webSocket)
+                    appendTerminal("\n$message\n", webSocket)
+                }
+            } }
 
-            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                if (terminalSocket !== webSocket) return
+            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) { webSocket.close(code, reason) }
+
+            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) { handler.post {
+                if (terminalSocket !== webSocket) return@post
                 terminalReady = false
-                if (terminalOverlay != null) {
-                    updateTerminalStatus("连接已关闭（$code）", WARNING)
+                finishTerminalConnectionAttempt()
+                if (terminalOverlay != null && !terminalConnectionError) {
+                    updateTerminalStatus("连接已关闭（$code）", WARNING, webSocket)
                     appendTerminal("\n终端连接已关闭：${reason.ifBlank { "无原因说明" }}\n", webSocket)
                 }
-            }
+            } }
         })
+        terminalSocket = socket
+        terminalConnectTimeout = Runnable {
+            if (terminalSocket !== socket || !terminalConnecting) return@Runnable
+            terminalReady = false
+            terminalConnectionError = true
+            finishTerminalConnectionAttempt()
+            updateTerminalStatus("终端连接超时，请点重启重试。", ERROR, socket)
+            socket.cancel()
+        }.also { handler.postDelayed(it, 20_000L) }
     }
 
     private fun appendTerminal(value: String, source: WebSocket) = handler.post {
@@ -13583,27 +15105,29 @@ class MainActivity : Activity() {
         val pending = Runnable {
             terminalRenderRunnable = null
             val output = terminalOutput ?: return@Runnable
-            val scroll = output.parent as? ScrollView
-            val oldScrollY = scroll?.scrollY ?: 0
+            if (output.isSelecting) return@Runnable
+            val followBottom = output.isAtBottom()
+            val oldScrollX = output.scrollX
+            val dropped = terminalScreen.discardedHistoryLines - terminalRenderedHistoryDrop
+            val oldScrollY = (output.scrollY - dropped * output.paint.fontSpacing).toInt().coerceAtLeast(0)
             val interactionRevision = terminalScrollInteractionRevision
-            val rendered = terminalScreen.render(hideStatusLine = terminalPersistent)
-            if (output.text.toString() != rendered) output.text = rendered
-            output.updateCursor(if (terminalReady) terminalScreen.cursorPosition(hideStatusLine = terminalPersistent) else null)
-            if (terminalInputSink?.hasFocus() == true) output.scrollTo(0, 0)
-            scroll?.post {
-                if (terminalScrollGestureActive || interactionRevision != terminalScrollInteractionRevision) return@post
-                val child = scroll.getChildAt(0) ?: return@post
-                val maxScrollY = (child.height - scroll.height).coerceAtLeast(0)
-                scroll.scrollTo(0, oldScrollY.coerceAtMost(maxScrollY))
+            val rendered = terminalScreen.render(hideStatusLine = terminalPersistent, waitingText = tr("等待终端输出…"))
+            output.renderSnapshot(rendered, if (terminalReady) terminalScreen.cursorPosition(hideStatusLine = terminalPersistent) else null)
+            terminalRenderedHistoryDrop = terminalScreen.discardedHistoryLines
+            output.post {
+                if (terminalOutput !== output || output.isSelecting || terminalScrollGestureActive ||
+                    interactionRevision != terminalScrollInteractionRevision) return@post
+                if (followBottom) output.scrollToBottom() else output.scrollToPosition(oldScrollX, oldScrollY)
             }
         }
         terminalRenderRunnable = pending
         handler.postDelayed(pending, 16L)
     }
 
-    private fun updateTerminalStatus(value: String, color: Int) = handler.post {
+    private fun updateTerminalStatus(value: String, color: Int, source: WebSocket? = null) = handler.post {
+        if (source != null && terminalSocket !== source) return@post
         terminalStatusView?.apply {
-            text = value
+            text = tr(value)
             setTextColor(color)
         }
     }
@@ -13701,6 +15225,15 @@ class MainActivity : Activity() {
     @Deprecated("Use Activity Result APIs when the Android module adopts AndroidX")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == REQUEST_BROWSER_FILE) {
+            val callback = browserFileCallback
+            val page = browserFilePage
+            browserFileCallback = null
+            browserFilePage = null
+            browserFilePickerActive = false
+            callback?.onReceiveValue(if (page?.disposed == false) WebChromeClient.FileChooserParams.parseResult(resultCode, data) else null)
+            return
+        }
         if (requestCode == REQUEST_THREAD_EXPORT) {
             val transcript = pendingThreadExport
             pendingThreadExport = null
@@ -13897,6 +15430,17 @@ class MainActivity : Activity() {
 
     private fun handleSocketEvent(event: JSONObject) {
         when (event.optString("type")) {
+            "deepseek.config.changed" -> refreshDeepseekStatus()
+            "deepseek/question/request" -> {
+                HarnessQuestionRequest.fromJson(event.optJSONObject("params") ?: JSONObject())?.let { request ->
+                    harnessQuestionsSupported = true
+                    if (harnessQuestions.receive(request) && request.key.threadId == activeThreadId) refreshClaudePermissionViews()
+                }
+            }
+            "deepseek/question/resolved" -> {
+                val params = event.optJSONObject("params") ?: return
+                if (harnessQuestions.resolve(HarnessQuestionKey(params.optString("threadId"), params.optString("questionId")))) refreshClaudePermissionViews()
+            }
             "pong" -> handler.post {
                 lastSocketActivityAt = System.currentTimeMillis()
                 if (event.optString("id") == outstandingSocketPing) outstandingSocketPing = null
@@ -13904,6 +15448,8 @@ class MainActivity : Activity() {
             "connection" -> {
                 runtime = JSONObject(event.toString())
                 refreshClaudePermissions()
+                refreshHarnessQuestions()
+                refreshDeepseekStatus()
                 handler.post { renderHeader() }
             }
             "claude/permission/request" -> {
@@ -13935,7 +15481,7 @@ class MainActivity : Activity() {
                     handler.post { renderMessages(false) }
                 }
             }
-            "threads.changed", "claude.threads.changed" -> scheduleThreadListRefresh()
+            "threads.changed", "claude.threads.changed", "deepseek.threads.changed" -> scheduleThreadListRefresh()
             "thread.history.changed" -> {
                 val threadId = event.optString("threadId")
                 if (threadId == activeThreadId && event.optString("revision") != activeThread?.optString("historyRevision")) {
@@ -13965,9 +15511,15 @@ class MainActivity : Activity() {
             return
         }
         when (method) {
+            "deepseek/turn/telemetry" -> {
+                if (currentMode == ChatEngines.DEEPSEEK && targetsActiveThread(params)) scheduleActiveThreadRefresh()
+            }
             "turn/started" -> {
                 val eventThread = eventThreadId(params)
-                if (eventThread != null && turnId != null) pendingLiveTurnIds[eventThread] = turnId
+                if (eventThread != null && turnId != null) {
+                    pendingLiveTurnIds[eventThread] = turnId
+                    observeTurnTimer(eventThread, turnId, params.optJSONObject("turn") ?: JSONObject())
+                }
                 if (eventThread == activeThreadId && turnId != null && turnId != liveReplyTurnId) clearLiveReply()
                 if (eventThread != null) run {
                     pausedThreadKeys.remove(threadTitleKey(eventThread))
@@ -14194,6 +15746,83 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun refreshHarnessQuestions() {
+        if (!foreground || token.isBlank() || harnessQuestionRefreshInFlight || !harnessQuestionsSupported) return
+        val connection = connectionGeneration
+        val revision = harnessQuestions.revision
+        val api = RemoteApi(endpoint, token)
+        harnessQuestionRefreshInFlight = true
+        io.execute {
+            val result = runCatching {
+                val items = api.get("/api/v1/deepseek/questions").getJSONArray("requests")
+                (0 until items.length()).map { HarnessQuestionRequest.fromJson(items.getJSONObject(it))
+                    ?: throw IOException("无效的 DeepSeek 提问") }
+            }
+            handler.post {
+                if (connection != connectionGeneration || isFinishing || isDestroyed) return@post
+                harnessQuestionRefreshInFlight = false
+                result.onSuccess { snapshot ->
+                    val before = harnessQuestions.forThread(activeThreadId)
+                    harnessQuestions.reconcile(snapshot, revision)
+                    if (before != harnessQuestions.forThread(activeThreadId)) refreshClaudePermissionViews()
+                }.onFailure { error ->
+                    if (error is RemoteApiException && error.statusCode in setOf(404, 405)) harnessQuestionsSupported = false
+                }
+            }
+        }
+    }
+
+    private fun respondHarnessQuestion(key: HarnessQuestionKey, response: JSONObject) {
+        val request = harnessQuestions.request(key) ?: return
+        if (!harnessQuestions.beginDecision(key)) return
+        val connection = connectionGeneration
+        val reply = request.reply(response, java.time.Instant.now().toString())?.apply {
+            questionReplyBoundary(request)?.let { put("_assistantBoundary", it) }
+        }
+        val replyStorageKey = connectionScopedKey("harness_question_replies_${key.threadId}")
+        val api = RemoteApi(endpoint, token)
+        refreshClaudePermissionViews()
+        io.execute {
+            val result = runCatching {
+                val value = api.post("/api/v1/deepseek/threads/${RemoteApi.encodePath(key.threadId)}/questions/${RemoteApi.encodePath(key.questionId)}", response)
+                if (!value.optBoolean("answered")) throw IOException("回答没有送达，请重试。")
+                if (reply != null) synchronized(prefs) {
+                    val saved = runCatching { JSONArray(prefs.getString(replyStorageKey, "[]")) }.getOrDefault(JSONArray())
+                    prefs.edit().putString(replyStorageKey, HarnessQuestionReplies.add(saved, reply).toString()).apply()
+                }
+            }
+            handler.post {
+                if (connection != connectionGeneration || isFinishing || isDestroyed) return@post
+                harnessQuestions.finishDecision(key, result.isSuccess)
+                if (activeThreadId == key.threadId) refreshClaudePermissionViews()
+                if (result.isSuccess && activeThreadId == key.threadId) refreshActiveThread(false)
+                if (result.isFailure) {
+                    showStatus(result.exceptionOrNull()?.message ?: "回答没有送达，请重试。")
+                    refreshHarnessQuestions()
+                }
+            }
+        }
+    }
+
+    private fun questionReplyBoundary(request: HarnessQuestionRequest): JSONObject? {
+        val params = JSONObject(request.json)
+        if (params.optInt("timelineVersion") >= 1 || request.key.threadId != activeThreadId) return null
+        val turnId = params.optString("turnId")
+        if (liveReplyThreadId == activeThreadId && liveReplyTurnId == turnId) {
+            liveReplyTexts.entries.lastOrNull { it.value.targetText.isNotBlank() }?.let { (id, reply) ->
+                reply.flush()
+                return JSONObject().put("itemId", id).put("text", reply.targetText)
+            }
+        }
+        val turns = activeThread?.optJSONArray("turns") ?: return null
+        val turn = (0 until turns.length()).mapNotNull { turns.optJSONObject(it) }.firstOrNull { it.optString("id") == turnId } ?: return null
+        val items = turn.optJSONArray("items") ?: return null
+        val item = (0 until items.length()).mapNotNull { items.optJSONObject(it) }.lastOrNull {
+            normalizedType(it.optString("type")) == "agentmessage" && messageText(it, "assistant").isNotBlank()
+        } ?: return null
+        return JSONObject().put("itemId", item.getString("id")).put("text", messageText(item, "assistant"))
+    }
+
     private fun respondClaudePermission(key: ClaudePermissionKey, allow: Boolean) {
         if (!claudePermissions.beginDecision(key)) return
         val connection = connectionGeneration
@@ -14295,7 +15924,7 @@ class MainActivity : Activity() {
         if (terminalOverlay != null && terminalThreadId != threadId) closeTerminal()
         val thread = findThread(threadId)
         val target = thread ?: JSONObject().put("id", threadId)
-            .put("engine", if (threadId.startsWith("claude:")) "claude-code" else "codex")
+            .put("engine", ChatEngines.fromThreadId(threadId))
         selectThread(target, eagerDiskCache = true)
     }
 
@@ -14391,15 +16020,13 @@ class MainActivity : Activity() {
 
     private fun currentMessageTime(): String = formatMessageTime(Instant.now().toString())
 
-    private fun parseMessageInstant(value: Any?): Instant? = try {
-        when (value) {
-            is Number -> value.toLong().let { Instant.ofEpochMilli(if (it in -9_999_999_999L..9_999_999_999L) it * 1000L else it) }
-            is String -> value.trim().toLongOrNull()?.let { Instant.ofEpochMilli(if (it in -9_999_999_999L..9_999_999_999L) it * 1000L else it) }
-                ?: runCatching { Instant.parse(value) }.getOrNull()
-                ?: runCatching { OffsetDateTime.parse(value).toInstant() }.getOrNull()
-            else -> null
-        }
-    } catch (_: Exception) { null }
+    private fun observeTurnTimer(threadId: String, turnId: String, turn: JSONObject): TurnTimerKey {
+        val key = TurnTimerKey(endpoint.trimEnd('/'), currentMode, threadId, turnId)
+        val nowMs = SystemClock.elapsedRealtime()
+        turnElapsedTimer.observe(key, TurnTiming.startedAt(turn), nowMs, System.currentTimeMillis(),
+            RemoteApi.serverTimeMillis(key.endpoint, nowMs))
+        return key
+    }
 
     private fun firstJsonValue(value: JSONObject, vararg keys: String): Any? {
         for (key in keys) {
@@ -14575,7 +16202,7 @@ class MainActivity : Activity() {
         "low" -> "Low"
         "medium" -> "Medium"
         "high" -> "High"
-        "xhigh" -> "Extra High"
+        "xhigh" -> "xhigh"
         "max" -> "Max"
         null, "default" -> "Effort"
         else -> selected
@@ -14792,7 +16419,7 @@ class MainActivity : Activity() {
         "delete" -> R.drawable.pixel_delete
         "palette", "theme" -> R.drawable.pixel_theme
         "display" -> R.drawable.pixel_display
-        "language" -> R.drawable.pixel_language
+        "language", "globe" -> R.drawable.pixel_language
         "notifications" -> R.drawable.pixel_notifications
         "lock", "match" -> R.drawable.pixel_match
         "info", "about" -> R.drawable.pixel_about
@@ -14896,16 +16523,44 @@ class MainActivity : Activity() {
     }
 
     private fun brandIconTint(engine: String): Int = when {
+        engine == ChatEngines.DEEPSEEK -> if (lightTheme) Color.rgb(61, 90, 224) else Color.rgb(130, 153, 255)
         engine != "claude-code" -> codexBrandAccent()
         themeName == "lollipop" -> Color.rgb(177, 112, 83)
         pixelTheme -> Color.rgb(238, 140, 109)
         else -> ACCENT_WARM
     }
 
-    private fun setBrandIcon(view: ImageView, engine: String) {
-        val claude = engine == "claude-code"
-        view.setImageResource(if (claude) R.drawable.ic_brand_claude else R.drawable.ic_brand_codex)
+    private fun setBrandIcon(view: ImageView, engine: String, basePadding: Int? = null) {
+        view.setImageResource(when (engine) {
+            ChatEngines.DEEPSEEK -> R.drawable.ic_brand_deepseek
+            "claude-code" -> R.drawable.ic_brand_claude
+            else -> R.drawable.ic_brand_codex
+        })
         view.imageTintList = ColorStateList.valueOf(brandIconTint(engine))
+        if (basePadding != null) {
+            // The wide whale needs more room to match the other marks optically.
+            val padding = dp((basePadding - if (engine == ChatEngines.DEEPSEEK) 2 else 0).coerceAtLeast(0))
+            view.setPadding(padding, padding, padding, padding)
+        }
+    }
+
+    private fun assistantNameView(engine: String): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.HORIZONTAL
+        gravity = Gravity.CENTER_VERTICAL
+        val nameColor = if (engine == currentMode) ASSISTANT_NAME_ACCENT else brandIconTint(engine)
+        val mark = ImageView(this@MainActivity).apply {
+            setBrandIcon(this, engine)
+            imageTintList = ColorStateList.valueOf(nameColor)
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+        }
+        // A shared slot aligns names while preserving each logo's aspect ratio.
+        val iconSlot = FrameLayout(this@MainActivity).apply {
+            val size = dp(if (engine == ChatEngines.DEEPSEEK) 16 else 14)
+            addView(mark, FrameLayout.LayoutParams(size, size, Gravity.CENTER))
+        }
+        addView(iconSlot, LinearLayout.LayoutParams(dp(18), dp(18)).apply { rightMargin = dp(4) })
+        addView(label(ChatEngines.label(engine), 11, nameColor, true), LinearLayout.LayoutParams(WRAP, WRAP))
     }
 
     private fun codexBrandAccent(): Int = when (themeName) {
@@ -14930,6 +16585,7 @@ class MainActivity : Activity() {
         if (pixelTheme) pixelIconResource(icon)?.let { return it }
         if (themeName == "lollipop") return when (icon) {
             "codex" -> R.drawable.ic_brand_codex
+            "deepseek" -> R.drawable.ic_brand_deepseek
             "claude" -> R.drawable.ic_brand_claude
             "chat" -> R.drawable.ic_android1_chat
             "save" -> R.drawable.ic_android1_save
@@ -14968,6 +16624,9 @@ class MainActivity : Activity() {
             "history" -> R.drawable.ic_android1_history
             "notifications" -> R.drawable.ic_android1_notifications
             "language" -> R.drawable.ic_android1_language
+            "globe" -> R.drawable.ic_android1_language
+            "bookmark" -> R.drawable.ic_browser_bookmark
+            "bookmark_filled" -> R.drawable.ic_browser_bookmark_filled
             "info" -> R.drawable.ic_android1_info
             "palette" -> R.drawable.ic_android1_palette
             "display" -> R.drawable.ic_android1_display
@@ -14982,6 +16641,7 @@ class MainActivity : Activity() {
         }
         return when (icon) {
         "codex" -> R.drawable.ic_brand_codex
+        "deepseek" -> R.drawable.ic_brand_deepseek
         "claude" -> R.drawable.ic_brand_claude
         "menu" -> R.drawable.ic_menu
         "terminal" -> R.drawable.ic_terminal
@@ -15015,6 +16675,9 @@ class MainActivity : Activity() {
         "chevron_right" -> R.drawable.ic_chevron_right
         "stop" -> R.drawable.ic_stop
         "back" -> R.drawable.ic_back
+        "globe" -> R.drawable.ic_globe
+        "bookmark" -> R.drawable.ic_browser_bookmark
+        "bookmark_filled" -> R.drawable.ic_browser_bookmark_filled
         else -> R.drawable.ic_add
         }
     }
@@ -15275,6 +16938,10 @@ class MainActivity : Activity() {
         private const val KEY_UPDATE_DOWNLOAD_ID = "local_android_update_download_id"
         private const val KEY_UPDATE_DOWNLOAD_VERSION = "local_android_update_download_version"
         private const val KEY_UPDATE_DOWNLOAD_SHA256 = "local_android_update_download_sha256"
+        private const val KEY_UPDATE_DOWNLOAD_SIZE = "local_android_update_download_size"
+        private const val KEY_UPDATE_DOWNLOAD_FILENAME = "local_android_update_download_filename"
+        private const val KEY_UPDATE_DOWNLOAD_ENDPOINT = "local_android_update_download_endpoint"
+        private const val KEY_UPDATE_DOWNLOAD_IN_APP = "local_android_update_download_in_app"
         private const val KEY_CONNECTION_PROFILES = "native_connection_profiles"
         private const val KEY_ACTIVE_CONNECTION_ID = "native_active_connection_id"
         private const val KEY_LEGACY_CONNECTION_ID = "native_legacy_connection_id"
@@ -15297,6 +16964,7 @@ class MainActivity : Activity() {
         private const val REQUEST_WEB_DOWNLOAD_STORAGE = 4104
         private const val REQUEST_THREAD_EXPORT = 4105
         private const val REQUEST_WORKSPACE_UPLOAD = 4106
+        private const val REQUEST_BROWSER_FILE = 4107
         private const val MAX_WORKSPACE_UPLOAD_BYTES = 512L * 1024 * 1024
         private const val CHANNEL_ID = "devwisp_native"
         private const val EXTRA_THREAD_ID = "notification_thread_id"
@@ -15307,8 +16975,6 @@ class MainActivity : Activity() {
         private const val KEY_SYSTEM_NOTIFICATIONS_ENABLED = "native_system_notifications_enabled"
         private const val KEY_APP_LANGUAGE = "native_app_language"
         private const val KEY_WORKSPACE_EXPLORER_ROOT = "native_workspace_explorer_root"
-        private const val KEY_WEB_PREVIEW_WIDTH_RATIO = "native_web_preview_width_ratio"
-        private const val KEY_WEB_PREVIEW_HEIGHT_RATIO = "native_web_preview_height_ratio"
         private const val KEY_TERMINAL_HEIGHT_DP = "native_terminal_height_dp"
         private const val TAG_INSET_CONTENT = "inset_content"
         private const val TAG_MESSAGE_TURN_PREFIX = "message_turn:"
@@ -15349,63 +17015,6 @@ class MainActivity : Activity() {
     }
 }
 
-private class TerminalOutputView(context: Context) : TextView(context) {
-    private var cursorRow = -1
-    private var cursorColumn = -1
-    private var cursorOn = true
-    private val cursorPaint = Paint(Paint.ANTI_ALIAS_FLAG)
-    private val blink = object : Runnable {
-        override fun run() {
-            if (cursorRow < 0 || !isAttachedToWindow) return
-            cursorOn = !cursorOn
-            invalidate()
-            postDelayed(this, 550L)
-        }
-    }
-
-    fun updateCursor(position: Pair<Int, Int>?) {
-        val nextRow = position?.first ?: -1
-        val nextColumn = position?.second ?: -1
-        if (nextRow == cursorRow && nextColumn == cursorColumn) return
-        cursorRow = nextRow
-        cursorColumn = nextColumn
-        cursorOn = true
-        removeCallbacks(blink)
-        if (cursorRow >= 0 && isAttachedToWindow) postDelayed(blink, 550L)
-        invalidate()
-    }
-
-    override fun onAttachedToWindow() {
-        super.onAttachedToWindow()
-        if (cursorRow >= 0) postDelayed(blink, 550L)
-    }
-
-    override fun onDetachedFromWindow() {
-        removeCallbacks(blink)
-        super.onDetachedFromWindow()
-    }
-
-    override fun onDraw(canvas: Canvas) {
-        super.onDraw(canvas)
-        if (!cursorOn || cursorRow < 0) return
-        val textLayout = layout ?: return
-        if (cursorRow >= textLayout.lineCount) return
-        val start = textLayout.getLineStart(cursorRow)
-        val end = textLayout.getLineEnd(cursorRow)
-        val contentEnd = if (end > start && text[end - 1] == '\n') end - 1 else end
-        val textColumn = cursorColumn.coerceAtMost(contentEnd - start)
-        val density = resources.displayMetrics.density
-        val cursorWidth = density * 2.5f
-        val x = (compoundPaddingLeft + textLayout.getPrimaryHorizontal(start + textColumn) +
-            (cursorColumn - textColumn) * paint.measureText(" "))
-            .coerceAtMost(width - compoundPaddingRight - cursorWidth)
-        val top = compoundPaddingTop + textLayout.getLineTop(cursorRow) + density * 2f
-        val bottom = compoundPaddingTop + textLayout.getLineBottom(cursorRow) - density * 2f
-        if (bottom <= top) return
-        cursorPaint.color = currentTextColor
-        canvas.drawRoundRect(x, top, x + cursorWidth, bottom, density, density, cursorPaint)
-    }
-}
 
 private class TerminalInputSink(
     context: Context,
@@ -15543,224 +17152,6 @@ private fun terminalSequenceForKey(event: KeyEvent): String? {
     }
 }
 
-private class TerminalScreenBuffer(private var columns: Int, private var rows: Int) {
-    val columnCount: Int get() = columns
-    val rowCount: Int get() = rows
-    private var screen = MutableList(rows) { CharArray(columns) { ' ' } }
-    private var cursorRow = 0
-    private var cursorColumn = 0
-    private var savedRow = 0
-    private var savedColumn = 0
-    private var scrollTop = 0
-    private var scrollBottom = rows - 1
-    private var state = 0
-    private var receivedOutput = false
-    private var cursorVisible = true
-    private val sequence = StringBuilder()
-
-    fun append(value: String) {
-        if (value.isNotEmpty()) receivedOutput = true
-        value.forEach(::consume)
-    }
-
-    fun render(hideStatusLine: Boolean = false): String =
-        if (!receivedOutput && screen.all { line -> line.all { it == ' ' } }) "等待终端输出…"
-        else screen.take(if (hideStatusLine) rows - 1 else rows).joinToString("\n") { line ->
-            val text = String(line).trimEnd()
-            if (hideStatusLine && text.startsWith("[codex-rem")) "" else text
-        }
-
-    fun cursorPosition(hideStatusLine: Boolean = false): Pair<Int, Int>? =
-        if (!receivedOutput || !cursorVisible || hideStatusLine && cursorRow >= rows - 1) null
-        else cursorRow to cursorColumn.coerceIn(0, columns - 1)
-
-    fun prepareForReconnect() {
-        state = 0
-        sequence.setLength(0)
-    }
-
-    fun resize(newColumns: Int, newRows: Int) {
-        if (newColumns == columns && newRows == rows) return
-        val next = MutableList(newRows) { CharArray(newColumns) { ' ' } }
-        val contentRows = minOf(rows - 1, newRows - 1)
-        val maxSourceStart = (rows - 1 - contentRows).coerceAtLeast(0)
-        val sourceStart = (cursorRow.coerceAtMost(rows - 2) - contentRows + 1).coerceIn(0, maxSourceStart)
-        val copyColumns = minOf(columns, newColumns)
-        for (row in 0 until contentRows) screen[sourceStart + row].copyInto(next[row], endIndex = copyColumns)
-        screen[rows - 1].copyInto(next[newRows - 1], endIndex = copyColumns)
-        cursorRow = if (cursorRow == rows - 1) newRows - 1 else (cursorRow - sourceStart).coerceIn(0, newRows - 2)
-        savedRow = if (savedRow == rows - 1) newRows - 1 else (savedRow - sourceStart).coerceIn(0, newRows - 2)
-        cursorColumn = cursorColumn.coerceAtMost(newColumns - 1)
-        savedColumn = savedColumn.coerceAtMost(newColumns - 1)
-        columns = newColumns
-        rows = newRows
-        screen = next
-        scrollTop = 0
-        scrollBottom = rows - 1
-    }
-
-    private fun consume(character: Char) {
-        when (state) {
-            0 -> when (character) {
-                '\u001b' -> state = 1
-                '\r' -> cursorColumn = 0
-                '\n' -> newLine()
-                '\b' -> cursorColumn = (cursorColumn - 1).coerceAtLeast(0)
-                '\t' -> cursorColumn = ((cursorColumn / 8 + 1) * 8).coerceAtMost(columns - 1)
-                '\u0000', '\u0007' -> Unit
-                else -> if (character >= ' ') put(character)
-            }
-            1 -> when (character) {
-                '[' -> { sequence.setLength(0); state = 2 }
-                ']' -> { sequence.setLength(0); state = 3 }
-                '7' -> { savedRow = cursorRow; savedColumn = cursorColumn; state = 0 }
-                '8' -> { cursorRow = savedRow; cursorColumn = savedColumn; state = 0 }
-                'c' -> { clear(resetCursor = true); state = 0 }
-                'D' -> { newLine(resetColumn = false); state = 0 }
-                'E' -> { newLine(); state = 0 }
-                'M' -> { reverseIndex(); state = 0 }
-                '(', ')', '#', '%' -> state = 4
-                else -> state = 0
-            }
-            2 -> {
-                if (character in '@'..'~') {
-                    applyCsi(character, sequence.toString())
-                    state = 0
-                } else if (sequence.length < 64) sequence.append(character) else state = 0
-            }
-            3 -> when {
-                character == '\u0007' -> state = 0
-                character == '\u001b' -> state = 5
-                sequence.length < 512 -> sequence.append(character)
-                else -> state = 0
-            }
-            4 -> state = 0
-            5 -> state = if (character == '\\') 0 else 3
-        }
-    }
-
-    private fun put(character: Char) {
-        if (cursorColumn >= columns) newLine()
-        screen[cursorRow][cursorColumn] = character
-        cursorColumn += 1
-    }
-
-    private fun newLine(resetColumn: Boolean = true) {
-        if (cursorRow == scrollBottom) scrollUp(1)
-        else if (cursorRow < rows - 1) cursorRow++
-        else scrollUp(1, 0, rows - 1)
-        if (resetColumn) cursorColumn = 0
-    }
-
-    private fun reverseIndex() {
-        if (cursorRow == scrollTop) scrollDown(1)
-        else cursorRow = (cursorRow - 1).coerceAtLeast(0)
-    }
-
-    private fun scrollUp(count: Int, top: Int = scrollTop, bottom: Int = scrollBottom) {
-        repeat(count.coerceAtMost(bottom - top + 1)) {
-            screen.removeAt(top)
-            screen.add(bottom, CharArray(columns) { ' ' })
-        }
-    }
-
-    private fun scrollDown(count: Int) {
-        repeat(count.coerceAtMost(scrollBottom - scrollTop + 1)) {
-            screen.removeAt(scrollBottom)
-            screen.add(scrollTop, CharArray(columns) { ' ' })
-        }
-    }
-
-    private fun applyCsi(command: Char, raw: String) {
-        val cleaned = raw.trimStart('?', '>', '!', '=')
-        val values = cleaned.split(';').map { it.toIntOrNull() ?: 0 }
-        if (raw.startsWith('?') && 25 in values && (command == 'h' || command == 'l')) {
-            cursorVisible = command == 'h'
-            return
-        }
-        fun value(index: Int, fallback: Int = 1): Int = values.getOrNull(index)?.takeIf { it > 0 } ?: fallback
-        when (command) {
-            'A' -> cursorRow = (cursorRow - value(0)).coerceAtLeast(0)
-            'B' -> cursorRow = (cursorRow + value(0)).coerceAtMost(rows - 1)
-            'C' -> cursorColumn = (cursorColumn + value(0)).coerceAtMost(columns - 1)
-            'D' -> cursorColumn = (cursorColumn - value(0)).coerceAtLeast(0)
-            'E' -> { cursorRow = (cursorRow + value(0)).coerceAtMost(rows - 1); cursorColumn = 0 }
-            'F' -> { cursorRow = (cursorRow - value(0)).coerceAtLeast(0); cursorColumn = 0 }
-            'G' -> cursorColumn = (value(0) - 1).coerceIn(0, columns - 1)
-            'H', 'f' -> {
-                cursorRow = (value(0) - 1).coerceIn(0, rows - 1)
-                cursorColumn = (value(1) - 1).coerceIn(0, columns - 1)
-            }
-            'd' -> cursorRow = (value(0) - 1).coerceIn(0, rows - 1)
-            'J' -> eraseDisplay(values.firstOrNull() ?: 0)
-            'K' -> eraseLine(values.firstOrNull() ?: 0)
-            'P' -> deleteCharacters(value(0))
-            '@' -> insertCharacters(value(0))
-            'X' -> repeat(value(0).coerceAtMost(columns - cursorColumn)) { screen[cursorRow][cursorColumn + it] = ' ' }
-            'S' -> scrollUp(value(0))
-            'T' -> scrollDown(value(0))
-            'r' -> {
-                val top = value(0)
-                val bottom = value(1, rows)
-                if (top < bottom && bottom <= rows) {
-                    scrollTop = top - 1
-                    scrollBottom = bottom - 1
-                    cursorRow = 0
-                    cursorColumn = 0
-                }
-            }
-            's' -> { savedRow = cursorRow; savedColumn = cursorColumn }
-            'u' -> { cursorRow = savedRow; cursorColumn = savedColumn }
-        }
-    }
-
-    private fun eraseDisplay(mode: Int) {
-        when (mode) {
-            1 -> {
-                for (row in 0 until cursorRow) screen[row].fill(' ')
-                for (column in 0..cursorColumn.coerceAtMost(columns - 1)) screen[cursorRow][column] = ' '
-            }
-            2, 3 -> screen.forEach { it.fill(' ') }
-            else -> {
-                for (column in cursorColumn until columns) screen[cursorRow][column] = ' '
-                for (row in cursorRow + 1 until rows) screen[row].fill(' ')
-            }
-        }
-    }
-
-    private fun eraseLine(mode: Int) {
-        when (mode) {
-            1 -> for (column in 0..cursorColumn.coerceAtMost(columns - 1)) screen[cursorRow][column] = ' '
-            2 -> screen[cursorRow].fill(' ')
-            else -> for (column in cursorColumn until columns) screen[cursorRow][column] = ' '
-        }
-    }
-
-    private fun deleteCharacters(count: Int) {
-        val line = screen[cursorRow]
-        val amount = count.coerceAtMost(columns - cursorColumn)
-        for (column in cursorColumn until columns - amount) line[column] = line[column + amount]
-        for (column in columns - amount until columns) line[column] = ' '
-    }
-
-    private fun insertCharacters(count: Int) {
-        val line = screen[cursorRow]
-        val amount = count.coerceAtMost(columns - cursorColumn)
-        for (column in columns - 1 downTo cursorColumn + amount) line[column] = line[column - amount]
-        for (column in cursorColumn until cursorColumn + amount) line[column] = ' '
-    }
-
-    private fun clear(resetCursor: Boolean = false) {
-        screen.forEach { it.fill(' ') }
-        if (resetCursor) {
-            cursorRow = 0
-            cursorColumn = 0
-            cursorVisible = true
-            scrollTop = 0
-            scrollBottom = rows - 1
-        }
-    }
-}
 
 private class SimpleTextWatcher(private val changed: (String) -> Unit) : android.text.TextWatcher {
     override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
@@ -15804,7 +17195,7 @@ private fun MainActivity.effortLabel(selected: String?): String = when (selected
     "low" -> "Low"
     "medium" -> "Medium"
     "high" -> "High"
-    "xhigh" -> "Extra High"
+    "xhigh" -> "xhigh"
     "max" -> "Max"
     null, "default" -> "Effort"
     else -> selected

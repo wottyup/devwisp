@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Activate a backend update after all local Codex/Claude turns finish."""
+"""Activate a backend update after all local engine turns finish."""
 
 from __future__ import annotations
 
@@ -21,7 +21,9 @@ from devwisp.codex_history import CodexHistoryStore  # noqa: E402
 
 ACTIVE_STATUSES = {"active", "inProgress", "running", "started"}
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
-CLAUDE_DATABASES = tuple(CODEX_HOME / directory / "claude-code.sqlite3" for directory in ("devwisp", "codex-remote"))
+CLAUDE_DATABASES = tuple(CODEX_HOME / directory / filename
+    for directory in ("devwisp", "codex-remote")
+    for filename in ("claude-code.sqlite3", "deepseek-harness.sqlite3"))
 
 
 def service_pid(unit: str) -> int:

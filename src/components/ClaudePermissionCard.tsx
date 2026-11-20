@@ -3,6 +3,7 @@ import { useState } from 'react'
 import { AlertTriangle, Check, X } from 'lucide-react'
 
 interface ClaudePermissionRequest {
+  threadId?: string
   permissionId: string
   toolName: string
   command: string
@@ -29,7 +30,7 @@ export function ClaudePermissionCard({ request, onRespond }: Props) {
     }
   }
   return <div className="approval-card" role="alert">
-    <div className="approval-card__heading"><AlertTriangle size={17} /><strong>{ui('Claude 需要你的批准')}</strong></div>
+    <div className="approval-card__heading"><AlertTriangle size={17} /><strong>{request.threadId?.startsWith('deepseek:') ? ui('DeepSeek 需要你的批准') : ui('Claude 需要你的批准')}</strong></div>
     <p>{request.reason || ui('Claude Code 请求执行一项需要批准的操作。')}</p>
     {request.toolName ? <small>{ui('工具：')}{request.toolName}</small> : null}
     {request.command ? <code>{request.command}</code> : null}

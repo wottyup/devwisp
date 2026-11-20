@@ -68,12 +68,18 @@ export function sameSidebarChatShortcut(left: SidebarChatShortcut, right: Sideba
 export function isReservedSidebarChatShortcut(event: KeyboardEvent) {
   const key = normalizeKey(event.key).toLowerCase()
   const controlOrMeta = event.ctrlKey || event.metaKey
+  if (isQueueShortcut(event)) return true
   if (event.ctrlKey && !event.altKey && !event.metaKey && !event.shiftKey && event.key === 'Enter') return true
   if (event.key === 'Tab' || event.key === 'Escape' || ['F5', 'F11', 'F12'].includes(event.key)) return true
   if (controlOrMeta && (['w', 't', 'n', 'r', 'l', 'p', 'f', 'q', 's', 'o', 'u', 'd'].includes(key) || /^[0-9]$/.test(key))) return true
   if (controlOrMeta && event.shiftKey && ['i', 'j', 'c', 'delete'].includes(key)) return true
   if (event.altKey && ['ArrowLeft', 'ArrowRight', 'Home', 'F4'].includes(event.key)) return true
   return false
+}
+
+function isQueueShortcut(shortcut: SidebarChatShortcut) {
+  return shortcut.ctrlKey && !shortcut.altKey && !shortcut.metaKey && !shortcut.shiftKey
+    && (shortcut.key === 'ArrowUp' || shortcut.key === 'ArrowDown')
 }
 
 export function formatSidebarChatShortcut(shortcut: SidebarChatShortcut) {
@@ -107,8 +113,10 @@ export function readSidebarChatShortcuts(): SidebarChatShortcuts {
     const stored = window.localStorage.getItem(storageKey)
     if (!stored) return defaultSidebarChatShortcuts
     const parsed = JSON.parse(stored) as Record<string, unknown>
-    const previous = normalizeShortcut(parsed.previous)
-    const next = normalizeShortcut(parsed.next)
+    const storedPrevious = normalizeShortcut(parsed.previous)
+    const storedNext = normalizeShortcut(parsed.next)
+    const previous = storedPrevious && isQueueShortcut(storedPrevious) ? defaultSidebarChatShortcuts.previous : storedPrevious
+    const next = storedNext && isQueueShortcut(storedNext) ? defaultSidebarChatShortcuts.next : storedNext
     if (!previous || !next || sameSidebarChatShortcut(previous, next)) return defaultSidebarChatShortcuts
     return { previous, next }
   } catch {

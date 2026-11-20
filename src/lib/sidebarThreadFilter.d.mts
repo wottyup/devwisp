@@ -1,5 +1,5 @@
 import type { CodexThread } from './devwispClient'
 
-export type SidebarThreadEngineFilter = 'codex' | 'claude-code' | null
+export type SidebarThreadEngineFilter = 'codex' | 'claude-code' | 'deepseek-harness' | null
 
-export function filterSidebarThreads(threads: CodexThread[], engineFilter?: SidebarThreadEngineFilter, search?: string): CodexThread[]
+export function filterSidebarThreads<T extends CodexThread>(threads: T[], engineFilter?: SidebarThreadEngineFilter, search?: string): T[]

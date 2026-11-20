@@ -197,7 +197,7 @@ def browser_thread(thread: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-_GLOBAL_NOTIFICATIONS = {"thread/name/updated", "thread/deleted", "turn/started", "turn/completed", "nativeConfig/changed"}
+_GLOBAL_NOTIFICATIONS = {"thread/name/updated", "thread/deleted", "turn/started", "turn/completed", "nativeConfig/changed", "usage/local/updated"}
 _DETAIL_NOTIFICATIONS = {
     "item/started", "item/completed", "item/agentMessage/delta",
     "item/fileChange/patchUpdated", "turn/workspaceChanges", "turn/plan/updated",
@@ -234,4 +234,14 @@ def browser_event(event: dict[str, Any], *, thread_id: str | None = None, filter
         result.update(_pick(params, ("threadName",)))
     elif method == "nativeConfig/changed":
         result.update(_pick(params, ("engine", "model")))
+    elif method == "usage/local/updated":
+        # The project dashboard needs updates from every owned conversation.
+        # Composer subscribers additionally gate by engine and thread ID.
+        result.update(_pick(params, ("engine", "revision")))
+        totals = params.get("totals")
+        if isinstance(totals, dict):
+            result['totals'] = _pick(totals, (
+                'inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'reasoningTokens', 'totalTokens',
+                'turns', 'reportedTurns', 'missingTurns', 'partialTurns', 'activeTurns',
+            ))
     return {"type": "notification", "method": method, "params": result}

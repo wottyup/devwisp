@@ -32,7 +32,7 @@ class PermissionPromptError(RuntimeError):
 @dataclass
 class _PendingPermission:
     future: asyncio.Future[bool]
-    writer: asyncio.StreamWriter
+    writer: asyncio.StreamWriter | None
     params: dict[str, str]
 
 
@@ -78,7 +78,8 @@ class PermissionPromptBroker:
             if not entry.future.done():
                 entry.future.set_result(False)
             with suppress(Exception):
-                entry.writer.close()
+                if entry.writer is not None:
+                    entry.writer.close()
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
@@ -93,6 +94,26 @@ class PermissionPromptBroker:
         if entry.future.done():
             raise PermissionPromptError("该权限请求已经处理。")
         entry.future.set_result(allow)
+
+    async def request(self, thread_id: str, *, tool_name: str, reason: str, cwd: str) -> bool:
+        """Ask once on behalf of an in-process engine adapter; cancellation denies."""
+        permission_id = str(uuid4())
+        key = f"{thread_id}:{permission_id}"
+        future = asyncio.get_running_loop().create_future()
+        params = {"threadId": thread_id, "permissionId": permission_id,
+                  "toolName": tool_name[:128], "reason": reason[:1000],
+                  "cwd": cwd, "command": "", "filePath": ""}
+        self._pending[key] = _PendingPermission(future, None, params)
+        try:
+            await self.emit({"type": "claude/permission/request", "params": params})
+            return await asyncio.wait_for(future, PERMISSION_REQUEST_TIMEOUT_SECONDS)
+        except TimeoutError:
+            return False
+        finally:
+            self._pending.pop(key, None)
+            if not future.done():
+                future.cancel()
+            await self.emit({"type": "claude/permission/resolved", "params": params})
 
     async def _handle_client(
         self,

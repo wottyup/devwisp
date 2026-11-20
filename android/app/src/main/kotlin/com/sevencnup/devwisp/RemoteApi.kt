@@ -1,6 +1,7 @@
 package com.sevencnup.devwisp
 
 import android.net.Uri
+import android.os.SystemClock
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -108,7 +109,13 @@ internal class RemoteApi(
             else -> builder.method(method, body ?: ByteArray(0).toRequestBody(null))
         }
         return try {
-            networkClient.newCall(builder.build()).execute()
+            val sentMs = SystemClock.elapsedRealtime()
+            networkClient.newCall(builder.build()).execute().also { response ->
+                val receivedMs = SystemClock.elapsedRealtime()
+                if (response.isSuccessful && response.cacheResponse == null && response.header("Age") == null) {
+                    serverClock.observe(endpoint, response.header("Date"), sentMs, receivedMs)
+                }
+            }
         } catch (error: IOException) {
             throw IOException("无法连接电脑网页服务，请检查手机网络或远程连接。", error)
         }
@@ -130,6 +137,11 @@ internal class RemoteApi(
     }
 
     companion object {
+        private val serverClock = ServerClock()
+
+        fun serverTimeMillis(endpoint: String, elapsedRealtimeMs: Long): Long? =
+            serverClock.nowMillis(endpoint, elapsedRealtimeMs)
+
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
         private val CLIENT = OkHttpClient.Builder()
             .connectTimeout(12, TimeUnit.SECONDS)
@@ -152,14 +164,14 @@ internal class RemoteApi(
             if (!value.contains("://")) value = "http://$value"
             val uri = Uri.parse(value)
             if ((uri.scheme != "http" && uri.scheme != "https") || uri.host.isNullOrBlank()) {
-                throw IllegalArgumentException("地址格式无效，请填写 http://电脑IP:4173。")
+                throw IllegalArgumentException("地址格式无效，请填写 http://电脑IP:26546。")
             }
             if (!uri.query.isNullOrBlank() || !uri.fragment.isNullOrBlank()) {
                 throw IllegalArgumentException("地址不要包含查询参数或片段。")
             }
             if (uri.scheme == "http" && uri.port == -1 && uri.host?.matches(Regex("[0-9]{1,3}(\\.[0-9]{1,3}){3}")) == true &&
                 uri.path.orEmpty().trim('/').isEmpty()) {
-                return "http://${uri.host}:4173"
+                return "http://${uri.host}:26546"
             }
             return value.trimEnd('/')
         }

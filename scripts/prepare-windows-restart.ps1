@@ -2,6 +2,8 @@ $ErrorActionPreference = 'Stop'
 $projectRoot = (Resolve-Path -LiteralPath (Split-Path -Parent $PSScriptRoot)).Path
 $backendExe = Join-Path $projectRoot '.venv\Scripts\python.exe'
 $viteEntrypoint = Join-Path $projectRoot 'node_modules\vite\bin\vite.js'
+$workspaceNodeModules = Split-Path -Parent $projectRoot
+$workspaceViteEntrypoint = Join-Path $workspaceNodeModules 'node_modules\vite\bin\vite.js'
 $runnerPath = Join-Path $PSScriptRoot 'run-windows-service.ps1'
 
 # Only stop scheduled tasks when they point to this project's runner.
@@ -20,11 +22,12 @@ $processes = @(Get-CimInstance Win32_Process)
 $backend = @($processes | Where-Object {
     $_.Name -eq 'python.exe' -and $_.ExecutablePath -and
     $_.ExecutablePath.Equals($backendExe, [StringComparison]::OrdinalIgnoreCase) -and
-    $_.CommandLine -match '(^|\s)devwisp\.main(\s|$)'
+    $_.CommandLine -match '(^|\s)(devwisp|code_remote|codex_remote)\.main(\s|$)'
 })
 $vites = @($processes | Where-Object {
     $_.Name -eq 'node.exe' -and $_.CommandLine -and
-    $_.CommandLine.IndexOf($viteEntrypoint, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+    ($_.CommandLine.IndexOf($viteEntrypoint, [StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+        $_.CommandLine.IndexOf($workspaceViteEntrypoint, [StringComparison]::OrdinalIgnoreCase) -ge 0) -and
     $_.CommandLine -match '(\s|")preview(\s|"|$)'
 })
 
@@ -43,9 +46,9 @@ foreach ($launcher in $launchers) {
 }
 
 for ($attempt = 0; $attempt -lt 20; $attempt++) {
-    $occupied = @(Get-NetTCPConnection -State Listen -LocalPort 18766,4173 -ErrorAction SilentlyContinue)
+    $occupied = @(Get-NetTCPConnection -State Listen -LocalPort 18766,26546 -ErrorAction SilentlyContinue)
     if ($occupied.Count -eq 0) { exit 0 }
     Start-Sleep -Milliseconds 250
 }
 $occupied | Select-Object LocalAddress, LocalPort, OwningProcess | Format-Table | Out-Host
-throw 'Port 18766 or 4173 is still in use. Stop the listed service before starting DevWisp.'
+throw 'Port 18766 or 26546 is still in use. Stop the listed service before starting DevWisp.'

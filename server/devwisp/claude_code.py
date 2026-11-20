@@ -17,9 +17,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from .claude_errors import api_error_message, is_known_persisted_api_error, stream_error_state
 from .browser_payload import browser_item
 from .claude_native_history import scan_native_sessions
 from .claude_stream import ClaudeReplyText
+from .local_usage import ClaudeUsage, LocalUsageStore, track
+from .codex_app_server import WorkspaceSnapshot, snapshot_workspace, workspace_change_entries, workspace_snapshot_changes
 from .permission_prompt import MCP_SERVER_NAME, MCP_TOOL_FULL_NAME, PermissionPromptBroker
 from .terminal_handoff import TerminalHandoffBroker
 
@@ -68,6 +71,8 @@ class _ClaudeTurnInput:
     completed_messages: int = 0
     request_ids: set[str] = field(default_factory=set)
     temporary_directories: list[Path] = field(default_factory=list)
+    workspace: Path | None = None
+    workspace_baseline: WorkspaceSnapshot | None = None
 
 
 def is_claude_thread_id(thread_id: str) -> bool:
@@ -120,6 +125,17 @@ class _ClaudeStartupDiagnostics:
 class ClaudeCodeServer:
     """Owns Claude Code CLI sessions and projects them into DevWisp threads."""
 
+    effort_levels = CLAUDE_EFFORT_LEVELS
+    engine = "claude-code"
+    engine_label = "Claude Code"
+    thread_prefix = CLAUDE_THREAD_PREFIX
+
+    def _is_thread(self, thread_id: str) -> bool:
+        try:
+            return thread_id.startswith(self.thread_prefix) and bool(uuid.UUID(thread_id.removeprefix(self.thread_prefix)))
+        except (ValueError, AttributeError):
+            return False
+
     def __init__(
         self,
         command: str,
@@ -131,6 +147,7 @@ class ClaudeCodeServer:
         self.workspace = workspace.resolve()
         self.database_path = database_path
         self.emit = emit
+        self._usage_store: LocalUsageStore | None = None
         self._lock = asyncio.Lock()
         self._native_refresh_lock = asyncio.Lock()
         self._next_native_scan_at = 0.0
@@ -181,11 +198,49 @@ class ClaudeCodeServer:
         self._connection.execute(
             "CREATE TABLE IF NOT EXISTS claude_native_hidden (session_id TEXT PRIMARY KEY)",
         )
+        self._sanitize_persisted_api_errors()
         self._recover_interrupted_turns()
         self._connection.commit()
 
     def _database_path_parent_ready(self) -> None:
         self.database_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+    def _sanitize_persisted_api_errors(self) -> None:
+        rows = self._connection.execute(
+            "SELECT thread_id, preview, messages_json FROM claude_threads",
+        ).fetchall()
+        for row in rows:
+            try:
+                messages = json.loads(row["messages_json"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(messages, list):
+                continue
+            changed = False
+            preview = row["preview"]
+            for index, message in enumerate(messages):
+                if not isinstance(message, dict) or message.get("role") != "assistant":
+                    continue
+                text = message.get("text")
+                if not isinstance(text, str) or not is_known_persisted_api_error(text):
+                    continue
+                safe_text = api_error_message(
+                    {"result": text, "isApiErrorMessage": True},
+                    allow_text_status=True,
+                )
+                if not safe_text or safe_text == text:
+                    continue
+                message["text"] = safe_text
+                message["status"] = "failed"
+                changed = True
+                old_preview = " ".join(text.split())[:400]
+                if index == len(messages) - 1 or preview == old_preview:
+                    preview = " ".join(safe_text.split())[:400]
+            if changed:
+                self._connection.execute(
+                    "UPDATE claude_threads SET preview = ?, messages_json = ? WHERE thread_id = ?",
+                    (preview, json.dumps(messages, ensure_ascii=False), row["thread_id"]),
+                )
 
     def enable_terminal_handoff(self, broker: TerminalHandoffBroker) -> None:
         self._terminal_handoff = broker
@@ -209,7 +264,7 @@ class ClaudeCodeServer:
             messages.append({
                 "id": f"assistant-{turn_id}",
                 "role": "assistant",
-                "text": "Claude Code 在服务重启时中断了回复，请继续发送消息。",
+                "text": f"{self.engine_label} 在服务重启时中断了回复，请继续发送消息。",
                 "createdAt": _now(),
                 "completedAt": _now(),
                 "turnId": turn_id,
@@ -221,7 +276,7 @@ class ClaudeCodeServer:
             )
 
     async def _notify_threads_changed(self) -> None:
-        await self.emit({"type": "claude.threads.changed"})
+        await self.emit({"type": "threads.changed"})
 
     def _executable(self) -> str | None:
         executable = shutil.which(self.command) if not Path(self.command).is_absolute() else self.command
@@ -246,11 +301,11 @@ class ClaudeCodeServer:
             raise ClaudeThreadNotFoundError("找不到这条 Claude Code 对话。")
         return row
 
-    @staticmethod
-    def _summary(row: sqlite3.Row) -> dict[str, Any]:
+    @classmethod
+    def _summary(cls, row: sqlite3.Row) -> dict[str, Any]:
         return {
             "id": row["thread_id"],
-            "engine": "claude-code",
+            "engine": cls.engine,
             "name": row["name"],
             "preview": row["preview"],
             "cwd": row["cwd"],
@@ -392,8 +447,8 @@ class ClaudeCodeServer:
         workspace = cwd.resolve() if cwd else self.workspace
         if not workspace.is_dir():
             raise ClaudeCodeError("Claude Code 对话的工作目录不可用。")
-        thread_id = f"{CLAUDE_THREAD_PREFIX}{uuid.uuid4()}"
-        session_id = thread_id.removeprefix(CLAUDE_THREAD_PREFIX)
+        thread_id = f"{self.thread_prefix}{uuid.uuid4()}"
+        session_id = thread_id.removeprefix(self.thread_prefix)
         created_at = _now()
         with self._connection:
             self._connection.execute(
@@ -408,7 +463,7 @@ class ClaudeCodeServer:
     async def read_thread(
         self, thread_id: str, *, include_turns: bool = True, tail_turns: int | None = None,
     ) -> dict[str, Any]:
-        if not is_claude_thread_id(thread_id):
+        if not self._is_thread(thread_id):
             raise ClaudeThreadNotFoundError("Claude Code 对话编号无效。")
         # Known sessions are indexed by the thread list refresh. Avoid scanning
         # every native project file again when opening one specific session.
@@ -447,13 +502,14 @@ class ClaudeCodeServer:
 
     async def queue_turn_snapshot(self, thread_id: str) -> dict[str, Any]:
         """Read the latest turn's status without decoding the whole message array."""
-        if not is_claude_thread_id(thread_id):
+        if not self._is_thread(thread_id):
             raise ClaudeThreadNotFoundError("Claude Code 对话编号无效。")
         try:
             row = self._connection.execute(
                 "SELECT thread_id, name, preview, cwd, created_at, updated_at, running_turn_id, "
                 "native_source, native_mtime_ns, "
-                "json_extract(messages_json, '$[#-1]') AS latest_message "
+                + self._queue_snapshot_extra_fields()
+                + "json_extract(messages_json, '$[#-1]') AS latest_message "
                 "FROM claude_threads WHERE thread_id = ?",
                 (thread_id,),
             ).fetchone()
@@ -484,6 +540,9 @@ class ClaudeCodeServer:
             turns[0].pop("completedAt", None)
         result["turns"] = turns
         return result
+
+    def _queue_snapshot_extra_fields(self) -> str:
+        return ""
 
     @staticmethod
     def _turns(messages: Any) -> list[dict[str, Any]]:
@@ -541,7 +600,7 @@ class ClaudeCodeServer:
         return turns
 
     async def rename_thread(self, thread_id: str, name: str) -> dict[str, str]:
-        if not is_claude_thread_id(thread_id):
+        if not self._is_thread(thread_id):
             raise ClaudeThreadNotFoundError("Claude Code 对话编号无效。")
         self._row(thread_id)
         with self._connection:
@@ -553,7 +612,7 @@ class ClaudeCodeServer:
         return {"thread_id": thread_id, "name": name}
 
     async def set_workspace(self, thread_id: str, cwd: Path) -> dict[str, str]:
-        if not is_claude_thread_id(thread_id):
+        if not self._is_thread(thread_id):
             raise ClaudeThreadNotFoundError("Claude Code 对话编号无效。")
         if not cwd.is_dir():
             raise ClaudeCodeError("Claude Code 对话的工作目录不可用。")
@@ -567,7 +626,7 @@ class ClaudeCodeServer:
         return {"thread_id": thread_id, "cwd": str(cwd.resolve())}
 
     async def delete_thread(self, thread_id: str) -> None:
-        if not is_claude_thread_id(thread_id):
+        if not self._is_thread(thread_id):
             raise ClaudeThreadNotFoundError("Claude Code 对话编号无效。")
         row = self._row(thread_id)
         if thread_id in self._tasks:
@@ -588,7 +647,7 @@ class ClaudeCodeServer:
         await self._notify_threads_changed()
 
     async def active_turn_id(self, thread_id: str) -> str | None:
-        if not is_claude_thread_id(thread_id):
+        if not self._is_thread(thread_id):
             return None
         return self._row(thread_id, include_messages=False)["running_turn_id"]
 
@@ -606,14 +665,14 @@ class ClaudeCodeServer:
         effort: str | None = None,
         permission_mode: str | None = None,
     ) -> str:
-        if not is_claude_thread_id(thread_id):
+        if not self._is_thread(thread_id):
             raise ClaudeThreadNotFoundError("Claude Code 对话编号无效。")
         status = self.status()
         if not status["available"]:
             raise ClaudeCodeError(status["error"] or "Claude Code CLI 不可用。")
         if not prompt.strip() and not image_paths and not attachment_paths:
             raise ClaudeCodeError("请填写消息或附加文件。")
-        if effort is not None and effort not in CLAUDE_EFFORT_LEVELS:
+        if effort is not None and effort not in self.effort_levels:
             raise ClaudeCodeError("Claude Code 思考等级无效。")
         if permission_mode is not None and permission_mode not in CLAUDE_PERMISSION_MODES:
             raise ClaudeCodeError("Claude Code 权限模式无效。")
@@ -626,6 +685,15 @@ class ClaudeCodeServer:
                 uuid.UUID(turn_id)
             except ValueError:
                 turn_id = str(uuid.uuid4())
+            workspace = Path(row['cwd']).expanduser().resolve()
+            baseline = None
+            try:
+                baseline = await asyncio.to_thread(
+                    snapshot_workspace, workspace,
+                    exclude_paths=self._workspace_capture_excludes(turn_id, [temporary_directory] if temporary_directory else []),
+                )
+            except Exception:
+                logger.warning('Unable to snapshot %s turn workspace', self.engine, exc_info=True)
             created_at = _now()
             display_text = display_prompt if display_prompt is not None else prompt
             try:
@@ -668,8 +736,11 @@ class ClaudeCodeServer:
                 turn_id=turn_id,
                 request_ids={request_id} if request_id else set(),
                 temporary_directories=[temporary_directory] if temporary_directory is not None else [],
+                workspace=workspace,
+                workspace_baseline=baseline,
             )
             self._turn_inputs[thread_id] = turn_input
+            await track(self._usage_store, "begin", self.engine, thread_id, turn_id, model)
             await self.emit({
                 "type": "notification",
                 "method": "turn/started",
@@ -718,7 +789,7 @@ class ClaudeCodeServer:
         permission_mode: str | None = None,
     ) -> str:
         """Send a message into the active CLI input stream, or start it as the next turn if it just ended."""
-        if not is_claude_thread_id(thread_id):
+        if not self._is_thread(thread_id):
             raise ClaudeThreadNotFoundError("Claude Code 对话编号无效。")
         if not prompt.strip() and not image_paths and not attachment_paths:
             raise ClaudeCodeError("请填写消息或附加文件。")
@@ -853,6 +924,10 @@ class ClaudeCodeServer:
     ) -> None:
         assistant_item_id = f"assistant-{turn_id}"
         assistant_text = ""
+        usage = ClaudeUsage(self._usage_store, thread_id, turn_id, model)
+        pending_assistant_text = ""
+        pending_stream_records: list[dict[str, Any]] = []
+        suppress_api_error_stream = False
         reply_text = ClaudeReplyText()
         tool_items: dict[str, dict[str, Any]] = {}
         result_error: str | None = None
@@ -860,6 +935,37 @@ class ClaudeCodeServer:
         process: asyncio.subprocess.Process | None = None
         exit_task: asyncio.Task[int] | None = None
         line_task: asyncio.Task[bytes] | None = None
+
+        async def consume_reply_record(record: dict[str, Any]) -> None:
+            nonlocal assistant_text
+            next_text = reply_text.consume(record)
+            if next_text == assistant_text:
+                return
+            if next_text.startswith(assistant_text):
+                delta = next_text[len(assistant_text):]
+                if delta:
+                    await self._emit_delta(thread_id, turn_id, assistant_item_id, delta)
+            else:
+                reply = self._live_replies.get(thread_id)
+                if reply and reply["turnId"] == turn_id:
+                    reply["text"] = next_text
+                await self.emit({
+                    "type": "notification", "method": "item/completed",
+                    "params": {"threadId": thread_id, "turnId": turn_id, "item": {
+                        "id": assistant_item_id, "type": "agentMessage", "text": next_text,
+                    }},
+                })
+            assistant_text = next_text
+
+        async def flush_pending_stream() -> None:
+            nonlocal pending_assistant_text
+            if not pending_assistant_text:
+                return
+            for pending_record in pending_stream_records:
+                await consume_reply_record(pending_record)
+            pending_assistant_text = ""
+            pending_stream_records.clear()
+
         diagnostics = _ClaudeStartupDiagnostics()
         diagnostics_task: asyncio.Task[None] | None = None
         turn_input = self._turn_inputs.get(thread_id)
@@ -880,7 +986,7 @@ class ClaudeCodeServer:
                 "--input-format", "stream-json", "--verbose",
             ]
             mcp_servers: dict[str, Any] = {}
-            if self._terminal_handoff and os.name != "nt" and self._terminal_handoff.is_enabled(thread_id):
+            if self._terminal_handoff and self._terminal_handoff.is_enabled(thread_id):
                 context = uuid.uuid4().hex
                 self._terminal_handoff.bind_context(context, thread_id)
                 package_parent = str(Path(__file__).resolve().parent.parent)
@@ -890,7 +996,7 @@ class ClaudeCodeServer:
                     "args": ["-m", "devwisp.terminal_handoff"],
                     "env": {
                         "PYTHONPATH": python_path,
-                        "DEVWISP_TERMINAL_SOCKET": str(self._terminal_handoff.socket_path),
+                        **self._terminal_handoff.mcp_environment(),
                         "DEVWISP_TERMINAL_CONTEXT": context,
                     },
                 }
@@ -1006,21 +1112,7 @@ class ClaudeCodeServer:
                     continue
                 if not isinstance(record, dict):
                     continue
-                next_text = reply_text.consume(record)
-                if next_text != assistant_text:
-                    if next_text.startswith(assistant_text):
-                        await self._emit_delta(thread_id, turn_id, assistant_item_id, next_text[len(assistant_text):])
-                    else:
-                        reply = self._live_replies.get(thread_id)
-                        if reply and reply["turnId"] == turn_id:
-                            reply["text"] = next_text
-                        await self.emit({
-                            "type": "notification", "method": "item/completed",
-                            "params": {"threadId": thread_id, "turnId": turn_id, "item": {
-                                "id": assistant_item_id, "type": "agentMessage", "text": next_text,
-                            }},
-                        })
-                    assistant_text = next_text
+                await usage.observe(record)
                 record_type = record.get("type")
                 if record_type == "system" and record.get("subtype") == "init":
                     received_init = True
@@ -1039,8 +1131,33 @@ class ClaudeCodeServer:
                         logger.warning("Claude Code permission MCP failed for turn %s", turn_id)
                         await self._terminate_process(process)
                         break
+                elif record_type == "stream_event":
+                    event = record.get("event")
+                    delta = event.get("delta") if isinstance(event, dict) else None
+                    text = delta.get("text") if isinstance(delta, dict) and delta.get("type") == "text_delta" else None
+                    if isinstance(text, str) and text:
+                        if suppress_api_error_stream:
+                            continue
+                        pending_stream_records.append(record)
+                        pending_assistant_text += text
+                        if stream_error_state(pending_assistant_text) in {"pending", "holding"}:
+                            continue
+                        await flush_pending_stream()
+                    else:
+                        await consume_reply_record(record)
                 elif record_type == "assistant":
                     message = record.get("message")
+                    api_error = api_error_message(record)
+                    if api_error:
+                        result_error = api_error
+                        suppress_api_error_stream = True
+                        pending_assistant_text = ""
+                        pending_stream_records.clear()
+                    elif pending_assistant_text:
+                        await flush_pending_stream()
+                        await consume_reply_record(record)
+                    else:
+                        await consume_reply_record(record)
                     content = message.get("content") if isinstance(message, dict) else None
                     if isinstance(content, list):
                         for block in content:
@@ -1084,8 +1201,14 @@ class ClaudeCodeServer:
                     received_result = True
                     if record.get("is_error") is True:
                         result_error = "Claude Code 请求未完成，可能与模型服务、登录状态、权限或网络连接有关。"
+                        pending_assistant_text = ""
+                        pending_stream_records.clear()
+                        suppress_api_error_stream = True
                     else:
                         result_error = None
+                        await consume_reply_record(record)
+                    if pending_assistant_text:
+                        await flush_pending_stream()
                     if not record.get("parent_tool_use_id"):
                         async with turn_input.lock:
                             turn_input.completed_messages += 1
@@ -1094,6 +1217,8 @@ class ClaudeCodeServer:
                                 await self._close_stream_input(process)
 
             return_code = await exit_task
+            if pending_assistant_text and not suppress_api_error_stream:
+                await flush_pending_stream()
             if return_code != 0 and not received_init and diagnostics_task is not None:
                 with suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(asyncio.shield(diagnostics_task), CLAUDE_DRAIN_GRACE_SECONDS)
@@ -1155,10 +1280,11 @@ class ClaudeCodeServer:
                 shutil.rmtree(directory, ignore_errors=True)
             status = "stopped" if thread_id in self._interrupts else "failed" if result_error else "completed"
             final_text = assistant_text
-            if result_error and not final_text:
-                final_text = result_error
+            if result_error:
+                error_suffix = result_error if not final_text else f"\n\n{result_error}"
+                final_text += error_suffix
                 with suppress(Exception):
-                    await self._emit_delta(thread_id, turn_id, assistant_item_id, final_text)
+                    await self._emit_delta(thread_id, turn_id, assistant_item_id, error_suffix)
             with suppress(Exception):
                 await self._finish_turn(
                     thread_id, turn_id, assistant_item_id, final_text, completed_at, status, model, effort,
@@ -1214,6 +1340,60 @@ class ClaudeCodeServer:
             "params": {"threadId": thread_id, "turnId": turn_id, "itemId": item_id, "delta": delta},
         })
 
+    def _workspace_capture_excludes(self, turn_id: str, temporary_directories: list[Path]) -> tuple[Path, ...]:
+        # Runtime journals, credential-bearing patches and SDK state are not
+        # project edits, even when a user places the data directory in the cwd.
+        paths = [self.database_path, *(Path(f'{self.database_path}{suffix}')
+                                      for suffix in ('-journal', '-wal', '-shm'))]
+        paths.extend(path for name in ('_native_home', 'home', 'settings_path')
+                     if isinstance(path := getattr(self, name, None), Path))
+        if self._usage_store is not None:
+            paths.extend([self._usage_store.path, *(Path(f"{self._usage_store.path}{suffix}") for suffix in ("-wal", "-shm", "-journal"))])
+        paths.extend(temporary_directories)
+        paths.extend(directory / f'harness-stream-{turn_id}.json'
+                     for directory in (self.database_path.parent, *temporary_directories))
+        return tuple(paths)
+
+    async def _complete_workspace_changes(self, thread_id: str, turn_id: str) -> None:
+        turn_input = self._turn_inputs.get(thread_id)
+        if not turn_input or turn_input.turn_id != turn_id or turn_input.workspace_baseline is None:
+            return
+        baseline = turn_input.workspace_baseline
+        turn_input.workspace_baseline = None
+        workspace = turn_input.workspace
+        if workspace is None:
+            return
+
+        def collect() -> list[dict[str, Any]]:
+            after = snapshot_workspace(workspace, exclude_paths=self._workspace_capture_excludes(
+                turn_id, turn_input.temporary_directories))
+            return workspace_change_entries(workspace_snapshot_changes(baseline, after), workspace, baseline, after)
+
+        try:
+            capture_task = asyncio.create_task(asyncio.to_thread(collect))
+            while True:
+                try:
+                    changes = await asyncio.shield(capture_task)
+                    break
+                except asyncio.CancelledError:
+                    if capture_task.cancelled():
+                        raise
+                    # The engine has already finished. A late/repeated stop
+                    # must not abandon its bounded final scan and leave the
+                    # thread permanently marked as running in the journal.
+                    continue
+            if not changes:
+                return
+            item = {'id': f'workspace-change-{turn_id}', 'type': 'fileChange',
+                    'status': 'completed', 'changes': changes}
+            self._save_terminal_tool_item(thread_id, turn_id, item)
+            await self.emit({'type': 'notification', 'method': 'item/completed', 'params': {
+                'threadId': thread_id, 'turnId': turn_id, 'item': item}})
+        except Exception:
+            # File summaries are supplementary; a failed scan must never turn
+            # a successful reply into a failed or permanently running turn.
+            logger.warning('Unable to collect %s workspace changes', self.engine, exc_info=True)
+
     async def _finish_turn(
         self,
         thread_id: str,
@@ -1226,6 +1406,8 @@ class ClaudeCodeServer:
         effort: str | None,
         error: str | None = None,
     ) -> None:
+        await track(self._usage_store, "finish", self.engine, thread_id, turn_id, status)
+        await self._complete_workspace_changes(thread_id, turn_id)
         row = self._row(thread_id)
         try:
             messages = json.loads(row["messages_json"])

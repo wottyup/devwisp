@@ -214,7 +214,7 @@ export function NativeEngineConfigCard({ token, engine, onDirtyChange }: {
           <button type="button" className="theme-notification-toggle" disabled={disabled || !selected || profileId === config?.activeProfileId} onClick={() => { void remove() }} title={profileId === config?.activeProfileId ? ui('先应用另一套配置，再删除当前配置') : ui('删除此配置')}><Trash2 size={15} />{ui("删除")}</button>
         </div>
       </div>
-      {config ? <p className="native-config__current">{ui("当前使用：")}<strong>{active?.name ?? ui('本机配置（与已保存配置不同）')}</strong><span>{ui("选择配置用于编辑，点击“保存并应用”才会切换。")}</span></p> : null}
+      <p className="native-config__current" aria-hidden={!config}>{ui("当前使用：")}<strong>{config ? active?.name ?? ui('本机配置（与已保存配置不同）') : null}</strong><span>{ui("选择配置用于编辑，点击“保存并应用”才会切换。")}</span></p>
       <form ref={formRef} className="native-config__form" onSubmit={(event) => { void save(event) }}>
         <label className="native-config__field"><span>{ui("配置名称")}</span><input value={draft.name} onChange={(event) => edit({ name: event.target.value })} placeholder={ui("例如：日常使用、备用接口")} maxLength={80} required disabled={disabled} /></label>
         <section className="native-config__group" aria-label={ui("接口配置")}>

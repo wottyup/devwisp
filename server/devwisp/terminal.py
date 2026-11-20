@@ -5,9 +5,11 @@ import errno
 import hashlib
 import logging
 import os
+import secrets
 import shutil
 import signal
 import struct
+import subprocess
 import time
 from contextlib import suppress
 from pathlib import Path
@@ -36,24 +38,24 @@ async def _run_tmux(*arguments: str, check: bool = True) -> str:
         raise RuntimeError("本机未安装 tmux，无法保留终端会话。请安装 tmux 后重启 DevWisp。")
     environment = os.environ.copy()
     environment.pop("TMUX", None)
-    process = await asyncio.create_subprocess_exec(
-        executable,
-        "-L",
-        TMUX_SOCKET_NAME,
-        *arguments,
-        env=environment,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    # uvloop uses socket pairs for subprocess PIPEs. A cold-started tmux
+    # daemon keeps those open after its client exits, so communicate() never
+    # sees EOF. Use ordinary subprocess pipes off the event-loop thread.
     try:
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=5)
-    except TimeoutError:
-        process.kill()
-        await process.wait()
-        raise RuntimeError("tmux 命令超时。")
-    output = stdout.decode("utf-8", errors="replace")
-    if check and process.returncode != 0:
-        detail = stderr.decode("utf-8", errors="replace").strip()
+        result = await asyncio.to_thread(
+            subprocess.run,
+            [executable, "-L", TMUX_SOCKET_NAME, *arguments],
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=5,
+        )
+    except subprocess.TimeoutExpired as error:
+        # run() kills and reaps its own client before raising.
+        raise RuntimeError("tmux 命令超时。") from error
+    output = result.stdout.decode("utf-8", errors="replace")
+    if check and result.returncode != 0:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
         raise RuntimeError(detail or "tmux 命令执行失败。")
     return output
 
@@ -137,6 +139,9 @@ class TerminalSession:
         self._master_fd: int | None = None
         self._process: asyncio.subprocess.Process | None = None
         self._windows_process: object | None = None
+        self._handoff_id = secrets.token_hex(16)
+        self._screen: object | None = None
+        self._screen_stream: object | None = None
         self._closed = False
 
     @staticmethod
@@ -206,24 +211,29 @@ class TerminalSession:
                 if not executable:
                     raise RuntimeError("本机未安装 tmux，无法保留终端会话。请安装 tmux 后重启 DevWisp。")
                 environment.pop("TMUX", None)
-                argv = [
-                    executable,
-                    "-L",
-                    TMUX_SOCKET_NAME,
-                    "-u",
-                    "new-session",
-                    "-A",
-                    "-s",
-                    self.tmux_session_name,
-                    "-c",
-                    str(self.cwd),
-                    "-x",
-                    str(self.columns),
-                    "-y",
-                    str(self.rows),
-                ]
-                with suppress(OSError, RuntimeError):
-                    await _set_tmux_last_used(self.tmux_session_name)
+                # Cold starts have no socket yet. Await detached creation/reuse
+                # before any configuration client or browser attachment races it.
+                try:
+                    await _run_tmux(
+                        '-u', 'new-session', '-d', '-s', self.tmux_session_name,
+                        '-c', str(self.cwd), '-x', str(self.columns), '-y', str(self.rows),
+                    )
+                except RuntimeError as creation_error:
+                    # new-session -Ad tries to attach on tmux 3.4 when the
+                    # session exists, which requires a TTY. Reuse it explicitly.
+                    try:
+                        await _run_tmux('has-session', '-t', f'={self.tmux_session_name}')
+                    except RuntimeError:
+                        raise creation_error
+
+                await _run_tmux(
+                    'set-window-option', '-t', self.tmux_session_name,
+                    'history-limit', str(TMUX_HISTORY_LIMIT),
+                )
+                await _run_tmux('set-option', '-t', self.tmux_session_name, 'mouse', 'on')
+                await _set_tmux_last_used(self.tmux_session_name)
+                argv = [executable, '-L', TMUX_SOCKET_NAME, '-u',
+                        'attach-session', '-t', f'={self.tmux_session_name}']
             else:
                 argv = self.argv
             self._process = await asyncio.create_subprocess_exec(
@@ -235,19 +245,9 @@ class TerminalSession:
                 stderr=slave_fd,
                 start_new_session=True,
             )
-            if self.tmux_session_name:
-                await _run_tmux(
-                    "set-window-option",
-                    "-t",
-                    self.tmux_session_name,
-                    "history-limit",
-                    str(TMUX_HISTORY_LIMIT),
-                )
-                await _run_tmux("set-option", "-t", self.tmux_session_name, "mouse", "on")
-                await _set_tmux_last_used(self.tmux_session_name)
-                if self.compact_prompt:
-                    with suppress(OSError, RuntimeError, ValueError):
-                        await self._compact_bash_prompt_if_idle()
+            if self.tmux_session_name and self.compact_prompt:
+                with suppress(OSError, RuntimeError, ValueError):
+                    await self._compact_bash_prompt_if_idle()
         except Exception:
             if self._process is not None and self._process.returncode is None:
                 self._process.kill()
@@ -289,8 +289,12 @@ class TerminalSession:
     async def _start_windows(self) -> None:
         try:
             from winpty import PtyProcess
+            import pyte
         except ImportError as error:
-            raise RuntimeError("Windows 本机终端依赖 pywinpty，请重新安装 server/requirements.txt。") from error
+            raise RuntimeError("Windows 本机终端依赖 pywinpty 和 pyte，请重新安装 server/requirements.txt。") from error
+
+        self._screen = pyte.Screen(self.columns, self.rows)
+        self._screen_stream = pyte.Stream(self._screen)
 
         # pywinpty's native blocking reader can hold the GIL when the
         # terminal has no output, preventing unrelated API requests.
@@ -317,6 +321,8 @@ class TerminalSession:
                     # pywinpty inserts this sentinel on each empty native read.
                     output = output.replace("0011Ignore", "")
                 if output:
+                    if self._screen_stream is not None:
+                        self._screen_stream.feed(output if isinstance(output, str) else output.decode('utf-8', errors='replace'))
                     return output.encode("utf-8", errors="replace") if isinstance(output, str) else bytes(output)
                 # Non-blocking pywinpty reads return an empty string while the
                 # shell is idle. That is not an end-of-session signal.
@@ -352,11 +358,52 @@ class TerminalSession:
 
             await asyncio.to_thread(write_all)
 
+    @property
+    def handoff_available(self) -> bool:
+        return self.persistent or self._windows_process is not None and not self._closed
+
+    async def capture_screen(self) -> str:
+        if self._closed or self._screen is None:
+            raise RuntimeError("终端已断开，请重新打开后再交给 AI。")
+        return '\n'.join(line.rstrip() for line in self._screen.display).rstrip()
+
+    async def handoff_identity(self) -> tuple[str, int] | None:
+        """Bind grants to this PTY and its local shell or exact SSH process.
+
+        Do not inspect command lines or collect typed credentials. A shell-to-SSH
+        transition and SSH exit produce different identities and revoke grants.
+        """
+        process = self._windows_process
+        if self._closed or process is None:
+            return None
+
+        def inspect() -> tuple[str, int] | None:
+            import psutil
+            try:
+                root = psutil.Process(process.pid)
+                if not root.is_running():
+                    return None
+                ssh = [child for child in root.children(recursive=True)
+                       if child.is_running() and child.name().lower() in {'ssh', 'ssh.exe'}]
+                if len(ssh) > 1:
+                    raise RuntimeError("终端中存在多个 SSH 进程，无法安全确认接管目标。")
+                target = ssh[0] if ssh else root
+                scope = 'ssh' if ssh else 'local'
+                return (f'{self._handoff_id}:{scope}:{target.create_time()}', target.pid)
+            except psutil.NoSuchProcess:
+                return None
+            except psutil.AccessDenied as error:
+                raise RuntimeError("无法确认终端进程身份，本次未执行操作。") from error
+
+        return await asyncio.to_thread(inspect)
+
     async def resize(self, columns: int, rows: int) -> None:
         if self._closed:
             return
         self.columns = self._bounded_dimension(columns, self.columns, 20, 300)
         self.rows = self._bounded_dimension(rows, self.rows, 5, 120)
+        if self._screen is not None:
+            self._screen.resize(lines=self.rows, columns=self.columns)
         if self._windows_process is not None:
             await asyncio.to_thread(self._windows_process.setwinsize, self.rows, self.columns)  # type: ignore[attr-defined]
             return
@@ -379,8 +426,9 @@ class TerminalSession:
         if self._windows_process is not None:
             process = self._windows_process
             try:
-                if await asyncio.to_thread(process.isalive):  # type: ignore[attr-defined]
-                    await asyncio.to_thread(process.terminate, force=True)  # type: ignore[attr-defined]
+                # terminate() marks PtyProcess.closed without closing its socket
+                # pair; close(force=True) handles both resources and the child.
+                await asyncio.to_thread(process.close, force=True)  # type: ignore[attr-defined]
             except (OSError, RuntimeError, ValueError):
                 pass
             self._windows_process = None

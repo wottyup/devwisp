@@ -16,6 +16,10 @@ class TerminalHandoffTests(unittest.IsolatedAsyncioTestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.broker = TerminalHandoffBroker(Path(self.directory.name) / "terminal.sock")
+        # These tests exercise the tmux backend, even on a Windows host.
+        platform_patch = patch('devwisp.terminal_handoff.os.name', 'posix')
+        platform_patch.start()
+        self.addCleanup(platform_patch.stop)
         self.thread = "sample-thread"
         self.context = "sample-context"
         self.broker.bind_context(self.context, self.thread)

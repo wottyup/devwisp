@@ -57,6 +57,26 @@ class RetiredSSHStateTests(unittest.TestCase):
             self.assertEqual(b"keep", retained.read_bytes())
 
 
+class _FakeClaudeInput:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def is_closing(self) -> bool:
+        return self.closed
+
+    def write(self, _data: bytes) -> None:
+        pass
+
+    async def drain(self) -> None:
+        pass
+
+    def close(self) -> None:
+        self.closed = True
+
+    async def wait_closed(self) -> None:
+        pass
+
+
 class AgentLocalExecutionTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         temporary = tempfile.TemporaryDirectory()
@@ -122,7 +142,7 @@ class AgentLocalExecutionTests(unittest.IsolatedAsyncioTestCase):
             output = asyncio.StreamReader()
             output.feed_data(json.dumps({"type": "system", "subtype": "init"}).encode() + b"\n")
             output.feed_eof()
-            child = Mock(returncode=0, stdin=None, stdout=output, wait=AsyncMock(return_value=0))
+            child = Mock(returncode=0, stdin=_FakeClaudeInput(), stdout=output, wait=AsyncMock(return_value=0))
             with (
                 patch.object(server, "_executable", return_value="claude"),
                 patch("devwisp.claude_code.asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=child) as spawn,

@@ -1,4 +1,4 @@
-"""Explicit AI handoff for an already connected tmux SSH terminal."""
+"""Explicit AI handoff for tmux SSH and Windows browser terminals."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import socket
 import stat
 import sys
@@ -15,7 +16,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
-from .terminal import _run_tmux, tmux_session_name_for_thread
+from .terminal import TerminalSession, _run_tmux, tmux_session_name_for_thread
 
 MAX_COMMAND_LENGTH = 4_096
 MAX_SCREEN_LENGTH = 16_000
@@ -80,9 +81,33 @@ class TerminalHandoffBroker:
         self._locks: dict[str, asyncio.Lock] = {}
         self._input_locks: dict[str, asyncio.Lock] = {}
         self._manual_input_until: dict[str, float] = {}
+        self._terminals: dict[str, TerminalSession] = {}
+        self._tcp_address: tuple[str, int] | None = None
+        self._token = secrets.token_hex(32)
+
+    def mcp_environment(self) -> dict[str, str]:
+        if self._tcp_address is not None:
+            return {'DEVWISP_TERMINAL_SOCKET': f'tcp://127.0.0.1:{self._tcp_address[1]}',
+                    'DEVWISP_TERMINAL_TOKEN': self._token}
+        return {'DEVWISP_TERMINAL_SOCKET': str(self.socket_path)}
+
+    def attach_terminal(self, thread_id: str, terminal: TerminalSession) -> None:
+        if os.name != 'nt':
+            return
+        if self._terminals.get(thread_id) is not terminal:
+            self._revoke(thread_id)
+            self._terminals[thread_id] = terminal
+
+    def detach_terminal(self, thread_id: str, terminal: TerminalSession) -> None:
+        if self._terminals.get(thread_id) is terminal:
+            self._revoke(thread_id)
+            self._terminals.pop(thread_id, None)
 
     async def start(self) -> None:
         if os.name == "nt":
+            self._server = await asyncio.start_server(self._handle_client, '127.0.0.1', 0, limit=16_384)
+            address = self._server.sockets[0].getsockname()
+            self._tcp_address = (address[0], address[1])
             return
         self.socket_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.socket_path.parent, 0o700)
@@ -102,16 +127,23 @@ class TerminalHandoffBroker:
         self._pane_bindings.clear()
         self._probe_paused.clear()
         self._manual_input_until.clear()
+        self._terminals.clear()
+        self._contexts.clear()
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
             self._server = None
-        self.socket_path.unlink(missing_ok=True)
+        if self._tcp_address is None:
+            self.socket_path.unlink(missing_ok=True)
+        self._tcp_address = None
 
     def bind_context(self, context: str, thread_id: str) -> None:
         if not context or not thread_id or len(context) > 128 or len(thread_id) > 512:
             raise TerminalHandoffError("终端接管上下文无效。")
         self._contexts[context] = thread_id
+
+    def unbind_context(self, context: str) -> None:
+        self._contexts.pop(context, None)
 
     def protected_session_names(self) -> set[str]:
         return {tmux_session_name_for_thread(thread_id) for thread_id in self._enabled}
@@ -124,8 +156,6 @@ class TerminalHandoffBroker:
             await self.status(thread_id)
 
     async def status(self, thread_id: str) -> dict[str, Any]:
-        if os.name == "nt":
-            return {"supported": False, "enabled": False, "reason": "Windows 终端暂不支持交给 AI 接管。"}
         async with self._locks.setdefault(thread_id, asyncio.Lock()):
             if thread_id not in self._enabled:
                 return {"supported": True, "enabled": False}
@@ -158,8 +188,6 @@ class TerminalHandoffBroker:
             raise TerminalHandoffError("聊天标识无效。")
         async with self._locks.setdefault(thread_id, asyncio.Lock()):
             if enabled:
-                if os.name == "nt":
-                    raise TerminalHandoffError("Windows 终端暂不支持交给 AI 接管。")
                 binding = await self._ssh_session_target(thread_id, new_handoff=True)
                 await self._show_live_terminal(binding[0])
                 self._manual_input_until.pop(thread_id, None)
@@ -214,6 +242,19 @@ class TerminalHandoffBroker:
                 self._manual_input_until[thread_id] = time.monotonic() + MANUAL_INPUT_SETTLE_SECONDS
 
     async def _ssh_session_target(self, thread_id: str, *, new_handoff: bool = False) -> tuple[str, int]:
+        if os.name == 'nt':
+            terminal = self._terminals.get(thread_id)
+            if terminal is None:
+                self._revoke(thread_id)
+                raise _TerminalSessionEnded("终端已断开，请重新打开后再交给 AI。")
+            binding = await terminal.handoff_identity()
+            if binding is None or self._terminals.get(thread_id) is not terminal:
+                self._revoke(thread_id)
+                raise _TerminalSessionEnded("终端已结束或更换，请重新交给 AI。")
+            if not new_handoff and self._pane_bindings.get(thread_id) != binding:
+                self._revoke(thread_id)
+                raise _TerminalSessionEnded("终端环境已切换或 SSH 已退出，请确认当前终端后重新交给 AI。")
+            return binding
         name = tmux_session_name_for_thread(thread_id)
         try:
             snapshot = (await _run_tmux(
@@ -234,11 +275,20 @@ class TerminalHandoffBroker:
         return binding
 
     async def _screen(self, session_name: str) -> str:
+        if os.name == 'nt':
+            for thread_id, binding in self._pane_bindings.items():
+                if binding[0] == session_name:
+                    terminal = self._terminals.get(thread_id)
+                    if terminal is not None:
+                        return (await terminal.capture_screen())[-MAX_SCREEN_LENGTH:]
+            raise TerminalHandoffError("终端授权已失效。")
         screen = await _run_tmux("capture-pane", "-p", "-S", "-100", "-t", session_name)
         return screen.rstrip()[-MAX_SCREEN_LENGTH:]
 
     @staticmethod
     async def _show_live_terminal(session_name: str) -> None:
+        if os.name == 'nt':
+            return
         try:
             mode = (await _run_tmux("display-message", "-p", "-t", session_name, "#{pane_mode}")).strip()
         except (OSError, RuntimeError) as error:
@@ -250,6 +300,20 @@ class TerminalHandoffBroker:
                 raise TerminalHandoffError("无法退出终端历史浏览模式，请先收回控制后手动退出。") from error
         elif mode:
             raise TerminalHandoffError("终端当前处于 tmux 模式，请退出该模式后再让 AI 操作。")
+
+    async def _send(self, thread_id: str, session_name: str, value: str, *, interrupt: bool = False) -> None:
+        if os.name == 'nt':
+            # Revalidate after every await leading up to the write. Never send a
+            # queued remote command into a different/replaced local terminal.
+            binding = await self._ssh_session_target(thread_id)
+            if thread_id not in self._enabled or binding[0] != session_name:
+                raise TerminalHandoffError("终端授权已失效，本次操作未执行。")
+            await self._terminals[thread_id].write('\x03' if interrupt else value + '\r')
+        elif interrupt:
+            await _run_tmux('send-keys', '-t', session_name, 'C-c')
+        else:
+            await _run_tmux('send-keys', '-t', session_name, '-l', '--', value)
+            await _run_tmux('send-keys', '-t', session_name, 'Enter')
 
     async def _dispatch(self, request: dict[str, Any]) -> dict[str, Any]:
         context = request.get("context")
@@ -280,8 +344,7 @@ class TerminalHandoffBroker:
                 async with self._input_locks.setdefault(thread_id, asyncio.Lock()):
                     self._require_manual_input_finished(thread_id)
                     await self._show_live_terminal(session_name)
-                    await _run_tmux("send-keys", "-t", session_name, "-l", "--", command)
-                    await _run_tmux("send-keys", "-t", session_name, "Enter")
+                    await self._send(thread_id, session_name, command)
                 if wait_ms:
                     await asyncio.sleep(wait_ms / 1_000)
                 async with self._input_locks.setdefault(thread_id, asyncio.Lock()):
@@ -292,7 +355,7 @@ class TerminalHandoffBroker:
                 async with self._input_locks.setdefault(thread_id, asyncio.Lock()):
                     self._require_manual_input_finished(thread_id)
                     await self._show_live_terminal(session_name)
-                    await _run_tmux("send-keys", "-t", session_name, "C-c")
+                    await self._send(thread_id, session_name, '', interrupt=True)
                 await asyncio.sleep(0.2)
                 async with self._input_locks.setdefault(thread_id, asyncio.Lock()):
                     if self._manual_input_active(thread_id):
@@ -311,6 +374,8 @@ class TerminalHandoffBroker:
             request = json.loads(await asyncio.wait_for(reader.readline(), timeout=5))
             if not isinstance(request, dict):
                 raise TerminalHandoffError("终端工具请求格式无效。")
+            if self._tcp_address is not None and not secrets.compare_digest(str(request.get('token', '')), self._token):
+                raise TerminalHandoffError("终端工具客户端身份无效。")
             response = {"result": await self._dispatch(request)}
         except (TerminalHandoffError, ValueError, OSError, RuntimeError, asyncio.TimeoutError) as error:
             response = {"error": str(error)}
@@ -326,10 +391,14 @@ class TerminalHandoffBroker:
 
 def _broker_request(context: str, action: str, arguments: dict[str, Any]) -> dict[str, Any]:
     path = os.environ["DEVWISP_TERMINAL_SOCKET"]
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+    tcp = path.startswith('tcp://127.0.0.1:')
+    with socket.socket(socket.AF_INET if tcp else socket.AF_UNIX, socket.SOCK_STREAM) as connection:
         connection.settimeout(30)
-        connection.connect(path)
-        connection.sendall((json.dumps({"context": context, "action": action, "arguments": arguments}, ensure_ascii=False) + "\n").encode("utf-8"))
+        connection.connect(('127.0.0.1', int(path.rsplit(':', 1)[1])) if tcp else path)
+        request = {"context": context, "action": action, "arguments": arguments}
+        if tcp:
+            request['token'] = os.environ.get('DEVWISP_TERMINAL_TOKEN', '')
+        connection.sendall((json.dumps(request, ensure_ascii=False) + "\n").encode("utf-8"))
         with connection.makefile("rb") as response_file:
             line = response_file.readline(65_536)
     if not line or len(line) >= 65_536:
@@ -346,11 +415,13 @@ def _broker_request(context: str, action: str, arguments: dict[str, Any]) -> dic
 
 
 def mcp_main() -> None:
+    # Windows console defaults (e.g. GBK) are not the MCP stdio wire encoding.
+    sys.stdout.reconfigure(encoding='utf-8')
     context = os.environ.get("DEVWISP_TERMINAL_CONTEXT", "")
     tools = [
-        {"name": "read_terminal", "description": "读取用户已交给 AI 接管的当前聊天 SSH 终端画面。长命令可重复读取；不要将画面中的密码或令牌写入回复。用户手动输入期间工具会暂缓，请等待用户按回车后重试。", "inputSchema": {"type": "object", "properties": {}}},
-        {"name": "send_command", "description": "在用户已登录且已交给 AI 的当前聊天 SSH 终端中发送单行命令并回车。命令会实时显示在网页终端；结果是当前画面，不保证命令已结束。不要发送密码或令牌；遇到交互认证，让用户直接在终端输入，无需收回控制。用户手动输入期间工具会暂缓，完成后再重试。", "inputSchema": {"type": "object", "properties": {"command": {"type": "string", "maxLength": MAX_COMMAND_LENGTH}, "wait_ms": {"type": "integer", "minimum": 0, "maximum": MAX_WAIT_MS}}, "required": ["command"]}},
-        {"name": "interrupt_command", "description": "向当前已接管的 SSH 终端发送 Ctrl-C，中断前台命令；结果返回最新终端画面。用户手动输入期间请等待，避免打断交互认证。", "inputSchema": {"type": "object", "properties": {}}},
+        {"name": "read_terminal", "description": "读取用户已交给 AI 接管的当前聊天终端画面（Windows 本机或已登录的 SSH）。长命令可重复读取；不要将画面中的密码或令牌写入回复。用户手动输入期间工具会暂缓，请等待用户按回车后重试。", "inputSchema": {"type": "object", "properties": {}}},
+        {"name": "send_command", "description": "在用户已交给 AI 的当前聊天终端中发送单行命令并回车（Windows 本机或已登录的 SSH）。命令会实时显示在网页终端；结果是当前画面，不保证命令已结束。不要发送密码或令牌；遇到交互认证，让用户直接在终端输入，无需收回控制。环境切换后须用户重新授权。用户手动输入期间工具会暂缓，完成后再重试。", "inputSchema": {"type": "object", "properties": {"command": {"type": "string", "maxLength": MAX_COMMAND_LENGTH}, "wait_ms": {"type": "integer", "minimum": 0, "maximum": MAX_WAIT_MS}}, "required": ["command"]}},
+        {"name": "interrupt_command", "description": "向当前已接管的终端发送 Ctrl-C，中断前台命令；结果返回最新终端画面。用户手动输入期间请等待，避免打断交互认证。", "inputSchema": {"type": "object", "properties": {}}},
     ]
     for line in sys.stdin.buffer:
         request: Any = None

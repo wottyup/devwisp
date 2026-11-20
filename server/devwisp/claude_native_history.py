@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .claude_errors import api_error_message
+
 
 def _timestamp(value: Any, fallback: str) -> str:
     if isinstance(value, str):
@@ -66,6 +68,9 @@ def read_native_session(path: Path, fallback_cwd: Path) -> dict[str, Any] | None
                 if not isinstance(message, dict):
                     continue
                 text = _plain_text(message.get("content"))
+                api_error = api_error_message(entry) if role == "assistant" else None
+                if api_error:
+                    text = api_error
                 if not text:
                     continue
                 timestamp = _timestamp(entry.get("timestamp"), fallback_time)
@@ -95,11 +100,13 @@ def read_native_session(path: Path, fallback_cwd: Path) -> dict[str, Any] | None
                         elif not old_text.startswith(text) and text not in old_text:
                             existing["text"] = f"{old_text}\n\n{text}"
                         existing["completedAt"] = timestamp
+                        if api_error:
+                            existing["status"] = "failed"
                     else:
                         assistant = {
                             "id": f"assistant-{entry.get('uuid') or len(messages)}", "role": "assistant",
                             "text": text, "createdAt": timestamp, "completedAt": timestamp,
-                            "turnId": current_turn_id, "status": "completed",
+                            "turnId": current_turn_id, "status": "failed" if api_error else "completed",
                         }
                         messages.append(assistant)
                         assistant_by_key[key] = assistant

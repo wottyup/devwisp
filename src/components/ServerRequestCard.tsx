@@ -1,5 +1,7 @@
+import { QuestionFields } from './QuestionFields'
+import { QuestionAnswerImages, useQuestionAnswerImages } from './QuestionAnswerImages'
 import { ui, useUiLanguage } from '../lib/uiLanguage'
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { AlertTriangle, Check, X } from 'lucide-react'
 import type { MCPApprovalScope } from '../lib/devwispClient'
 
@@ -14,6 +16,7 @@ interface ServerRequest {
 }
 
 interface Props {
+  token: string
   request: ServerRequest
   source: string | null
   sourceIsCurrent: boolean
@@ -58,50 +61,62 @@ function toolQuestions(value: unknown): ToolQuestion[] {
   })
 }
 
-function ToolQuestionFields({ questions, onRespond }: { questions: ToolQuestion[]; onRespond: Props['onRespond'] }) {
+function ToolQuestionFields({ token, questions, onRespond }: { token: string; questions: ToolQuestion[]; onRespond: Props['onRespond'] }) {
   useUiLanguage()
   const [selected, setSelected] = useState<Record<string, string>>({})
   const [custom, setCustom] = useState<Record<string, string>>({})
+  const images = useQuestionAnswerImages()
+  const [sending, setSending] = useState(false)
+  const inFlight = useRef(false)
+  const [error, setError] = useState('')
   const complete = questions.length > 0 && questions.every((question) => {
     const answer = selected[question.id]
-    return answer && (answer !== otherChoice || Boolean(custom[question.id]?.trim()))
+    return !question.options.length ? Boolean(custom[question.id]?.trim() || images.has(question.id))
+      : answer && (answer !== otherChoice || Boolean(custom[question.id]?.trim() || images.has(question.id)))
   })
 
-  const submit = () => {
-    if (!complete) return
-    const answers = Object.fromEntries(questions.map((question) => [question.id, {
-      answers: [selected[question.id] === otherChoice ? custom[question.id].trim() : selected[question.id]],
-    }]))
-    onRespond({ answers })
+  const submit = async () => {
+    if (!complete || images.isBusy() || inFlight.current) return
+    inFlight.current = true
+    setSending(true)
+    setError('')
+    try {
+      const answers = Object.fromEntries(await Promise.all(questions.map(async (question) => [question.id, {
+        answers: [selected[question.id] === otherChoice || !question.options.length
+          ? await images.withReferences(token, question.id, custom[question.id] ?? '') : selected[question.id]],
+      }])))
+      if (!onRespond({ answers })) setError(ui('回答没有送达，请重试。'))
+    } catch (reason) { setError(reason instanceof Error ? reason.message : ui('回答没有送达，请重试。')) }
+    finally { inFlight.current = false; setSending(false) }
   }
 
   return <>
-    {questions.length ? questions.map((question) => <fieldset className="approval-card__question" key={question.id}>
-      <legend>{question.header || ui('请选择')}</legend>
-      <p>{question.question}</p>
-      {question.options.length ? question.options.map((option) => <label className="approval-card__option" key={option.label}>
-        <input type="radio" name={`approval-${question.id}`} checked={selected[question.id] === option.label} onChange={() => setSelected((current) => ({ ...current, [question.id]: option.label }))} />
-        <span><strong>{option.label}</strong>{option.description ? <small>{option.description}</small> : null}</span>
-      </label>) : null}
-      {question.isOther && question.options.length ? <label className="approval-card__option">
-        <input type="radio" name={`approval-${question.id}`} checked={selected[question.id] === otherChoice} onChange={() => setSelected((current) => ({ ...current, [question.id]: otherChoice }))} />
-        <span><strong>{ui("其他")}</strong></span>
-      </label> : null}
-      {(question.isOther && selected[question.id] === otherChoice) || !question.options.length ? <input
-        className="approval-card__input"
+    {questions.length ? questions.map((question) => <QuestionFields key={question.id} title={question.header || ui('请选择')}
+      disabled={sending || images.busy}
+      description={question.question}
+      options={[...question.options.map((option) => ({ value: option.label, ...option })),
+        ...(question.isOther && question.options.length ? [{ value: otherChoice, label: ui('其他') }] : [])]}
+      selected={selected[question.id] ? [selected[question.id]] : []}
+      onToggle={(value) => setSelected((current) => ({ ...current, [question.id]: current[question.id] === value ? '' : value }))}>
+      {(question.isOther && selected[question.id] === otherChoice) || !question.options.length ? <><input
+        className="message-choices__custom"
         type={question.isSecret ? 'password' : 'text'}
         aria-label={question.question}
         value={custom[question.id] ?? ''}
+        disabled={sending || images.busy}
+        onPaste={question.isSecret ? undefined : (event) => images.paste(question.id, event)}
         onChange={(event) => {
           const value = event.target.value
           setCustom((current) => ({ ...current, [question.id]: value }))
           if (!question.options.length) setSelected((current) => ({ ...current, [question.id]: otherChoice }))
         }}
-      /> : null}
-    </fieldset>) : <p>{ui("工具问题格式无法显示，可以取消这次请求。")}</p>}
-    <div className="approval-card__actions">
-      <button type="button" onClick={() => onRespond({ answers: {} })}><X size={14} />{ui("取消")}</button>
-      <button className="approval-card__accept" type="button" disabled={!complete} onClick={submit}><Check size={14} />{ui("提交答复")}</button>
+      /><QuestionAnswerImages images={images.get(question.id)} disabled={sending || images.busy} onRemove={(index) => images.remove(question.id, index)} />
+      {!question.isSecret ? <small className="message-choices__custom-hint">{ui('支持粘贴图片')}</small> : null}</> : null}
+    </QuestionFields>) : <p>{ui("工具问题格式无法显示，可以取消这次请求。")}</p>}
+    {error || images.error ? <p role="alert">{error || images.error}</p> : null}
+    <div className="message-choices__footer">
+      <button type="button" disabled={sending} onClick={() => onRespond({ answers: {} })}><X size={14} />{ui("取消")}</button>
+      <button type="button" disabled={!complete || sending || images.busy} onClick={() => void submit()}><Check size={14} />{ui("发送并继续")}</button>
     </div>
   </>
 }
@@ -175,7 +190,7 @@ function McpElicitationFields({ params, approvalScope, onRespond }: { params: Re
   </>
 }
 
-export function ServerRequestCard({ request, source, sourceIsCurrent, onOpenSource, onRespond }: Props) {
+export function ServerRequestCard({ token, request, source, sourceIsCurrent, onOpenSource, onRespond }: Props) {
   useUiLanguage()
   const isMcp = request.method === 'mcpServer/elicitation/request'
   const isToolQuestion = request.method === 'item/tool/requestUserInput'
@@ -184,7 +199,7 @@ export function ServerRequestCard({ request, source, sourceIsCurrent, onOpenSour
     <div className="approval-card__heading"><AlertTriangle size={17} /><strong>{title}</strong></div>
     {source ? <button className="approval-card__source" type="button" onClick={onOpenSource} disabled={sourceIsCurrent} title={sourceIsCurrent ? ui('来自当前对话') : ui('打开请求审批的对话')}>{ui("来自：")}{source}</button> : null}
     {isMcp ? <McpElicitationFields params={request.params} approvalScope={request.approvalScope} onRespond={onRespond} />
-      : isToolQuestion ? <ToolQuestionFields questions={toolQuestions(request.params.questions)} onRespond={onRespond} />
+      : isToolQuestion ? <ToolQuestionFields token={token} questions={toolQuestions(request.params.questions)} onRespond={onRespond} />
         : <>
           <p>{typeof request.params.reason === 'string' ? request.params.reason : ui('Codex 请求执行一项需要批准的操作。')}</p>
           {typeof request.params.command === 'string' ? <code>{request.params.command}</code> : null}

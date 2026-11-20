@@ -4,4 +4,4 @@ export type SidebarThreadSection = '置顶' | '今天' | '最近 7 天' | '15 �
 
 export const sidebarThreadSectionOrder: SidebarThreadSection[]
 export function sidebarThreadSection(thread: CodexThread, pinnedThreadIds: ReadonlySet<string>, now?: Date): SidebarThreadSection
-export function groupSidebarThreads(threads: CodexThread[], pinnedThreadIds: ReadonlySet<string>, now?: Date): Array<{ label: SidebarThreadSection; threads: CodexThread[] }>
+export function groupSidebarThreads<T extends CodexThread>(threads: T[], pinnedThreadIds: ReadonlySet<string>, now?: Date): Array<{ label: SidebarThreadSection; threads: T[] }>

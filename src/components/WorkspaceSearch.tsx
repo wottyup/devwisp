@@ -2,6 +2,7 @@ import { ChevronDown, ChevronRight, FileText, LoaderCircle, ReplaceAll, Search, 
 import { useEffect, useRef, useState } from 'react'
 import { devwispClient, type WorkspaceSearchFile, type WorkspaceSearchMatch, type WorkspaceSearchResult, type WorkspaceReplaceResult } from '../lib/devwispClient'
 import { ui, uiFormat, uiMessage, useUiLanguage } from '../lib/uiLanguage'
+import type { WorkspaceOperationProgress } from '../lib/workspaceOperationStream'
 
 export type WorkspaceSearchMode = 'find' | 'replace' | null
 
@@ -32,6 +33,8 @@ export function WorkspaceSearch({ token, root, mode, onModeChange, onOpenResult,
   const [error, setError] = useState<string | null>(null)
   const [searchError, setSearchError] = useState<string | null>(null)
   const [replaced, setReplaced] = useState<WorkspaceReplaceResult | null>(null)
+  const [searchProgress, setSearchProgress] = useState<WorkspaceOperationProgress | null>(null)
+  const [replaceProgress, setReplaceProgress] = useState<WorkspaceOperationProgress | null>(null)
   const enabled = mode !== null
   const result = snapshot && snapshot.root === root && snapshot.query === query && snapshot.matchCase === matchCase ? snapshot.result : null
 
@@ -47,8 +50,11 @@ export function WorkspaceSearch({ token, root, mode, onModeChange, onOpenResult,
     }
     const controller = new AbortController()
     setLoading(true)
+    setSearchProgress(null)
     const timer = window.setTimeout(() => {
-      void devwispClient.searchWorkspace(token, root, query, matchCase, controller.signal).then((data) => {
+      void devwispClient.searchWorkspace(token, root, query, matchCase, controller.signal, (progress) => {
+        if (!controller.signal.aborted) setSearchProgress(progress)
+      }).then((data) => {
         if (!controller.signal.aborted) { setSnapshot({ root, query, matchCase, result: data }); setSearchError(null) }
       }).catch((reason: unknown) => {
         if (!controller.signal.aborted) { setSnapshot(null); setSearchError(reason instanceof Error ? reason.message : '目录查找失败') }
@@ -75,11 +81,14 @@ export function WorkspaceSearch({ token, root, mode, onModeChange, onOpenResult,
     if (!window.confirm(uiFormat('将在目录 {0} 的 {1} 个文件中替换 {2} 处匹配，并直接保存。继续吗？', root, fileCount, count))) return
     replacingRef.current = true
     setReplacing(true)
+    setReplaceProgress(null)
     onBusyChange(true)
     setError(null)
     setReplaced(null)
     try {
-      const outcome = await devwispClient.replaceWorkspace(token, root, query, replacement, matchCase, files)
+      const outcome = await devwispClient.replaceWorkspace(token, root, query, replacement, matchCase, files, (progress) => {
+        if (mounted.current) setReplaceProgress(progress)
+      })
       if (mounted.current) { setReplaced(outcome); setSnapshot(null) }
       await onReplaced(outcome.paths)
     } catch (reason) {
@@ -107,11 +116,11 @@ export function WorkspaceSearch({ token, root, mode, onModeChange, onOpenResult,
         <input value={replacement} disabled={replacing} placeholder={ui('替换为')} aria-label={ui('目录替换内容')} spellCheck={false} autoComplete="off" autoCapitalize="off" autoCorrect="off" onChange={(event) => { setReplacement(event.currentTarget.value); clearFeedback() }} />
         <button className="workspace-file-preview__copy" type="button" disabled={replacing || loading || !result?.matchCount || result.truncated} onClick={() => void replace()} title={ui('替换全部搜索结果并保存')}><ReplaceAll size={14} />{ui('全部替换')}</button>
       </div> : null}
-      <div className="workspace-search__status" role="status" aria-live="polite">{replacing ? <><LoaderCircle className="spin" size={13} />{ui('正在替换文件…')}</> : loading ? <><LoaderCircle className="spin" size={13} />{ui('正在查找…')}</> : result ? result.truncated ? uiFormat('扫描已达到安全上限，至少在 {0} 个文件中找到 {1} 处匹配', result.fileCount, result.matchCount) : uiFormat('{0} 个文件中找到 {1} 处匹配', result.fileCount, result.matchCount) : ui('在当前目录的文件内容中查找')}</div>
+      <div className="workspace-search__status" role="status" aria-live="polite">{replacing ? <><LoaderCircle className="spin" size={13} />{replaceProgress?.phase === 'write' ? uiFormat('正在保存：{0}/{1} 个文件…', replaceProgress.processedFiles ?? 0, replaceProgress.totalFiles ?? 0) : replaceProgress ? uiFormat('正在准备替换：已扫描 {0} 个文件，找到 {1} 处匹配…', replaceProgress.scannedFiles, replaceProgress.matchCount) : ui('正在替换文件…')}</> : loading ? <><LoaderCircle className="spin" size={13} />{searchProgress ? uiFormat('已扫描 {0} 个文件，找到 {1} 处匹配…', searchProgress.scannedFiles, searchProgress.matchCount) : ui('正在查找…')}</> : result ? result.truncated ? uiFormat('扫描已达到安全上限，至少在 {0} 个文件中找到 {1} 处匹配', result.fileCount, result.matchCount) : uiFormat('{0} 个文件中找到 {1} 处匹配', result.fileCount, result.matchCount) : ui('在当前目录的文件内容中查找')}</div>
       <small className="workspace-search__hint">{ui('默认跳过依赖、缓存和构建目录')}</small>
       {result?.displayTruncated ? <p className="workspace-search__warning" role="status">{ui('列表只显示部分匹配；全部替换会处理本次扫描到的全部匹配。')}</p> : null}
       {result?.truncated ? <p className="workspace-search__warning" role="status">{ui('扫描已达到安全上限，结果不完整；缩小目录范围后才能全部替换。')}</p> : null}
-      {result?.skippedFiles ? <p className="workspace-search__warning" role="status">{uiFormat('已跳过 {0} 个不支持预览、无法读取或超过 1 MiB 的文件。', result.skippedFiles)}</p> : null}
+      {result?.skippedFiles ? <p className="workspace-search__warning" role="status">{uiFormat('已跳过 {0} 个二进制、非 UTF-8 或无法读取的文件。', result.skippedFiles)}</p> : null}
       {error ? <p className="workspace-explorer__error" role="alert">{uiMessage(error)}</p> : null}
       {searchError ? <p className="workspace-explorer__error" role="alert">{uiMessage(searchError)}</p> : null}
       {replaced ? <div className="workspace-search__feedback" role="status">
@@ -123,7 +132,7 @@ export function WorkspaceSearch({ token, root, mode, onModeChange, onOpenResult,
       {!query ? <div className="workspace-search__empty"><Search size={22} /><span>{ui('输入文字，查找当前目录及子目录')}</span></div> : null}
       {query && result && !result.files.length && !loading ? <p className="workspace-explorer__empty">{ui('未找到匹配项')}</p> : null}
       {result?.files.map((file) => <details className="workspace-search__file" key={file.path} open>
-        <summary title={file.path}><FileText size={14} /><span className="workspace-search__path">{file.path}</span><small>{file.matchCount}{!file.complete || file.matches.length < file.matchCount ? '+' : ''}</small>
+        <summary title={file.path}><FileText size={14} /><span className="workspace-search__path">{file.path}</span><small>{file.matchCount}{!file.complete ? '+' : ''}</small>
           {mode === 'replace' ? <button className="workspace-file-search__icon" type="button" disabled={replacing || loading || !file.complete} aria-label={uiFormat('替换文件 {0} 中的匹配项', file.path)} title={ui('替换此文件中的匹配项并保存')} onClick={(event) => { event.preventDefault(); event.stopPropagation(); void replace([file]) }}><ReplaceAll size={13} /></button> : null}
         </summary>
         {file.matches.map((match) => <button className="workspace-search__match" type="button" key={`${match.line}:${match.column}`} disabled={replacing} title={uiFormat('打开 {0} 第 {1} 行', file.path, match.line)} onClick={() => { void Promise.resolve(onOpenResult(file, match)).catch((reason: unknown) => setError(reason instanceof Error ? reason.message : '无法读取文件')) }}>

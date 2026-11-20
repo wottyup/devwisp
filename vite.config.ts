@@ -174,7 +174,7 @@ export default defineConfig({
   },
   server: {
     host: '0.0.0.0',
-    port: 4173,
+    port: 26546,
     strictPort: true,
     watch: {
       // These are not served by Vite. Android builds in particular create
@@ -194,7 +194,7 @@ export default defineConfig({
   },
   preview: {
     host: '0.0.0.0',
-    port: 4173,
+    port: 26546,
     strictPort: true,
     proxy: { '/api': engineProxy },
   },

@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import quote
 
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, status
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -36,6 +36,7 @@ from watchfiles import awatch
 
 from .browser_history_sync import BrowserHistorySync
 from .browser_payload import browser_event, browser_thread, browser_thread_summary
+from .deepseek_harness import DeepSeekHarnessServer, is_deepseek_thread_id
 from .claude_code import (
     ClaudeCodeError,
     ClaudeCodeServer,
@@ -56,6 +57,8 @@ from .codex_app_server import (
     CodexThreadNotFoundError,
 )
 from .shared_state import QueueConflictError, SharedQueueService, SharedStateStore
+from .collaboration_api import install_collaboration
+from .collaboration_queue import CollaborationQueueEngine, GroupEngineSettings
 from .mcp_approvals import MCPApprovalError, MCPApprovalNotFoundError, MCPApprovalStore
 from .ssh_mcp_settings import SshMcpSettingsError, SshMcpSettingsStore
 from .native_engine_config import NativeEngineConfigError, NativeEngineConfigStore
@@ -64,11 +67,13 @@ from .native_engine_gateway import NativeEngineGateway
 from .native_engine_connection import check_connection as check_native_connection
 from .retired_features import remove_retired_ssh_state
 from .workspace_search import search_workspace, replace_workspace, replace_workspace_all
+from .workspace_search_stream import workspace_operation_stream
 from .terminal import TMUX_CLEANUP_INTERVAL_SECONDS, TerminalSession, cleanup_tmux_sessions
 from .terminal_handoff import TerminalHandoffBroker, TerminalHandoffError
 from .translation import TranslationError, TranslationService
 from .codex_proxy_usage import CodexProxyUsageError, fetch_usage as fetch_codex_proxy_usage
 from .new_api_usage import NewAPIUsageError, fetch_usage as fetch_new_api_usage
+from .local_usage import LocalUsageStore
 
 logger = logging.getLogger(__name__)
 
@@ -339,11 +344,32 @@ class PdfAttachmentStore:
 
 
 class ThreadStartRequest(BaseModel):
-    engine: Literal["codex", "claude-code"] = "codex"
+    engine: Literal["codex", "claude-code", "deepseek-harness"] = "codex"
     model: str | None = Field(default=None, max_length=200)
     approval_policy: ApprovalPolicy | None = None
     cwd: str | None = Field(default=None, max_length=4_096)
     request_id: str | None = Field(default=None, min_length=8, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$")
+
+
+class DeepSeekSettingsRequest(BaseModel):
+    model: str = Field(default="deepseek-v4-flash", min_length=1, max_length=200)
+    base_url: str = Field(default="https://api.deepseek.com", max_length=2048)
+    api_key: str | None = Field(default=None, max_length=8192)
+    clear_key: bool = False
+    protocol: Literal['responses', 'anthropic', 'chat'] | None = None
+
+
+class DeepSeekProfileRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    profileId: str | None = Field(default=None, max_length=128)
+    expectedRevision: str = Field(min_length=1, max_length=128)
+    name: str = Field(min_length=1, max_length=80)
+    model: str = Field(min_length=1, max_length=200)
+    baseUrl: str = Field(max_length=2048)
+    apiKey: str = Field(default='', max_length=8192)
+    clearKey: bool = False
+    protocol: Literal['responses', 'anthropic', 'chat']
+    apply: bool = True
 
 
 class ThreadWorkspaceRequest(BaseModel):
@@ -430,6 +456,10 @@ class TurnImage(BaseModel):
     data: str = Field(min_length=4)
 
 
+class AnswerImagesRequest(BaseModel):
+    images: list[TurnImage] = Field(min_length=1, max_length=MAX_IMAGES_PER_TURN)
+
+
 class TurnRequest(BaseModel):
     prompt: str = Field(default="")
     original_text: str | None = Field(default=None, max_length=30_000)
@@ -440,6 +470,8 @@ class TurnRequest(BaseModel):
     model: str | None = Field(default=None, max_length=200)
     effort: str | None = Field(default=None, max_length=50)
     approval_policy: ApprovalPolicy | None = None
+    deepseek_agent_preset: Literal['standard', 'ptc', 'minimal', 'cordis', 'legacy'] | None = None
+    deepseek_permission_mode: Literal['read-only', 'workspace-write', 'full-access-ask', 'danger-full-access', 'plan'] | None = None
     claude_model: str | None = Field(default=None, max_length=200)
     claude_effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
     claude_permission_mode: Literal["default", "manual", "acceptEdits", "auto", "bypassPermissions", "dontAsk", "plan"] = "default"
@@ -453,6 +485,11 @@ class SteerRequest(BaseModel):
     direct: bool = False
     images: list[TurnImage] = Field(default_factory=list, max_length=MAX_IMAGES_PER_TURN)
     pdf_attachments: list[str] = Field(default_factory=list, max_length=MAX_PDF_ATTACHMENTS_PER_TURN)
+    model: str | None = Field(default=None, max_length=200)
+    effort: str | None = Field(default=None, max_length=50)
+    approval_policy: ApprovalPolicy | None = None
+    deepseek_agent_preset: Literal['standard', 'ptc', 'minimal', 'cordis', 'legacy'] | None = None
+    deepseek_permission_mode: Literal['read-only', 'workspace-write', 'full-access-ask', 'danger-full-access', 'plan'] | None = None
     claude_model: str | None = Field(default=None, max_length=200)
     claude_effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
     claude_permission_mode: Literal["default", "manual", "acceptEdits", "auto", "bypassPermissions", "dontAsk", "plan"] = "default"
@@ -489,9 +526,13 @@ class QueuedMessageRequest(BaseModel):
     model: str | None = Field(default=None, max_length=200)
     effort: str | None = Field(default=None, max_length=50)
     approvalPolicy: ApprovalPolicy | None = None
+    deepseekAgentPreset: Literal['standard', 'ptc', 'minimal', 'cordis', 'legacy'] | None = None
+    deepseekPermissionMode: Literal['read-only', 'workspace-write', 'full-access-ask', 'danger-full-access', 'plan'] | None = None
     claudeModel: str | None = Field(default=None, max_length=200)
     claudeEffort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
     claudePermissionMode: Literal["default", "manual", "acceptEdits", "auto", "bypassPermissions", "dontAsk", "plan"] | None = None
+    collaborationSettings: dict[Literal['codex', 'claude-code', 'deepseek-harness'], GroupEngineSettings] | None = None
+    collaborationRecipientIds: list[str] | None = Field(default=None, min_length=1, max_length=12)
     sendAttempt: dict[str, Any] | None = None
     translation: QueuedTranslationConfig | None = None
     translationStatus: Literal["pending", "failed"] | None = None
@@ -689,13 +730,13 @@ class WorkspaceSearchRequest(BaseModel):
 class WorkspaceReplaceFile(BaseModel):
     path: str = Field(min_length=1, max_length=WORKSPACE_TREE_MAX_PATH_LENGTH)
     revision: str = Field(pattern=r"^[0-9a-f]{64}$")
-    matchCount: int = Field(ge=1, le=1_048_576)
+    matchCount: int = Field(ge=1)
 
 
 class WorkspaceReplaceRequest(WorkspaceSearchRequest):
     replacement: str = Field(max_length=WORKSPACE_FILE_PREVIEW_MAX_BYTES)
     allMatches: bool = False
-    files: list[WorkspaceReplaceFile] = Field(default_factory=list, max_length=100)
+    files: list[WorkspaceReplaceFile] = Field(default_factory=list)
 
 
 class WorkspaceFileDownloadRequest(BaseModel):
@@ -1631,7 +1672,7 @@ def tail_thread_history(response: dict[str, Any], limit: int | None) -> dict[str
 class PairingAuth:
     def __init__(self, state_path: Path | None = None) -> None:
         self.code = "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(8))
-        configured_path = os.environ.get("DEVWISP_AUTH_FILE")
+        configured_path = os.environ.get("DEVWISP_AUTH_FILE") or os.environ.get("CODE_REMOTE_AUTH_FILE")
         self.state_path = state_path or self._default_state_path()
         state_exists = self.state_path.is_file()
         self.token_hashes = self._load_token_hashes(self.state_path)
@@ -1652,16 +1693,20 @@ class PairingAuth:
         if configured_path:
             return Path(configured_path).expanduser()
         if os.name == "nt":
-            configured_home = os.environ.get("DEVWISP_HOME")
+            configured_home = os.environ.get("DEVWISP_HOME") or os.environ.get("CODE_REMOTE_HOME")
             if configured_home:
                 remote_home = Path(configured_home).expanduser()
             else:
                 local_app_data = os.environ.get("LOCALAPPDATA")
-                remote_home = (
-                    Path(local_app_data) / "DevWisp"
-                    if local_app_data
-                    else Path.home() / ".devwisp"
-                )
+                legacy_home = Path(local_app_data) / "CodexRemote" if local_app_data else None
+                new_home = Path(local_app_data) / "DevWisp" if local_app_data else None
+                # Existing Windows installs keep their SQLite databases and
+                # credentials in this directory. Reuse it instead of copying
+                # live databases or silently starting with empty app state.
+                if legacy_home and legacy_home.is_dir() and new_home and not new_home.exists():
+                    remote_home = legacy_home
+                else:
+                    remote_home = new_home or Path.home() / ".devwisp"
             return remote_home / "trusted-devices.json"
         codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
         return codex_home / "devwisp" / "trusted-devices.json"
@@ -1676,6 +1721,10 @@ class PairingAuth:
             codex_home / "codex-remote" / "trusted-devices.json",
             Path.home() / ".codex-remote" / "trusted-devices.json",
         ]
+        if os.name == "nt":
+            legacy_home = os.environ.get("CODE_REMOTE_HOME")
+            if legacy_home:
+                paths.append(Path(legacy_home).expanduser() / "trusted-devices.json")
         local_app_data = os.environ.get("LOCALAPPDATA")
         if local_app_data:
             paths.append(Path(local_app_data) / "CodexRemote" / "trusted-devices.json")
@@ -1804,7 +1853,11 @@ def create_app(
         auth.state_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     except OSError as error:
         raise RuntimeError(f"无法准备 DevWisp 用户数据目录：{auth.state_path.parent}：{error}") from error
-    state_path = Path(os.environ.get("DEVWISP_STATE_FILE", str(auth.state_path.parent / "shared-state.sqlite3"))).expanduser()
+    state_path = Path(
+        os.environ.get("DEVWISP_STATE_FILE")
+        or os.environ.get("CODE_REMOTE_STATE_FILE")
+        or str(auth.state_path.parent / "shared-state.sqlite3")
+    ).expanduser()
     translation = TranslationService(auth.state_path.parent / "translation.json", codex_executable, claude_executable)
     mcp_approvals = MCPApprovalStore(auth.state_path.parent / "mcp-approvals.json")
     remove_retired_ssh_state(auth.state_path.parent, mcp_approvals)
@@ -1818,6 +1871,25 @@ def create_app(
         state_path.parent / "claude-code.sqlite3",
         app_server._emit,
     )
+    deepseek = DeepSeekHarnessServer(configured_workspace, state_path.parent / "deepseek-harness.sqlite3", app_server._emit)
+    local_usage = LocalUsageStore(state_path.parent / "chat-usage.sqlite3")
+    async def publish_local_usage(engine: str, thread_id: str) -> None:
+        snapshot = await asyncio.to_thread(local_usage.query, engine=engine, thread_id=thread_id, limit=1)
+        await app_server._emit({'type': 'notification', 'method': 'usage/local/updated', 'params': {
+            'engine': engine, 'threadId': thread_id, 'revision': snapshot['revision'], 'totals': snapshot['totals'],
+        }})
+
+    local_usage.on_change = publish_local_usage
+    app_server._usage_store = local_usage
+    claude_code._usage_store = local_usage
+    deepseek._usage_store = local_usage
+
+    def local_engine(thread_id: str) -> ClaudeCodeServer:
+        return deepseek if is_deepseek_thread_id(thread_id) else claude_code
+
+    def is_local_thread(thread_id: str) -> bool:
+        return is_claude_thread_id(thread_id) or is_deepseek_thread_id(thread_id)
+
     native_config = NativeEngineConfigStore(
         app_server._history_home / "config.toml",
         claude_code._native_home / "settings.json",
@@ -1837,9 +1909,14 @@ def create_app(
     claude_code.enable_terminal_handoff(terminal_handoff)
     permission_broker = PermissionPromptBroker(runtime_directory / "permission.sock", app_server._emit)
     claude_code.enable_permission_prompt(permission_broker)
+    deepseek.enable_permission_prompt(permission_broker)
+    deepseek.enable_terminal_handoff(terminal_handoff)
+    deepseek.enable_ssh_mcp(ssh_mcp_settings)
 
     def claude_attachment_root(thread_id: str) -> Path:
-        session_id = thread_id.removeprefix("claude:")
+        # Engine-prefixed IDs contain ':' on DeepSeek as well as Claude.
+        # Never use an external ID directly as a Windows path component.
+        session_id = hashlib.sha256(thread_id.encode("utf-8")).hexdigest()
         root = runtime_directory / "claude-attachments" / session_id
         root.mkdir(parents=True, exist_ok=True, mode=0o700)
         return root
@@ -1873,15 +1950,70 @@ def create_app(
             except Exception:
                 logger.exception("Could not clean expired chat images")
 
+    async def send_collaboration_member(member, prompt, payload, steer, cwd, readonly=False):
+        settings = (payload.get('collaborationSettings') or {}).get(member['engine'], {})
+        constrained = readonly or bool(member.get('groupWorkflow'))
+        model = settings.get('model') or member.get('model') or None
+        effort = settings.get('effort') or None
+        images = [TurnImage(name=image['name'], media_type=image['mediaType'], data=image['data']) for image in payload.get('images', [])]
+        pdf_ids = [item['sourceFileId'] for item in payload.get('documents', []) if item.get('sourceFileId')]
+        thread_id = member['threadId']
+        if member['engine'] == 'codex':
+            if not steer:
+                await app_server.resume_thread(thread_id, cwd=Path(cwd))
+            image_paths = save_turn_images(images, image_directory, max_storage_bytes=MAX_STORED_IMAGE_BYTES, storage_lock=image_storage_lock)
+            try:
+                prompt = prompt_with_original_pdfs(prompt, pdf_ids, pdf_attachments)
+                if steer:
+                    result = await app_server.steer_turn(thread_id, prompt, image_paths)
+                    turn_id = result.get('turnId') or result.get('turn', {}).get('id')
+                else:
+                    result = await app_server.start_turn(thread_id, prompt, image_paths, model=model, effort=effort,
+                        approval_policy='untrusted' if constrained else settings.get('approvalPolicy') or 'untrusted', cwd=Path(cwd),
+                        sandbox_policy=({'type': 'readOnly' if readonly else 'workspaceWrite'}
+                                        if constrained or not settings.get('approvalPolicy') else None))
+                    turn_id = result.get('turn', {}).get('id')
+                if not turn_id:
+                    raise CodexRuntimeError('引擎没有返回回合编号')
+                return turn_id
+            except Exception:
+                for path in image_paths:
+                    with suppress(FileNotFoundError):
+                        path.unlink()
+                raise
+        native = deepseek if member['engine'] == 'deepseek-harness' else claude_code
+        temporary, prepared, paths, attachments = prepare_claude_turn_files(prompt, images, pdf_ids, pdf_attachments, claude_attachment_root(thread_id))
+        options = {'display_prompt': prompt, 'image_paths': paths, 'attachment_paths': attachments, 'temporary_directory': temporary}
+        if steer:
+            options['request_id'] = payload['id']
+        if not steer:
+            options.update(model=model, effort=effort)
+            if member['engine'] == 'deepseek-harness':
+                mode = 'workspace-write' if constrained else settings.get('deepseekPermissionMode') or 'workspace-write'
+                options['deepseek_permission_mode'] = 'read-only' if readonly else mode
+                if settings.get('deepseekAgentPreset'):
+                    options['deepseek_agent_preset'] = settings['deepseekAgentPreset']
+            else:
+                mode = 'default' if constrained else settings.get('claudePermissionMode') or 'default'
+                options['permission_mode'] = 'plan' if readonly else mode
+        try:
+            return await (native.steer_turn if steer else native.start_turn)(thread_id, prepared, **options)
+        except Exception:
+            if temporary is not None:
+                shutil.rmtree(temporary, ignore_errors=True)
+            raise
+
     async def send_queued_turn(thread_id: str, payload: dict[str, Any], steer: bool) -> str | None:
+        if thread_id.startswith('collaboration:'):
+            return await shared_queue.collaboration_engine.deliver(thread_id, payload, steer)
         images = [TurnImage(name=image["name"], media_type=image["mediaType"], data=image["data"]) for image in payload["images"]]
         pdf_ids = [document["sourceFileId"] for document in payload.get("documents", []) if document.get("sourceFileId")]
-        if is_claude_thread_id(thread_id):
+        if is_local_thread(thread_id):
             turn_directory, prompt, image_paths, attachment_paths = prepare_claude_turn_files(
                 payload["requestText"], images, pdf_ids, pdf_attachments, claude_attachment_root(thread_id),
             )
             try:
-                send_claude = claude_code.steer_turn if steer else claude_code.start_turn
+                send_claude = local_engine(thread_id).steer_turn if steer else local_engine(thread_id).start_turn
                 turn_id = await send_claude(
                     thread_id,
                     prompt,
@@ -1890,9 +2022,10 @@ def create_app(
                     attachment_paths=attachment_paths,
                     temporary_directory=turn_directory,
                     request_id=payload["id"],
-                    model=payload.get("claudeModel"),
-                    effort=payload.get("claudeEffort"),
-                    permission_mode=payload.get("claudePermissionMode"),
+                    model=payload.get("model") if is_deepseek_thread_id(thread_id) else payload.get("claudeModel"),
+                    effort=payload.get("effort") if is_deepseek_thread_id(thread_id) else payload.get("claudeEffort"),
+                    **({"deepseek_agent_preset": payload.get("deepseekAgentPreset"), "deepseek_permission_mode": payload.get("deepseekPermissionMode") or ({"never": "danger-full-access", "untrusted": "full-access-ask"}.get(payload.get("approvalPolicy"), "workspace-write"))} if is_deepseek_thread_id(thread_id) else {}),
+                    permission_mode=("bypassPermissions" if payload.get("approvalPolicy") == "never" else "default") if is_deepseek_thread_id(thread_id) else payload.get("claudePermissionMode"),
                 )
             except Exception:
                 if turn_directory is not None:
@@ -1901,22 +2034,22 @@ def create_app(
             await app_server.notify_turn_delivery(thread_id, payload["id"], turn_id)
             return turn_id
         if steer:
-            result = await steer_turn(thread_id, SteerRequest(
+            result = await deliver_codex_steer(thread_id, SteerRequest(
                 prompt=payload["requestText"], images=images, pdf_attachments=pdf_ids, request_id=payload["id"],
             ))
         else:
-            result = await start_turn(thread_id, TurnRequest(
+            result = await deliver_codex_start(thread_id, TurnRequest(
                 prompt=payload["requestText"], images=images, pdf_attachments=pdf_ids,
                 model=payload.get("model"), effort=payload.get("effort"),
                 approval_policy=payload.get("approvalPolicy"), request_id=payload["id"],
             ))
         return result.get("turn_id")
 
-    shared_queue = SharedQueueService(shared_state, app_server, send_queued_turn, claude_code, translation.translate)
+    shared_queue = SharedQueueService(shared_state, app_server, send_queued_turn, claude_code, translation.translate, deepseek=deepseek)
     workspace_download_tickets: dict[str, tuple[Path, str, float]] = {}
 
     def paused_thread_view(thread_id: str, thread: dict[str, Any]) -> dict[str, Any]:
-        if is_claude_thread_id(thread_id) or not shared_state.is_paused(thread_id):
+        if is_local_thread(thread_id) or not shared_state.is_paused(thread_id):
             return thread
         status = thread.get("status")
         status_type = status.get("type") if isinstance(status, dict) else None
@@ -1970,6 +2103,7 @@ def create_app(
         image_reaper = asyncio.create_task(reap_expired_message_images())
         terminal_reaper = asyncio.create_task(reap_tmux_terminal_sessions())
         shared_queue.start()
+        collaboration.start()
         try:
             yield
         finally:
@@ -1979,7 +2113,9 @@ def create_app(
             terminal_reaper.cancel()
             with suppress(asyncio.CancelledError):
                 await terminal_reaper
+            await collaboration.close()
             await shared_queue.close()
+            await deepseek.close()
             await claude_code.close()
             for terminal_session in tuple(terminal_sessions):
                 await terminal_session.close()
@@ -1992,18 +2128,24 @@ def create_app(
             await app_server.close()
             await terminal_handoff.close()
             await permission_broker.close()
+            local_usage.close()
             shared_state.close()
             shutil.rmtree(runtime_directory, ignore_errors=True)
 
-    app = FastAPI(title="DevWisp", version="0.122.0-dev.4", lifespan=lifespan)
+    app = FastAPI(title="DevWisp", version="0.143.0-dev.1", lifespan=lifespan)
     app.state.codex = app_server
     app.state.claude_code = claude_code
+    app.state.deepseek = deepseek
+    app.state.local_usage = local_usage
     app.state.auth = auth
     app.state.idempotent_requests = idempotent_requests
     app.state.pdf_attachments = pdf_attachments
     app.state.message_image_directory = image_directory
     app.state.shared_state = shared_state
     app.state.shared_queue = shared_queue
+    collaboration = install_collaboration(app, shared_state.connection, app_server, claude_code, deepseek, workspace_base_for_cwd, shared_queue, send_collaboration_member)
+    shared_queue.collaboration_engine = CollaborationQueueEngine(collaboration, shared_queue, send_collaboration_member)
+    app.state.collaboration = collaboration
     app.state.mcp_approvals = mcp_approvals
     app.state.ssh_mcp_settings = ssh_mcp_settings
     app.state.terminal_handoff = terminal_handoff
@@ -2019,13 +2161,13 @@ def create_app(
         allow_origins=[],
         allow_origin_regex=r"^http://(127\.0\.0\.1|localhost):\d+$",
         allow_credentials=False,
-        allow_methods=["GET", "POST", "DELETE"],
+        allow_methods=["GET", "POST", "PUT", "DELETE"],
         allow_headers=["Authorization", "Content-Type"],
     )
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, error: RequestValidationError):
-        if request.url.path.startswith(("/api/v1/native-config/", "/api/v1/codex/usage/")):
+        if request.url.path.startswith(("/api/v1/native-config/", "/api/v1/codex/usage/", "/api/v1/deepseek/")):
             # Pydantic's default error body can echo the submitted API key.
             return JSONResponse({"detail": "配置字段无效或缺失，请检查填写内容后重试。"}, status_code=422)
         return await request_validation_exception_handler(request, error)
@@ -2038,8 +2180,25 @@ def create_app(
             token = authorization.removeprefix("Bearer ").strip()
             if not auth.accepts(token):
                 return JSONResponse({"detail": "需要配对码"}, status_code=status.HTTP_401_UNAUTHORIZED)
+        if request.method in {"POST", "DELETE", "PUT", "PATCH"}:
+            owned = re.fullmatch(r"/api/v1/codex/(threads|queue|terminal/handoff)/([^/]+)(?:/(.*))?", request.url.path)
+            if owned:
+                if owned[1] == 'queue' and owned[2].startswith('collaboration:'):
+                    try:
+                        collaboration.group(owned[2].removeprefix('collaboration:'))
+                    except (KeyError, ValueError):
+                        return JSONResponse({'detail': '协同群聊不存在'}, status_code=404)
+                # A request may already be waiting when a conversation is
+                # adopted. Recheck ownership inside the same admission lock.
+                async with collaboration.member_lock(owned[2]):
+                    if collaboration.store.owner(owned[2]):
+                        action = owned[3] or ""
+                        allowed = owned[1] == "threads" and (action in {"resume", "name", "pin"} or action.startswith("permission/"))
+                        if not allowed:
+                            return JSONResponse({"detail": "这是协同任务的成员会话，请在协同工作区补充要求或暂停任务。"}, status_code=409)
+                    return await call_next(request)
         response = await call_next(request)
-        if request.url.path.startswith(("/api/v1/native-config/", "/api/v1/codex/usage/")):
+        if request.url.path.startswith(("/api/v1/native-config/", "/api/v1/codex/usage/", "/api/v1/deepseek/")):
             response.headers["Cache-Control"] = "private, no-store"
             response.headers["Pragma"] = "no-cache"
         return response
@@ -2245,6 +2404,22 @@ def create_app(
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
         return {"decided": True}
 
+    @app.get("/api/v1/codex/usage/local")
+    async def local_chat_usage(
+        since: int = Query(default=0, ge=0, le=2**53 - 1),
+        until: int | None = Query(default=None, ge=0, le=2**53 - 1),
+        engine: Literal['', 'codex', 'claude-code', 'deepseek-harness'] = '',
+        model: str = Query(default='', max_length=300),
+        thread_id: str = Query(default='', max_length=300),
+        offset_minutes: int = Query(default=0, ge=-840, le=840),
+        offset: int = Query(default=0, ge=0, le=10_000_000),
+        limit: int = Query(default=30, ge=1, le=100),
+    ) -> dict[str, Any]:
+        if until is not None and until < since:
+            raise HTTPException(status_code=422, detail='结束时间不能早于开始时间。')
+        return await asyncio.to_thread(local_usage.query, since=since, until=until, engine=engine,
+                                      model=model, thread_id=thread_id, offset_minutes=offset_minutes, offset=offset, limit=limit)
+
     @app.post("/api/v1/codex/usage/codex-proxy/{kind}")
     async def codex_proxy_usage(kind: Literal["summary", "history", "client-keys"], body: CodexProxyUsageRequest) -> dict[str, Any]:
         try:
@@ -2291,6 +2466,95 @@ def create_app(
         if not runtime_status["available"]:
             runtime_status["error"] = f"找不到 Codex CLI：{app_server.command}"
         return runtime_status
+
+    @app.get("/api/v1/deepseek/status")
+    async def deepseek_status() -> JSONResponse:
+        return JSONResponse(deepseek.status(), headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/v1/deepseek/runtime")
+    async def deepseek_runtime_status() -> dict[str, Any]:
+        return deepseek.setup.status()
+
+    @app.post("/api/v1/deepseek/runtime/{operation}")
+    async def deepseek_runtime_operation(operation: str) -> dict[str, Any]:
+        if operation not in {'install', 'check'}:
+            raise HTTPException(status_code=400, detail='不支持的运行组件操作。')
+        if operation == 'install' and deepseek._tasks:
+            raise HTTPException(status_code=409, detail='DeepSeek 仍有任务运行，请等待结束后修复安装。')
+        return deepseek.setup.start(operation)
+
+    @app.put("/api/v1/deepseek/runtime")
+    async def deepseek_runtime_save(body: dict[str, Any]) -> dict[str, Any]:
+        executable = body.get('executable', '')
+        if not isinstance(executable, str) or len(executable) > 4096:
+            raise HTTPException(status_code=400, detail='程序路径无效。')
+        try:
+            return await deepseek.setup.save(executable)
+        except (OSError, ValueError, TimeoutError) as error:
+            raise HTTPException(status_code=400, detail=str(error) if isinstance(error, ValueError) else '运行组件检查失败，请检查程序路径与权限。') from None
+
+    @app.put("/api/v1/deepseek/settings")
+    async def save_deepseek_settings(body: DeepSeekSettingsRequest) -> JSONResponse:
+        try:
+            result = deepseek.save_settings(body.model, body.base_url, body.api_key, body.clear_key, body.protocol)
+        except ClaudeCodeError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        except OSError as error:
+            raise HTTPException(status_code=400, detail="DeepSeek 配置保存失败，请检查地址、模型和数据目录权限。") from error
+        await app_server._emit({"type": "deepseek.config.changed"})
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/v1/deepseek/questions")
+    async def deepseek_questions() -> dict[str, Any]:
+        return {"requests": deepseek.questions.requests()}
+
+    @app.post("/api/v1/deepseek/threads/{thread_id}/questions/{question_id}")
+    async def answer_deepseek_question(thread_id: str, question_id: str, body: dict[str, Any]) -> dict[str, bool]:
+        try:
+            deepseek.questions.respond(thread_id, question_id, body)
+        except ClaudeCodeError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from None
+        return {"answered": True}
+
+    @app.get("/api/v1/deepseek/profiles")
+    async def deepseek_profiles() -> dict[str, Any]:
+        try:
+            return deepseek.profiles()
+        except NativeEngineConfigError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from None
+
+    @app.post("/api/v1/deepseek/profiles")
+    async def save_deepseek_profile(body: DeepSeekProfileRequest) -> dict[str, Any]:
+        try:
+            result = deepseek.save_profile(body.model_dump())
+        except NativeEngineConfigError as error:
+            raise HTTPException(status_code=409 if error.conflict else 400, detail=str(error)) from None
+        if result['applied']:
+            await app_server._emit({"type": "deepseek.config.changed"})
+        return result
+
+    @app.delete("/api/v1/deepseek/profiles/{profile_id}")
+    async def delete_deepseek_profile(profile_id: str, body: NativeEngineProfileDeleteRequest) -> dict[str, Any]:
+        try:
+            return deepseek.delete_profile(profile_id, body.expectedRevision)
+        except NativeEngineConfigError as error:
+            raise HTTPException(status_code=409 if error.conflict else 400, detail=str(error)) from None
+
+    @app.post("/api/v1/deepseek/test")
+    async def test_deepseek_profile(body: DeepSeekProfileRequest) -> dict[str, Any]:
+        try:
+            draft = deepseek.connection_draft(body.model_dump())
+            if deepseek.setup.status()['busy']:
+                raise HTTPException(status_code=409, detail='运行组件正在安装或检查，请稍后测试。')
+            try:
+                await deepseek.setup.check()
+            except (OSError, ValueError, TimeoutError):
+                raise HTTPException(status_code=400, detail='Harness 启动检查未通过，请先在运行组件中安装或修复。') from None
+            return await asyncio.wait_for(check_native_connection(draft, native_connection_slots), timeout=45)
+        except NativeEngineConfigError as error:
+            raise HTTPException(status_code=409 if error.conflict else 400, detail=str(error)) from None
+        except TimeoutError:
+            raise HTTPException(status_code=504, detail="连通性测试超时，请稍后重试。") from None
 
     @app.get("/api/v1/claude/status")
     async def claude_status() -> dict[str, Any]:
@@ -2355,26 +2619,28 @@ def create_app(
         return workspace_file_preview(base, path)
 
     @app.post("/api/v1/codex/workspace/search")
-    async def search_workspace_files(body: WorkspaceSearchRequest) -> dict[str, Any]:
+    async def search_workspace_files(body: WorkspaceSearchRequest, request: Request) -> Any:
         base = workspace_base_for_cwd(app_server.workspace, body.cwd)
-        return await asyncio.to_thread(search_workspace, base, body.query, body.matchCase, workspace_file_preview)
+        if "application/x-ndjson" in request.headers.get("accept", ""):
+            return workspace_operation_stream(search_workspace, base, body.query, body.matchCase)
+        return await asyncio.to_thread(search_workspace, base, body.query, body.matchCase)
 
     @app.post("/api/v1/codex/workspace/replace")
-    async def replace_workspace_files(body: WorkspaceReplaceRequest) -> dict[str, Any]:
+    async def replace_workspace_files(body: WorkspaceReplaceRequest, request: Request) -> Any:
         base = workspace_base_for_cwd(app_server.workspace, body.cwd)
         if body.allMatches:
             if body.files:
                 raise HTTPException(400, "全部替换请求不能同时指定文件列表。")
-            return await asyncio.to_thread(
-                replace_workspace_all, base, body.query, body.replacement, body.matchCase,
-                workspace_file_preview, workspace_file_save, workspace_file_content_bytes,
-            )
+            operation, arguments = replace_workspace_all, (base, body.query, body.replacement, body.matchCase)
+            if "application/x-ndjson" in request.headers.get("accept", ""):
+                return workspace_operation_stream(operation, *arguments)
+            return await asyncio.to_thread(operation, *arguments)
         if not body.files:
             raise HTTPException(400, "请指定要替换的文件。")
-        return await asyncio.to_thread(
-            replace_workspace, base, body.query, body.replacement, body.matchCase,
-            [entry.model_dump() for entry in body.files], workspace_file_preview, workspace_file_save, workspace_file_content_bytes,
-        )
+        arguments = (base, body.query, body.replacement, body.matchCase, [entry.model_dump() for entry in body.files])
+        if "application/x-ndjson" in request.headers.get("accept", ""):
+            return workspace_operation_stream(replace_workspace, *arguments)
+        return await asyncio.to_thread(replace_workspace, *arguments)
 
     @app.post("/api/v1/codex/workspace/download")
     async def prepare_workspace_download(body: WorkspaceFileDownloadRequest) -> dict[str, str]:
@@ -2418,7 +2684,7 @@ def create_app(
 
     @app.get("/api/v1/codex/threads/{thread_id}/viewed-image")
     async def codex_viewed_image(thread_id: str, path: str = "") -> dict[str, str | int]:
-        if is_claude_thread_id(thread_id):
+        if is_local_thread(thread_id):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="找不到 Codex 会话")
         try:
             thread = await app_server.read_thread(thread_id)
@@ -2465,7 +2731,7 @@ def create_app(
     @app.get("/api/v1/codex/threads")
     async def list_threads() -> list[dict[str, Any]]:
         claude_code.schedule_native_refresh()
-        claude_threads = claude_code.list_threads()
+        claude_threads = [*claude_code.list_threads(), *deepseek.list_threads()]
         try:
             threads = await app_server.list_threads()
             workspaces = shared_state.thread_workspaces()
@@ -2483,10 +2749,10 @@ def create_app(
                     if thread_id in workspaces:
                         summary["cwd"] = workspaces[thread_id]
                 result.append(summary)
-            return [*result, *claude_threads]
+            return [thread for thread in [*result, *claude_threads] if not collaboration.store.owner(thread["id"])]
         except CodexRuntimeError as error:
             logger.warning("Could not list Codex threads while returning Claude Code chats: %s", error)
-            return claude_threads
+            return [thread for thread in claude_threads if not collaboration.store.owner(thread["id"])]
 
     @app.get("/api/v1/codex/models")
     async def list_models() -> list[dict[str, Any]]:
@@ -2529,6 +2795,8 @@ def create_app(
     async def create_thread(body: ThreadStartRequest) -> dict[str, Any]:
         async def create() -> dict[str, Any]:
             cwd = workspace_base_for_cwd(app_server.workspace, body.cwd) if body.cwd else None
+            if body.engine == "deepseek-harness":
+                return await deepseek.create_thread(cwd)
             if body.engine == "claude-code":
                 return await claude_code.create_thread(cwd)
             return await app_server.start_thread(
@@ -2557,10 +2825,10 @@ def create_app(
         include_images: bool = True,
         tail_turns: int | None = None,
     ) -> dict[str, Any]:
-        if is_claude_thread_id(thread_id):
+        if is_local_thread(thread_id):
             try:
                 claude_code.schedule_native_refresh()
-                thread = await claude_code.read_thread(thread_id)
+                thread = await local_engine(thread_id).read_thread(thread_id)
                 response = browser_history_sync.response(thread, since)
                 return tail_thread_history(response, tail_turns if since is None else None)
             except ClaudeThreadNotFoundError as error:
@@ -2604,9 +2872,9 @@ def create_app(
     @app.post("/api/v1/codex/threads/{thread_id}/workspace")
     async def bind_thread_workspace(thread_id: str, body: ThreadWorkspaceRequest) -> dict[str, str]:
         cwd = workspace_base_for_cwd(app_server.workspace, body.cwd)
-        if is_claude_thread_id(thread_id):
+        if is_local_thread(thread_id):
             try:
-                result = await claude_code.set_workspace(thread_id, cwd)
+                result = await local_engine(thread_id).set_workspace(thread_id, cwd)
                 shared_state.set_thread_workspace(thread_id, result["cwd"])
                 return result
             except ClaudeCodeError as error:
@@ -2628,9 +2896,9 @@ def create_app(
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="会话名称不能超过 72 个字符。")
         if any(unicodedata.category(character) == "Cc" for character in name):
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="会话名称不能包含控制字符。")
-        if is_claude_thread_id(thread_id):
+        if is_local_thread(thread_id):
             try:
-                return await claude_code.rename_thread(thread_id, name)
+                return await local_engine(thread_id).rename_thread(thread_id, name)
             except ClaudeCodeError as error:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
         try:
@@ -2641,7 +2909,7 @@ def create_app(
 
     @app.post("/api/v1/codex/threads/{thread_id}/settings")
     async def update_thread_settings(thread_id: str, body: ThreadSettingsUpdateRequest) -> dict[str, Any]:
-        if is_claude_thread_id(thread_id):
+        if is_local_thread(thread_id):
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Claude Code 对话使用本机 Claude Code 的权限设置。")
         try:
             return await app_server.update_thread_approval_policy(thread_id, body.approval_policy)
@@ -2662,12 +2930,21 @@ def create_app(
     async def read_queued_messages(thread_id: str) -> dict[str, Any]:
         return {"queue": shared_state.queue(thread_id), "paused": shared_state.is_paused(thread_id)}
 
+    def queue_payload(thread_id: str, body: QueuedMessageRequest) -> dict:
+        payload = body.model_dump(exclude_none=True)
+        if thread_id.startswith('collaboration:'):
+            try:
+                return shared_queue.collaboration_engine.prepare_payload(thread_id, payload)
+            except ValueError as error:
+                raise HTTPException(422, str(error)) from error
+        return payload
+
     @app.post("/api/v1/codex/queue/{thread_id}/submit")
     async def submit_message(thread_id: str, body: QueuedMessageRequest) -> dict[str, Any]:
         if not body.requestText.strip() and not body.images and not body.documents:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="消息不能为空。")
         try:
-            sent = await shared_queue.submit(thread_id, body.model_dump(exclude_none=True))
+            sent = await shared_queue.submit(thread_id, queue_payload(thread_id, body))
         except QueueConflictError as error:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
         return {"sent": sent, "queue": shared_state.queue(thread_id)}
@@ -2677,7 +2954,7 @@ def create_app(
         if not body.requestText.strip() and not body.images and not body.documents:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="排队消息不能为空。")
         try:
-            inserted = shared_state.enqueue(thread_id, body.model_dump(exclude_none=True))
+            inserted = shared_state.enqueue(thread_id, queue_payload(thread_id, body))
         except QueueConflictError as error:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
         if inserted:
@@ -2692,7 +2969,7 @@ def create_app(
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="排队消息不能为空。")
         try:
             async with shared_queue.delivery_lock(thread_id):
-                inserted = shared_state.enqueue_translating(thread_id, body.model_dump(exclude_none=True))
+                inserted = shared_state.enqueue_translating(thread_id, queue_payload(thread_id, body))
         except QueueConflictError as error:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
         if inserted:
@@ -2706,7 +2983,7 @@ def create_app(
         if not body.requestText.strip() and not body.images and not body.documents:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="排队消息不能为空。")
         try:
-            inserted = shared_state.enqueue(thread_id, body.model_dump(exclude_none=True))
+            inserted = shared_state.enqueue(thread_id, queue_payload(thread_id, body))
         except QueueConflictError as error:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
         if inserted:
@@ -2744,7 +3021,7 @@ def create_app(
         if not body.requestText.strip() and not body.images and not body.documents:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="排队消息不能为空。")
         try:
-            shared_state.update(thread_id, body.id, body.model_dump(exclude_none=True))
+            shared_state.update(thread_id, body.id, queue_payload(thread_id, body))
         except QueueConflictError as error:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
         await shared_queue.changed(thread_id)
@@ -2844,11 +3121,20 @@ def create_app(
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(error)) from error
         return {"attachment_id": attachment.attachment_id, "name": attachment.name, "size": attachment.size}
 
+    @app.post("/api/v1/codex/answer-images")
+    async def upload_answer_images(body: AnswerImagesRequest) -> dict[str, Any]:
+        paths = await asyncio.to_thread(
+            save_turn_images, body.images, image_directory,
+            max_storage_bytes=MAX_STORED_IMAGE_BYTES, storage_lock=image_storage_lock,
+        )
+        return {"images": [{"name": image.name, "path": str(path.resolve())}
+                           for image, path in zip(body.images, paths)]}
+
     @app.post("/api/v1/codex/threads/{thread_id}/resume")
     async def resume_thread(thread_id: str, body: ResumeRequest | None = None) -> dict[str, Any]:
-        if is_claude_thread_id(thread_id):
+        if is_local_thread(thread_id):
             try:
-                thread = await claude_code.read_thread(thread_id)
+                thread = await local_engine(thread_id).read_thread(thread_id)
                 if body is not None and not body.include_history:
                     return {key: value for key, value in thread.items() if key != "turns"}
                 return thread
@@ -2892,13 +3178,69 @@ def create_app(
             # must not turn a successful send into a duplicate retry.
             logger.exception("Failed to store translated message metadata")
 
+    # Callers own the delivery lock: HTTP endpoints acquire it below, while
+    # the shared queue already holds it for claim/send/receipt. Calling the
+    # HTTP endpoints from the queue would recursively acquire that same lock.
+    async def deliver_codex_start(thread_id: str, body: TurnRequest) -> dict[str, Any]:
+        image_paths = save_turn_images(
+            body.images, image_directory,
+            max_storage_bytes=MAX_STORED_IMAGE_BYTES,
+            storage_lock=image_storage_lock,
+        )
+        try:
+            turn_prompt = prompt_with_original_pdfs(body.prompt.strip(), body.pdf_attachments, pdf_attachments)
+            cwd = await thread_workspace_for_turn(thread_id)
+            result = await app_server.start_turn(
+                thread_id,
+                turn_prompt,
+                image_paths,
+                body.model.strip() or None if body.model else None,
+                body.effort.strip() or None if body.effort else None,
+                body.approval_policy,
+                cwd,
+            )
+            turn = result.get("turn", {})
+            turn_id = turn.get("id") if isinstance(turn, dict) else None
+            remember_direct_translation(thread_id, body, turn_id)
+            await app_server.notify_turn_delivery(thread_id, body.request_id, turn_id)
+            return {"turn_id": turn_id}
+        except Exception:
+            for path in image_paths:
+                with suppress(FileNotFoundError):
+                    path.unlink()
+            raise
+
+    async def deliver_codex_steer(thread_id: str, body: SteerRequest) -> dict[str, Any]:
+        image_paths = save_turn_images(
+            body.images, image_directory,
+            max_storage_bytes=MAX_STORED_IMAGE_BYTES,
+            storage_lock=image_storage_lock,
+        )
+        try:
+            turn_prompt = prompt_with_original_pdfs(body.prompt.strip(), body.pdf_attachments, pdf_attachments)
+            result = await app_server.steer_turn(thread_id, turn_prompt, image_paths)
+            turn_id = result.get("turnId")
+            if not isinstance(turn_id, str):
+                turn = result.get("turn")
+                turn_id = turn.get("id") if isinstance(turn, dict) and isinstance(turn.get("id"), str) else None
+            remember_direct_translation(thread_id, body, turn_id)
+            await app_server.notify_turn_delivery(thread_id, body.request_id, turn_id)
+            return {"turn_id": turn_id}
+        except Exception:
+            for path in image_paths:
+                with suppress(FileNotFoundError):
+                    path.unlink()
+            raise
+
     async def run_direct_delivery(
         thread_id: str, direct: bool, callback: Callable[[], Awaitable[dict[str, Any]]], *, ensure_idle: bool = False,
     ) -> dict[str, Any]:
-        if not direct:
-            return await callback()
         async with shared_queue.delivery_lock(thread_id):
-            if ensure_idle and await shared_queue._active_turn_id(thread_id):
+            # Idempotent callbacks survive HTTP disconnects. Check again here
+            # in case adoption completed after their requester disappeared.
+            if collaboration.store.owner(thread_id):
+                raise HTTPException(status_code=409, detail="这是协同任务的成员会话，请在协同工作区补充要求或暂停任务。")
+            if direct and ensure_idle and await shared_queue._active_turn_id(thread_id):
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="回复已经开始，请重新发送。")
             return await callback()
 
@@ -2908,13 +3250,13 @@ def create_app(
         if not prompt and not body.images and not body.pdf_attachments:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="请填写消息或附加图片")
 
-        if is_claude_thread_id(thread_id):
+        if is_local_thread(thread_id):
             async def start_claude_turn() -> dict[str, Any]:
                 turn_directory, turn_prompt, image_paths, attachment_paths = prepare_claude_turn_files(
                     prompt, body.images, body.pdf_attachments, pdf_attachments, claude_attachment_root(thread_id),
                 )
                 try:
-                    turn_id = await claude_code.start_turn(
+                    turn_id = await local_engine(thread_id).start_turn(
                         thread_id,
                         turn_prompt,
                         display_prompt=prompt or ("已附加图片" if body.images else "已附加文件"),
@@ -2922,9 +3264,10 @@ def create_app(
                         attachment_paths=attachment_paths,
                         temporary_directory=turn_directory,
                         request_id=body.request_id,
-                        model=body.claude_model,
-                        effort=body.claude_effort,
-                        permission_mode=body.claude_permission_mode,
+                        model=body.model if is_deepseek_thread_id(thread_id) else body.claude_model,
+                        effort=body.effort if is_deepseek_thread_id(thread_id) else body.claude_effort,
+                        **({"deepseek_agent_preset": body.deepseek_agent_preset, "deepseek_permission_mode": body.deepseek_permission_mode or ({"never": "danger-full-access", "untrusted": "full-access-ask"}.get(body.approval_policy, "workspace-write"))} if is_deepseek_thread_id(thread_id) else {}),
+                        permission_mode=("bypassPermissions" if getattr(body, "approval_policy", None) == "never" else "default") if is_deepseek_thread_id(thread_id) else body.claude_permission_mode,
                     )
                 except Exception:
                     if turn_directory is not None:
@@ -2947,33 +3290,7 @@ def create_app(
                 raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(error)) from error
 
         async def start() -> dict[str, Any]:
-            image_paths = save_turn_images(
-                body.images, image_directory,
-                max_storage_bytes=MAX_STORED_IMAGE_BYTES,
-                storage_lock=image_storage_lock,
-            )
-            try:
-                turn_prompt = prompt_with_original_pdfs(prompt, body.pdf_attachments, pdf_attachments)
-                cwd = await thread_workspace_for_turn(thread_id)
-                result = await app_server.start_turn(
-                    thread_id,
-                    turn_prompt,
-                    image_paths,
-                    body.model.strip() or None if body.model else None,
-                    body.effort.strip() or None if body.effort else None,
-                    body.approval_policy,
-                    cwd,
-                )
-                turn = result.get("turn", {})
-                turn_id = turn.get("id") if isinstance(turn, dict) else None
-                remember_direct_translation(thread_id, body, turn_id)
-                await app_server.notify_turn_delivery(thread_id, body.request_id, turn_id)
-                return {"turn_id": turn_id}
-            except Exception:
-                for path in image_paths:
-                    with suppress(FileNotFoundError):
-                        path.unlink()
-                raise
+            return await deliver_codex_start(thread_id, body)
 
         try:
             return await run_idempotent_request(
@@ -3001,7 +3318,7 @@ def create_app(
     @app.post("/api/v1/codex/threads/{thread_id}/continue")
     async def continue_interrupted_turn(thread_id: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
         payload = None
-        if is_claude_thread_id(thread_id):
+        if is_local_thread(thread_id):
             try:
                 payload = QueuedMessageRequest.model_validate(body).model_dump(exclude_none=True)
             except ValidationError as error:
@@ -3031,12 +3348,12 @@ def create_app(
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="请填写消息或附加图片")
 
         async def steer() -> dict[str, Any]:
-            if is_claude_thread_id(thread_id):
+            if is_local_thread(thread_id):
                 turn_directory, turn_prompt, image_paths, attachment_paths = prepare_claude_turn_files(
                     prompt, body.images, body.pdf_attachments, pdf_attachments, claude_attachment_root(thread_id),
                 )
                 try:
-                    turn_id = await claude_code.steer_turn(
+                    turn_id = await local_engine(thread_id).steer_turn(
                         thread_id,
                         turn_prompt,
                         display_prompt=prompt or ("已附加图片" if body.images else "已附加文件"),
@@ -3044,9 +3361,10 @@ def create_app(
                         attachment_paths=attachment_paths,
                         temporary_directory=turn_directory,
                         request_id=body.request_id,
-                        model=body.claude_model,
-                        effort=body.claude_effort,
-                        permission_mode=body.claude_permission_mode,
+                        model=body.model if is_deepseek_thread_id(thread_id) else body.claude_model,
+                        effort=body.effort if is_deepseek_thread_id(thread_id) else body.claude_effort,
+                        **({"deepseek_agent_preset": body.deepseek_agent_preset, "deepseek_permission_mode": body.deepseek_permission_mode or ({"never": "danger-full-access", "untrusted": "full-access-ask"}.get(body.approval_policy, "workspace-write"))} if is_deepseek_thread_id(thread_id) else {}),
+                        permission_mode=("bypassPermissions" if getattr(body, "approval_policy", None) == "never" else "default") if is_deepseek_thread_id(thread_id) else body.claude_permission_mode,
                     )
                     remember_direct_translation(thread_id, body, turn_id)
                     await app_server.notify_turn_delivery(thread_id, body.request_id, turn_id)
@@ -3056,26 +3374,7 @@ def create_app(
                         shutil.rmtree(turn_directory, ignore_errors=True)
                     raise
 
-            image_paths = save_turn_images(
-                body.images, image_directory,
-                max_storage_bytes=MAX_STORED_IMAGE_BYTES,
-                storage_lock=image_storage_lock,
-            )
-            try:
-                turn_prompt = prompt_with_original_pdfs(prompt, body.pdf_attachments, pdf_attachments)
-                result = await app_server.steer_turn(thread_id, turn_prompt, image_paths)
-                turn_id = result.get("turnId")
-                if not isinstance(turn_id, str):
-                    turn = result.get("turn")
-                    turn_id = turn.get("id") if isinstance(turn, dict) and isinstance(turn.get("id"), str) else None
-                remember_direct_translation(thread_id, body, turn_id)
-                await app_server.notify_turn_delivery(thread_id, body.request_id, turn_id)
-                return {"turn_id": turn_id}
-            except Exception:
-                for path in image_paths:
-                    with suppress(FileNotFoundError):
-                        path.unlink()
-                raise
+            return await deliver_codex_steer(thread_id, body)
 
         try:
             return await run_idempotent_request(
@@ -3122,6 +3421,8 @@ def create_app(
         queue = await app_server.subscribe()
         for params in permission_broker.pending_requests():
             queue.put_nowait({"type": "claude/permission/request", "params": params})
+        for params in deepseek.questions.requests():
+            queue.put_nowait({"type": "deepseek/question/request", "params": params})
         send_lock = asyncio.Lock()
         tasks: list[asyncio.Task[None]] = []
 
@@ -3275,13 +3576,15 @@ def create_app(
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return
         except Exception as error:
-            logger.warning("Could not start local terminal: %s", error)
+            logger.exception("Could not start local terminal (%s)", type(error).__name__)
             with suppress(WebSocketDisconnect, RuntimeError):
-                await websocket.send_json({"type": "error", "message": str(error) or "无法启动本机终端。"})
+                await websocket.send_json({"type": "error", "message": str(error) or f"无法启动本机终端（{type(error).__name__}）。"})
                 await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
             return
 
         terminal_sessions.add(terminal_session)
+        if thread_id:
+            terminal_handoff.attach_terminal(thread_id, terminal_session)
         send_lock = asyncio.Lock()
 
         async def send_json(payload: dict[str, Any]) -> None:
@@ -3294,6 +3597,7 @@ def create_app(
                 "cwd": str(cwd),
                 "shell": terminal_session.shell_name,
                 "persistent": terminal_session.persistent,
+                "handoffAvailable": terminal_session.handoff_available,
             })
             while True:
                 output = await terminal_session.read()
@@ -3334,6 +3638,8 @@ def create_app(
             await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         finally:
             # Release the Windows PTY reader before awaiting the output task.
+            if thread_id:
+                terminal_handoff.detach_terminal(thread_id, terminal_session)
             terminal_sessions.discard(terminal_session)
             await terminal_session.close()
             for task in tasks:

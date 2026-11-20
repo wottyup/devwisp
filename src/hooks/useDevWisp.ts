@@ -1,6 +1,13 @@
+import { parseHarnessTelemetry, harnessPhaseLabels } from '../lib/harnessTelemetry'
 import { startTransition, useCallback, useEffect, useMemo, useReducer, useRef, useState, type SetStateAction } from 'react'
 import {
   devwispClient,
+  deepSeekPermissionModes,
+  deepSeekAgentPresets,
+  type DeepSeekAgentPreset,
+  type DeepSeekPermissionMode,
+  type HarnessQuestionRequest,
+  type HarnessQuestionResponse,
   isAmbiguousNetworkFailure,
   messagesFromThread,
   RemoteApiError,
@@ -73,7 +80,7 @@ export type CodexActivityTimelineEntry =
 export interface CodexThreadCompletion {
   threadId: string
   completedAt: number
-  engine: 'codex' | 'claude-code'
+  engine: 'codex' | 'claude-code' | 'deepseek-harness'
 }
 
 export interface SelectThreadOptions {
@@ -102,6 +109,7 @@ export interface QueuedTurnMessage {
   documents?: CodexDocumentAttachment[]
   model?: string
   effort?: string
+  deepseekAgentPreset?: DeepSeekAgentPreset
   claudeModel?: string
   claudeEffort?: string
   translation?: QueuedTranslationConfig
@@ -124,6 +132,7 @@ export type QueuedMessageSendMode = 'start' | 'steer'
 
 interface QueuedTurnPayload extends QueuedTurnMessage {
   requestText: string
+  deepseekPermissionMode?: DeepSeekPermissionMode
   approvalPolicy?: CodexApprovalPolicy
   claudePermissionMode?: ClaudeCodePermissionMode
 }
@@ -142,6 +151,8 @@ interface SendMessageInput {
   documents?: CodexDocumentAttachment[]
   model?: string
   effort?: string
+  deepseekAgentPreset?: DeepSeekAgentPreset
+  deepseekPermissionMode?: DeepSeekPermissionMode
   approvalPolicy?: CodexApprovalPolicy
   claudeModel?: string
   claudeEffort?: string
@@ -244,7 +255,7 @@ interface ActiveThreadSelection {
 }
 
 function engineOfThread(thread: CodexThread): ChatEngine {
-  return thread.engine ?? (thread.id.startsWith('claude:') ? 'claude-code' : 'codex')
+  return thread.engine ?? (thread.id.startsWith('deepseek:') ? 'deepseek-harness' : thread.id.startsWith('claude:') ? 'claude-code' : 'codex')
 }
 
 function updateActiveThreadSelection(current: ActiveThreadSelection, action: SetStateAction<CodexThread | null>): ActiveThreadSelection {
@@ -347,6 +358,7 @@ function readPersistedActiveThreadCache(threadId: string | null): PersistedActiv
           ? { replyDurationMs: message.replyDurationMs }
           : {}),
         ...(typeof message.turnId === 'string' ? { turnId: message.turnId } : {}),
+        ...(parseHarnessTelemetry(message.harness) ? { harness: parseHarnessTelemetry(message.harness) } : {}),
         ...(message.streaming === true ? { streaming: true } : {}),
         ...(typeof message.completedTextLength === 'number' && Number.isFinite(message.completedTextLength)
           ? { completedTextLength: Math.max(0, Math.min(message.text.length, message.completedTextLength)) }
@@ -539,6 +551,8 @@ function queuedPayloadFromInput(input: SendMessageInput): QueuedTurnPayload {
     ...(documents.length > 0 ? { documents } : {}),
     ...(input.model ? { model: input.model } : {}),
     ...(input.effort ? { effort: input.effort } : {}),
+    ...(input.deepseekAgentPreset ? { deepseekAgentPreset: input.deepseekAgentPreset } : {}),
+    ...(input.deepseekPermissionMode ? { deepseekPermissionMode: input.deepseekPermissionMode } : {}),
     ...(input.approvalPolicy ? { approvalPolicy: input.approvalPolicy } : {}),
     ...(input.claudeModel ? { claudeModel: input.claudeModel } : {}),
     ...(input.claudeEffort ? { claudeEffort: input.claudeEffort } : {}),
@@ -654,6 +668,8 @@ function persistedQueuedPayload(value: unknown): QueuedTurnPayload | null {
     ...(documents.length > 0 ? { documents } : {}),
     ...(model ? { model } : {}),
     ...(effort ? { effort } : {}),
+    ...([...deepSeekAgentPresets, 'legacy'].includes(payload.deepseekAgentPreset as DeepSeekAgentPreset) ? { deepseekAgentPreset: payload.deepseekAgentPreset as DeepSeekAgentPreset } : {}),
+    ...(deepSeekPermissionModes.includes(payload.deepseekPermissionMode as DeepSeekPermissionMode) ? { deepseekPermissionMode: payload.deepseekPermissionMode as DeepSeekPermissionMode } : {}),
     ...(approvalPolicy ? { approvalPolicy } : {}),
     ...(claudeModel ? { claudeModel } : {}),
     ...(claudeEffort ? { claudeEffort } : {}),
@@ -851,6 +867,7 @@ function sameMessages(left: CodexMessage[], right: CodexMessage[]) {
       && message.replyStartedAt === candidate.replyStartedAt
       && message.replyDurationMs === candidate.replyDurationMs
       && message.replyError === candidate.replyError
+      && JSON.stringify(message.harness) === JSON.stringify(candidate.harness)
       && Boolean(message.streaming) === Boolean(candidate.streaming)
       && message.completedTextLength === candidate.completedTextLength
       && message.choiceItemId === candidate.choiceItemId
@@ -874,6 +891,8 @@ function sameActiveThread(left: CodexThread | null, right: CodexThread) {
     && left.createdAt === right.createdAt
     && left.status?.type === right.status?.type
     && left.canInterrupt === right.canInterrupt
+    && left.deepseekAgentPreset === right.deepseekAgentPreset
+    && left.deepseekAgentPresetLocked === right.deepseekAgentPresetLocked
 }
 
 function sameActivity(left: CodexActivity | null, right: CodexActivity | null) {
@@ -1225,7 +1244,7 @@ function operationForItem(value: unknown, statusOverride?: CodexOperationStatus)
   const item = value as Record<string, unknown>
   const itemType = typeof item.type === 'string' ? item.type.replace(/[-_]/g, '').toLowerCase() : ''
   const id = typeof item.id === 'string' ? item.id : ''
-  if (!id || itemType === 'reasoning' || itemType === 'agentmessage' || itemType === 'usermessage' || itemType === 'plan') return null
+  if (!id || itemType === 'harnesstelemetry' || itemType === 'reasoning' || itemType === 'agentmessage' || itemType === 'usermessage' || itemType === 'plan') return null
   const status = statusOverride ?? normalizedOperationStatus(item.status)
 
   if (itemType === 'commandexecution') {
@@ -1552,6 +1571,10 @@ export function useDevWisp(token: string, onUnauthorized: () => void, options: U
   const [loadingHistory, setLoadingHistory] = useState(() => initialActiveThreadId !== null)
   const [error, setError] = useState<string | null>(null)
   const [approval, setApproval] = useState<ApprovalRequest | null>(null)
+  const [deepseekQuestions, setDeepseekQuestions] = useState<HarnessQuestionRequest[]>([])
+  const deepseekQuestionRevision = useRef(0)
+  const refreshingDeepseekQuestions = useRef(false)
+  const deepseekQuestion = deepseekQuestions.find((request) => request.threadId === activeThread?.id) ?? null
   const [claudePermissions, setClaudePermissions] = useState<ClaudePermissionRequest[]>([])
   const claudePermissionRevision = useRef(0)
   const refreshingClaudePermissions = useRef(false)
@@ -2956,6 +2979,8 @@ export function useDevWisp(token: string, onUnauthorized: () => void, options: U
       model: payload.model,
       effort: payload.effort,
       approvalPolicy: payload.approvalPolicy,
+      deepseekAgentPreset: payload.deepseekAgentPreset,
+      deepseekPermissionMode: payload.deepseekPermissionMode,
       claudeModel: payload.claudeModel,
       claudeEffort: payload.claudeEffort,
       claudePermissionMode: payload.claudePermissionMode,
@@ -3253,6 +3278,10 @@ export function useDevWisp(token: string, onUnauthorized: () => void, options: U
         images: payload.images,
         documents: payload.documents,
         requestId: payload.id,
+        deepseekAgentPreset: payload.deepseekAgentPreset,
+        deepseekPermissionMode: payload.deepseekPermissionMode,
+        model: payload.model,
+        effort: payload.effort,
       }))
       updateQueuedMessages(threadId, (current) => current.filter((message) => message.id !== payload.id))
       if (activeThreadId.current === threadId) {
@@ -3594,6 +3623,18 @@ export function useDevWisp(token: string, onUnauthorized: () => void, options: U
     }
   }, [isBackground, loadThread, onUnauthorized, persistActiveThread, reconcileQueuedHistory, setQueueRecoveryBarrier, startNextQueuedMessage, token, updateQueuedMessages])
 
+  const refreshDeepseekQuestions = useCallback(async () => {
+    if (refreshingDeepseekQuestions.current || isBackground()) return
+    refreshingDeepseekQuestions.current = true
+    const revision = deepseekQuestionRevision.current
+    try {
+      const response = await devwispClient.deepseekQuestions(token)
+      if (deepseekQuestionRevision.current === revision && Array.isArray(response.requests)) setDeepseekQuestions(response.requests)
+    } catch (reason) {
+      if (reason instanceof RemoteApiError && reason.status === 401) onUnauthorized()
+    } finally { refreshingDeepseekQuestions.current = false }
+  }, [isBackground, onUnauthorized, token])
+
   const refreshClaudePermissions = useCallback(async () => {
     if (refreshingClaudePermissions.current || isBackground()) return
     refreshingClaudePermissions.current = true
@@ -3614,7 +3655,7 @@ export function useDevWisp(token: string, onUnauthorized: () => void, options: U
 
   useEffect(() => {
     if (!enabled) return
-    const refresh = () => { void refreshClaudePermissions() }
+    const refresh = () => { void refreshClaudePermissions(); void refreshDeepseekQuestions() }
     refresh()
     const timer = window.setInterval(refresh, 5_000)
     document.addEventListener('visibilitychange', refresh)
@@ -3626,10 +3667,11 @@ export function useDevWisp(token: string, onUnauthorized: () => void, options: U
       window.removeEventListener('devwisp:resume', refresh)
       window.removeEventListener('online', refresh)
     }
-  }, [enabled, refreshClaudePermissions])
+  }, [enabled, refreshClaudePermissions, refreshDeepseekQuestions])
 
   const handleEvent = useCallback((event: RemoteEvent) => {
     if (handedOffRef.current && event.type !== 'connection'
+      && event.type !== 'deepseek/question/request' && event.type !== 'deepseek/question/resolved'
       && event.type !== 'claude/permission/request' && event.type !== 'claude/permission/resolved') return
     if (event.type === 'remote.queue.changed') {
       if (persistActiveThread) setQueueRevision((revision) => revision + 1)
@@ -3706,6 +3748,18 @@ export function useDevWisp(token: string, onUnauthorized: () => void, options: U
         || requestMethod === 'applyPatchApproval'
       if (supportedApproval && (typeof event.request_id === 'string' || typeof event.request_id === 'number')) {
         setApproval({ requestId: event.request_id, method: requestMethod, params: event.params ?? {}, approvalScope: event.approvalScope })
+      }
+      return
+    }
+    if (event.type === 'deepseek/question/request' || event.type === 'deepseek/question/resolved') {
+      const params = event.params ?? {}
+      if (typeof params.questionId !== 'string') return
+      deepseekQuestionRevision.current += 1
+      if (event.type === 'deepseek/question/resolved') {
+        setDeepseekQuestions((current) => current.filter((item) => item.questionId !== params.questionId))
+      } else if (typeof params.threadId === 'string' && Array.isArray(params.questions)) {
+        const request = params as unknown as HarnessQuestionRequest
+        setDeepseekQuestions((current) => current.some((item) => item.questionId === request.questionId) ? current : [...current, request])
       }
       return
     }
@@ -3975,7 +4029,7 @@ export function useDevWisp(token: string, onUnauthorized: () => void, options: U
       const completedAt = eventTimestamp(turn?.completedAt) ?? Date.now()
       const staleCompletion = params.stale === true
       const completedStatus = normalizedOperationStatus(turn?.status, 'completed')
-      const replyError = turnThreadId?.startsWith('claude:') && completedStatus === 'failed'
+      const replyError = (turnThreadId?.startsWith('claude:') || turnThreadId?.startsWith('deepseek:')) && completedStatus === 'failed'
         && typeof turn?.error === 'string' ? turn.error : null
       if (turnThreadId && completedTurnId) {
         liveTurnHistory.current.finish(turnThreadId, completedTurnId,
@@ -4053,6 +4107,27 @@ export function useDevWisp(token: string, onUnauthorized: () => void, options: U
         })
         scheduleHistoryReconciliation()
       }
+      return
+    }
+    if (event.method === 'deepseek/turn/telemetry') {
+      const turnId = typeof params.turnId === 'string' ? params.turnId : null
+      const harness = parseHarnessTelemetry(params.telemetry)
+      if (!turnId || !harness) return
+      const finished = ['completed', 'failed', 'stopped'].includes(harness.phase)
+      const messageId = streamingAssistantMessageId.current ?? streamingMessageId(turnId)
+      if (!finished) {
+        streamingAssistantMessageId.current = messageId
+        streamingAssistantTurnId.current = turnId
+      }
+      setMessages((current) => {
+        const latestUser = current.reduce((index, message, i) => message.role === 'user' ? i : index, -1)
+        const target = current.slice(latestUser + 1).reverse().find((message) => message.role === 'assistant' && message.turnId === turnId)
+        const index = target ? current.indexOf(target) : -1
+        if (index >= 0) return current.map((message, i) => i === index ? { ...message, harness, ...(!finished ? { id: messageId } : {}) } : message)
+        return [...current, { id: messageId, role: 'assistant', text: '', turnId, harness,
+          createdAt: new Date().toISOString(), streaming: !finished }]
+      })
+      if (!finished) setActivity({ label: harnessPhaseLabels[harness.phase] ?? '正在处理' })
       return
     }
     if (event.method === 'turn/workspaceChanges') {
@@ -4224,6 +4299,7 @@ export function useDevWisp(token: string, onUnauthorized: () => void, options: U
         if (nextState === 'connected') {
           socketRef.current?.subscribeThread(isBackground() ? null : activeThreadId.current)
           void refreshClaudePermissions()
+          void refreshDeepseekQuestions()
           if (wasConnected) return
           stableTimer = window.setTimeout(() => { retryDelay = 500 }, 30_000)
           void restoreActiveThread()
@@ -4388,7 +4464,7 @@ export function useDevWisp(token: string, onUnauthorized: () => void, options: U
       window.removeEventListener('devwisp:resume', handleAppResume)
       window.removeEventListener('devwisp-app-background', handleAppBackground)
     }
-  }, [enabled, isBackground, loadModels, loadThreads, onUnauthorized, refreshActiveThreadIfChanged, refreshClaudePermissions, refreshModels, refreshServerQueue, refreshThreads, restoreActiveThread, setConnectionState, setHandoffState, token])
+  }, [enabled, isBackground, loadModels, loadThreads, onUnauthorized, refreshActiveThreadIfChanged, refreshClaudePermissions, refreshDeepseekQuestions, refreshModels, refreshServerQueue, refreshThreads, restoreActiveThread, setConnectionState, setHandoffState, token])
 
   const selectThread = useCallback(async (thread: CodexThread, options: SelectThreadOptions = {}) => {
     if (handedOffRef.current) return
@@ -4492,7 +4568,7 @@ export function useDevWisp(token: string, onUnauthorized: () => void, options: U
 
     if (loadThreads && (connectionRef.current !== 'connected' || Date.now() - threadListFetchedAtRef.current > threadMetadataFreshnessMs)) {
       const metadataRefresh = refreshThreads()
-      if (engineOfThread(thread) === 'claude-code') {
+      if (engineOfThread(thread) !== 'codex') {
         void metadataRefresh
       } else {
         await metadataRefresh
@@ -4645,7 +4721,7 @@ export function useDevWisp(token: string, onUnauthorized: () => void, options: U
       setError(null)
       try {
         const result = await devwispClient.continuePausedThread(
-          token, threadId, activeEngine === 'claude-code' ? queuedPayloadFromInput(input) : undefined,
+          token, threadId, activeEngine !== 'codex' ? queuedPayloadFromInput(input) : undefined,
         )
         applyServerQueueResponse(threadId, result.queue)
         if (!result.continued) throw new Error('Codex 没有接受续接请求')
@@ -4737,6 +4813,10 @@ export function useDevWisp(token: string, onUnauthorized: () => void, options: U
           claudeModel: payload.claudeModel,
           claudeEffort: payload.claudeEffort,
           claudePermissionMode: payload.claudePermissionMode,
+          deepseekAgentPreset: payload.deepseekAgentPreset,
+          deepseekPermissionMode: payload.deepseekPermissionMode,
+          model: payload.model,
+          effort: payload.effort,
           requestId: payload.id,
         }), previousMessageIds)
         : requestTurnStart(thread.id, payload, previousMessageIds, true)
@@ -5158,6 +5238,21 @@ export function useDevWisp(token: string, onUnauthorized: () => void, options: U
     }
   }, [claudePermissions, token, onUnauthorized])
 
+  const respondToDeepseekQuestion = useCallback(async (questionId: string, response: HarnessQuestionResponse) => {
+    const request = deepseekQuestions.find((item) => item.questionId === questionId)
+    if (!request) return false
+    try {
+      await devwispClient.answerDeepSeekQuestion(token, request.threadId, questionId, response)
+      deepseekQuestionRevision.current += 1
+      setDeepseekQuestions((current) => current.filter((item) => item.questionId !== questionId))
+      return true
+    } catch (reason) {
+      if (reason instanceof RemoteApiError && reason.status === 401) onUnauthorized()
+      if (reason instanceof RemoteApiError && reason.status === 409) void refreshDeepseekQuestions()
+      throw reason
+    }
+  }, [deepseekQuestions, token, onUnauthorized, refreshDeepseekQuestions])
+
   const refreshActiveThread = useCallback(() => {
     if (handedOffRef.current) return
     if (activeThreadId.current) void loadThread(activeThreadId.current)
@@ -5222,6 +5317,9 @@ export function useDevWisp(token: string, onUnauthorized: () => void, options: U
     updatingApprovalPolicy,
     approval,
     claudePermission,
+    deepseekQuestions,
+    deepseekQuestion,
+    respondToDeepseekQuestion,
     completedThreadIds,
     latestThreadCompletion,
     refreshThreads,
@@ -5255,7 +5353,7 @@ export function useDevWisp(token: string, onUnauthorized: () => void, options: U
     queuedMessages, queueRevision, pinRevision, isRunning, runningTurnId,
     isInterrupting, turnStartedAt, activity, fileChangesByTurn, operationsByTurn,
     activityTimelineByTurn, writerConflict, handedOff, handoffInProgress,
-    loadingHistory, error, updatingApprovalPolicy, approval, claudePermission, completedThreadIds,
+    loadingHistory, error, updatingApprovalPolicy, approval, claudePermission, deepseekQuestions, deepseekQuestion, respondToDeepseekQuestion, completedThreadIds,
     latestThreadCompletion, refreshThreads, upsertThread, removeDeletedThread,
     renameThread, bindThreadWorkspace, refreshModels, selectThread, createThread,
     sendMessage, stopInterruptedThread, uploadPdfAttachment,

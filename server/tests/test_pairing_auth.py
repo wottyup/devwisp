@@ -29,6 +29,28 @@ class PairingAuthTests(unittest.TestCase):
                 Path("C:/UserWritable/RemoteData/trusted-devices.json"),
                 PairingAuth._default_state_path(),
             )
+        with (
+            patch("devwisp.app.os.name", "nt"),
+            patch.dict(os.environ, {"CODE_REMOTE_HOME": "C:/LegacyWritable/RemoteData", "DEVWISP_HOME": "", "DEVWISP_AUTH_FILE": ""}, clear=False),
+        ):
+            self.assertEqual(
+                Path("C:/LegacyWritable/RemoteData/trusted-devices.json"),
+                PairingAuth._default_state_path(),
+            )
+
+    def test_windows_default_state_reuses_existing_codex_remote_data_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            local_app_data = Path(directory) / "AppData" / "Local"
+            legacy_home = local_app_data / "CodexRemote"
+            legacy_home.mkdir(parents=True)
+            with (
+                patch("devwisp.app.os.name", "nt"),
+                patch.dict(os.environ, {
+                    "LOCALAPPDATA": str(local_app_data), "DEVWISP_HOME": "",
+                    "CODE_REMOTE_HOME": "", "DEVWISP_AUTH_FILE": "",
+                }, clear=False),
+            ):
+                self.assertEqual(legacy_home / "trusted-devices.json", PairingAuth._default_state_path())
 
     def test_windows_default_state_imports_legacy_tokens_into_writable_v2_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

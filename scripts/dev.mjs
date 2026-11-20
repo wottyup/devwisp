@@ -8,7 +8,10 @@ const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 // next restart on the compact build too; hot reload is explicitly opt-in.
 const production = !process.argv.includes('--development')
 const serverRoot = join(projectRoot, 'server')
-const viteEntrypoint = join(projectRoot, 'node_modules', 'vite', 'bin', 'vite.js')
+const localViteEntrypoint = join(projectRoot, 'node_modules', 'vite', 'bin', 'vite.js')
+const workspaceViteEntrypoint = join(projectRoot, '..', 'node_modules', 'vite', 'bin', 'vite.js')
+const viteEntrypoint = existsSync(localViteEntrypoint) ? localViteEntrypoint : workspaceViteEntrypoint
+const webOrigin = process.env.DEVWISP_WEB_ORIGIN || process.env.CODEX_REMOTE_WEB_ORIGIN || 'http://127.0.0.1:26546'
 const isWindows = process.platform === 'win32'
 const configuredPython = process.env.DEVWISP_PYTHON
 const configuredCodex = process.env.DEVWISP_COMMAND
@@ -62,7 +65,7 @@ function sleep(milliseconds) {
 
 function cleanCodexEnvironment() {
   for (const key of Object.keys(process.env)) {
-    if (key.startsWith('CODEX_') && !['CODEX_HOME', 'DEVWISP_APP_SERVER_HOME', 'DEVWISP_COMMAND', 'DEVWISP_PYTHON', 'DEVWISP_WORKSPACE', 'DEVWISP_AUTH_FILE', 'DEVWISP_STATE_FILE'].includes(key)) {
+    if (key.startsWith('CODEX_') && !['CODEX_HOME', 'DEVWISP_APP_SERVER_HOME', 'DEVWISP_COMMAND', 'DEVWISP_PYTHON', 'DEVWISP_WEB_ORIGIN', 'DEVWISP_WORKSPACE', 'DEVWISP_AUTH_FILE', 'DEVWISP_STATE_FILE'].includes(key)) {
       delete process.env[key]
     }
   }
@@ -72,6 +75,17 @@ async function engineReady() {
   try {
     const response = await fetch('http://127.0.0.1:18766/health')
     return response.ok
+  } catch {
+    return false
+  }
+}
+
+async function webReady() {
+  try {
+    const response = await fetch(webOrigin, { signal: AbortSignal.timeout(1_500) })
+    if (!response.ok) return false
+    const html = await response.text()
+    return ['Dev Wisp', 'DevWisp', 'Code Remote'].some((title) => html.includes(`<title>${title}</title>`))
   } catch {
     return false
   }
@@ -234,11 +248,33 @@ async function main() {
   }
   cleanCodexEnvironment()
 
-  if (await engineReady()) {
+  const existingEngineReady = await engineReady()
+  if (existingEngineReady && await webReady()) {
+    console.log('DevWisp 网页和后端已在运行，跳过重复启动。')
+    return
+  }
+
+  if (existingEngineReady) {
     console.log('复用已运行的本机 Codex 引擎。')
   } else {
+    if (isWindows) {
+      // Optional feature setup cannot stop the main web application starting.
+      // The settings page offers retry/repair if the network is unavailable.
+      await new Promise((resolveSetup) => {
+        const setup = spawn(python, ['-m', 'devwisp.harness_setup'], {
+          cwd: serverRoot, env: process.env, stdio: 'inherit', windowsHide: true,
+        })
+        setup.once('error', resolveSetup)
+        setup.once('exit', resolveSetup)
+      })
+    }
     startEngine()
     await waitForEngine()
+  }
+
+  if (await webReady()) {
+    console.log('DevWisp 网页已在运行，复用现有网页服务。')
+    return
   }
 
   startVite()

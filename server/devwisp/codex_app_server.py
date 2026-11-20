@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .local_usage import LocalUsageStore, track
+
 import asyncio
 import difflib
 import hashlib
@@ -116,8 +118,9 @@ class WorkspaceChangeCapture:
     after: WorkspaceSnapshot | None = None
 
 
-def snapshot_workspace(workspace: Path) -> WorkspaceSnapshot:
+def snapshot_workspace(workspace: Path, *, exclude_paths: tuple[Path, ...] = ()) -> WorkspaceSnapshot:
     root = workspace.expanduser().resolve()
+    excluded = {os.path.normcase(str(path.expanduser().resolve())) for path in exclude_paths}
     paths: set[str] = set()
     text_files: dict[str, bytes] = {}
     metadata: dict[str, tuple[int, int, int]] = {}
@@ -139,7 +142,7 @@ def snapshot_workspace(workspace: Path) -> WorkspaceSnapshot:
                 complete = False
                 break
             try:
-                if entry.name in _IGNORED_WORKSPACE_PARTS:
+                if entry.name in _IGNORED_WORKSPACE_PARTS or os.path.normcase(entry.path) in excluded:
                     continue
                 relative = prefix + entry.name
                 if entry.is_dir(follow_symlinks=False):
@@ -276,6 +279,10 @@ class CodexAppServer:
 
     def __init__(self, command: str, workspace: Path) -> None:
         self.command = command
+        self._usage_store: LocalUsageStore | None = None
+        self._usage_models: dict[str, str | None] = {}
+        self._usage_parents: dict[str, str] = {}
+        self._usage_owners: dict[tuple[str, str], tuple[str, str]] = {}
         self.workspace = workspace.expanduser().resolve()
         self._history_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser().resolve()
         configured_runtime_home = os.environ.get("DEVWISP_APP_SERVER_HOME")
@@ -375,7 +382,7 @@ class CodexAppServer:
                 "args": ["-m", "devwisp.terminal_handoff"],
                 "env": {
                     "PYTHONPATH": python_path,
-                    "DEVWISP_TERMINAL_SOCKET": str(self._terminal_handoff.socket_path),
+                    **self._terminal_handoff.mcp_environment(),
                     "DEVWISP_TERMINAL_CONTEXT": terminal_context,
                 },
             }
@@ -560,6 +567,7 @@ class CodexAppServer:
         include_turns: bool = True,
         tail_turns: int | None = None,
         compact: bool = False,
+        prefer_runtime: bool = False,
     ) -> dict[str, Any]:
         active_before = self._active_turn_ids.get(thread_id)
         history_thread = None
@@ -586,6 +594,7 @@ class CodexAppServer:
                     thread = candidate
             except CodexRuntimeError as error:
                 read_error = error
+                thread = None
         elif (compact or tail_turns is not None or runtime_turn_id is None) and isinstance(history_thread, dict):
             thread = history_thread
         else:
@@ -597,7 +606,18 @@ class CodexAppServer:
             except CodexRuntimeError as error:
                 read_error = error
 
-        if include_turns and isinstance(history_thread, dict):
+        if (prefer_runtime and include_turns and self.connected and isinstance(history_thread, dict)
+                and (compact or tail_turns is not None)):
+            try:
+                result = await self.request("thread/read", {"threadId": thread_id, "includeTurns": include_turns})
+                candidate = result.get("thread")
+                if isinstance(candidate, dict):
+                    thread = candidate
+            except CodexRuntimeError as error:
+                read_error = error
+                thread = None
+
+        if include_turns and isinstance(history_thread, dict) and not prefer_runtime:
             server_turns = thread.get("turns") if thread is not None else None
             history_turns = history_thread.get("turns")
             if thread is None or (
@@ -815,7 +835,7 @@ class CodexAppServer:
             "cwd": str(cwd or self.workspace),
             "serviceName": "devwisp_web",
         }
-        terminal_context = secrets.token_hex(16) if self._terminal_handoff and os.name != "nt" else None
+        terminal_context = secrets.token_hex(16) if self._terminal_handoff else None
         mcp_config = self._thread_mcp_config(terminal_context)
         if mcp_config:
             params["config"] = mcp_config
@@ -828,6 +848,7 @@ class CodexAppServer:
         thread = result.get("thread")
         if not isinstance(thread, dict) or not isinstance(thread.get("id"), str):
             raise CodexRuntimeError("Codex 没有返回新对话编号")
+        self._usage_models[thread['id']] = result.get('model') or thread.get('model') or model
         if terminal_context and self._terminal_handoff:
             self._terminal_handoff.bind_context(terminal_context, thread["id"])
         thread_cwd = thread.get("cwd")
@@ -844,7 +865,7 @@ class CodexAppServer:
         ):
             raise CodexRuntimeError("本机 Codex 历史数据库没有该对话，无法在隔离运行时中恢复。")
         params: dict[str, Any] = {"threadId": thread_id}
-        terminal_context = secrets.token_hex(16) if self._terminal_handoff and os.name != "nt" else None
+        terminal_context = secrets.token_hex(16) if self._terminal_handoff else None
         mcp_config = self._thread_mcp_config(terminal_context)
         if mcp_config:
             params["config"] = mcp_config
@@ -854,6 +875,7 @@ class CodexAppServer:
         thread = result.get("thread")
         if not isinstance(thread, dict):
             raise CodexRuntimeError("Codex 无法恢复该对话")
+        self._usage_models[thread_id] = result.get('model') or thread.get('model')
         if terminal_context and self._terminal_handoff:
             self._terminal_handoff.bind_context(terminal_context, thread_id)
         thread_cwd = thread.get("cwd")
@@ -984,6 +1006,7 @@ class CodexAppServer:
         approval_policy: ApprovalPolicy | None = None,
         cwd: Path | None = None,
         allow_empty: bool = False,
+        sandbox_policy: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         images = image_paths or []
         if not allow_empty and not prompt.strip() and not images:
@@ -1002,8 +1025,11 @@ class CodexAppServer:
             params["sandboxPolicy"] = {
                 "type": "dangerFullAccess" if approval_policy == "never" else "workspaceWrite",
             }
+        if sandbox_policy is not None:
+            params["sandboxPolicy"] = sandbox_policy
         pending_start = asyncio.get_running_loop().create_future()
         self._pending_turn_starts[thread_id] = pending_start
+        self._usage_models[thread_id] = model or self._usage_models.get(thread_id)
         try:
             fresh_cwd = self._fresh_thread_cwds.get(thread_id)
             resolved_cwd = cwd.expanduser().resolve() if cwd is not None else None
@@ -1018,6 +1044,11 @@ class CodexAppServer:
             turn = result.get("turn")
             turn_id = turn.get("id") if isinstance(turn, dict) and isinstance(turn.get("id"), str) else None
             if turn_id:
+                await track(self._usage_store, "begin", "codex", thread_id, turn_id, self._usage_models.get(thread_id))
+                self._usage_owners[(thread_id, turn_id)] = (thread_id, turn_id)
+                if completed_status := (turn.get("status") if isinstance(turn, dict) else None):
+                    if completed_status in {"completed", "interrupted", "failed"}:
+                        await track(self._usage_store, "finish", "codex", thread_id, turn_id, completed_status)
                 fresh_cwd = self._fresh_thread_cwds.pop(thread_id, None)
                 self._loaded_thread_workspaces[thread_id] = (
                     resolved_cwd or (fresh_cwd.expanduser().resolve() if fresh_cwd is not None else self.workspace)
@@ -1409,6 +1440,7 @@ class CodexAppServer:
                 error = CodexRuntimeError("Codex app-server WebSocket 已断开")
                 self._last_error = str(error)
                 self._fail_pending(str(error))
+                await track(self._usage_store, "interrupt", "codex")
                 await self._emit({"type": "connection", **self.status()})
 
     def _app_server_arguments(self, executable: str) -> list[str]:
@@ -1866,6 +1898,7 @@ class CodexAppServer:
                 error = CodexRuntimeError("Codex app-server 已断开")
                 self._last_error = str(error)
                 self._fail_pending(str(error))
+                await track(self._usage_store, "interrupt", "codex")
                 await self._emit({"type": "connection", **self.status()})
 
     async def _read_stderr(self, process: asyncio.subprocess.Process) -> None:
@@ -2000,9 +2033,32 @@ class CodexAppServer:
                 )
             if isinstance(thread_id, str) and params.get("threadId") != thread_id:
                 params = {**params, "threadId": thread_id}
+            if method == "thread/started":
+                native_thread = params.get("thread", {})
+                native_thread = native_thread if isinstance(native_thread, dict) else {}
+                source = native_thread.get("source", {})
+                subagent = source.get("subAgent", {}) if isinstance(source, dict) else {}
+                spawn = subagent.get("thread_spawn", {}) if isinstance(subagent, dict) else {}
+                spawn = spawn if isinstance(spawn, dict) else {}
+                child_id, parent_id = native_thread.get("id"), spawn.get("parent_thread_id")
+                if isinstance(child_id, str) and isinstance(parent_id, str):
+                    self._usage_parents[child_id] = parent_id
+                    self._usage_models[child_id] = native_thread.get("model")
+            if method == "thread/tokenUsage/updated" and isinstance(thread_id, str):
+                usage_turn = turn_id or self._active_turn_ids.get(thread_id)
+                await track(self._usage_store, "codex", thread_id, usage_turn, params.get("tokenUsage"),
+                            owner=self._usage_owners.get((thread_id, usage_turn)), model=self._usage_models.get(thread_id))
             completed_thread_id: str | None = None
             completed_turn_id: str | None = turn_id
             if method == "turn/started" and thread_id and turn_id:
+                if thread_id in self._pending_turn_starts:
+                    await track(self._usage_store, "begin", "codex", thread_id, turn_id, self._usage_models.get(thread_id))
+                    self._usage_owners[(thread_id, turn_id)] = (thread_id, turn_id)
+                elif parent_id := self._usage_parents.get(thread_id):
+                    parent_turn = self._active_turn_ids.get(parent_id)
+                    owner = self._usage_owners.get((parent_id, parent_turn))
+                    if owner:
+                        self._usage_owners[(thread_id, turn_id)] = owner
                 self._active_turn_ids[thread_id] = turn_id
                 pending_start = self._pending_turn_starts.get(thread_id)
                 if pending_start and not pending_start.done():
@@ -2028,6 +2084,9 @@ class CodexAppServer:
                             completed_thread_id = active_thread_id
                             break
             if method == "turn/completed" and completed_thread_id:
+                if completed_turn_id:
+                    await track(self._usage_store, "finish", "codex", completed_thread_id, completed_turn_id,
+                                turn.get("status", "completed") if isinstance(turn, dict) else "completed")
                 watch = self._workspace_change_watches.pop(completed_thread_id, None)
                 if watch is not None:
                     # Never hold the JSON-RPC reader (or queue wake-up) behind

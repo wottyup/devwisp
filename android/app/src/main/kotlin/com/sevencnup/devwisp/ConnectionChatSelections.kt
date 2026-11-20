@@ -23,18 +23,17 @@ internal class ConnectionChatSelections(
         val savedMode = read(scopedKey(connectionId, legacyId, CONNECTION_MODE_KEY))
         val savedThread = read(scopedKey(connectionId, legacyId, CONNECTION_THREAD_KEY))
         val fallback = validMode(fallbackMode) ?: "codex"
-        val alternate = if (fallback == "codex") "claude-code" else "codex"
         fun oldThread(mode: String): String? =
             read(scopedKey(connectionId, legacyId, "$ACTIVE_THREAD_PREFIX$mode"))?.takeIf(String::isNotBlank)
-        val mode = validMode(savedMode) ?: if (savedThread == null && oldThread(fallback) == null && oldThread(alternate) != null) {
-            alternate
+        val mode = validMode(savedMode) ?: if (savedThread == null && oldThread(fallback) == null) {
+            ChatEngines.all.firstOrNull { oldThread(it) != null } ?: fallback
         } else fallback
         val threadId = if (savedThread != null) savedThread.takeIf(String::isNotBlank)
         else oldThread(mode)
         return Selection(mode, threadId, savedThread != null && threadId == null)
     }
 
-    private fun validMode(mode: String?): String? = mode?.takeIf { it == "codex" || it == "claude-code" }
+    private fun validMode(mode: String?): String? = mode?.takeIf { it in ChatEngines.all }
 
     companion object {
         const val GLOBAL_MODE_KEY = "native_engine_mode"

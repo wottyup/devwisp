@@ -1,0 +1,22 @@
+.usage-trend { --trend-line: #9aafff; --trend-grid: rgba(146, 157, 184, .16); --trend-text: #929aaa; --trend-tip-bg: #20242d; --trend-tip-text: #eceef4; position: relative; width: 100%; min-width: 0; }
+.usage-trend__plot { display: block; overflow: hidden; touch-action: pan-y; }
+.usage-trend__axis line { stroke: var(--trend-grid); stroke-dasharray: 3 4; }
+.usage-trend__axis text, .usage-trend__label { fill: var(--trend-text); font-family: inherit; font-size: calc(10px + var(--mobile-font-offset)); }
+.usage-trend__line { stroke: var(--trend-line); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.usage-trend__dot { fill: var(--trend-line); }
+.usage-trend__target { cursor: crosshair; outline: none; }
+.usage-trend__target:focus-visible { stroke: var(--trend-line); stroke-width: 1; stroke-dasharray: 3 3; }
+.usage-trend__active { pointer-events: none; }
+.usage-trend__active line { stroke: var(--trend-line); stroke-width: 1; stroke-dasharray: 4 4; opacity: .6; }
+.usage-trend__active circle { fill: var(--trend-tip-bg); stroke: var(--trend-line); stroke-width: 2; }
+.usage-trend__tooltip { position: absolute; z-index: 2; display: grid; gap: 5px; max-width: calc(100% - 16px); padding: 10px 12px; border: 1px solid var(--trend-grid); border-radius: 8px; background: var(--trend-tip-bg); color: var(--trend-tip-text); box-shadow: 0 4px 16px rgba(0, 0, 0, .15); pointer-events: none; font-size: var(--settings-font-caption, calc(12px + var(--mobile-font-offset))); line-height: 1.4; }
+.usage-trend__tooltip strong { font-size: inherit; font-weight: 600; overflow-wrap: anywhere; }
+.usage-trend__tooltip span { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 12px; }
+.usage-trend__tooltip b { font-weight: 600; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.remote-shell--theme-light .usage-trend { --trend-line: #526db5; --trend-grid: #e0e3e9; --trend-text: #666; --trend-tip-bg: #fff; --trend-tip-text: #202020; }
+.remote-shell--theme-warm .usage-trend { --trend-line: #926c41; --trend-grid: #e2d7c8; --trend-text: #725f4d; --trend-tip-bg: #fffaf3; --trend-tip-text: #46382c; }
+.remote-shell--theme-retro .usage-trend { --trend-line: #477da7; --trend-grid: #b7c4d0; --trend-text: #536474; --trend-tip-bg: #fff; --trend-tip-text: #20252b; }
+.remote-shell--theme-retro .usage-trend__tooltip, .remote-shell--theme-pixel .usage-trend__tooltip { border-radius: 0; box-shadow: none; }
+.remote-shell--theme-pixel .usage-trend { --trend-line: #c8d1ff; --trend-text: var(--pixel-text); --trend-tip-text: var(--pixel-text); }
+.remote-shell--theme-custom .usage-trend { --trend-line: var(--custom-theme-text-color); --trend-text: var(--custom-theme-text-color); --trend-grid: color-mix(in srgb, var(--custom-theme-text-color) 20%, transparent); --trend-tip-text: var(--custom-theme-text-color); --trend-tip-bg: var(--custom-theme-sticky-surface, var(--panel-raised)); }
+.remote-shell--theme-chinese-retro .usage-trend { --trend-line: #315d93; --trend-grid: #d0c7b9; --trend-text: var(--cpa-retro-foreground); --trend-tip-bg: #f4ede2; --trend-tip-text: var(--cpa-retro-foreground); }

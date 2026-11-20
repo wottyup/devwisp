@@ -34,7 +34,9 @@ class SshMcpSettingsStore:
         self._lock = threading.RLock()
 
     def _entrypoint(self) -> Path:
-        return self.project_root / "node_modules" / "ssh-mcp" / "build" / "index.js"
+        project_entrypoint = self.project_root / "node_modules" / "ssh-mcp" / "build" / "index.js"
+        workspace_entrypoint = self.project_root.parent / "node_modules" / "ssh-mcp" / "build" / "index.js"
+        return project_entrypoint if project_entrypoint.is_file() else workspace_entrypoint
 
     @staticmethod
     def _node_command() -> str | None:
@@ -49,6 +51,7 @@ class SshMcpSettingsStore:
             "available": available,
             "configured": bool(profiles),
             "claudeSupported": False,
+            "deepseekSupported": True,
         }
 
     def list_profiles(self) -> list[dict[str, Any]]:

@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 from devwisp.claude_code import ClaudeCodeServer
+from devwisp.local_usage import LocalUsageStore
 
 
 class ControlledOutput:
@@ -32,13 +33,30 @@ class ControlledOutput:
         await asyncio.wait_for(self.waiting.wait(), 1)
 
 
+class FakeInput:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def is_closing(self) -> bool:
+        return self.closed
+
+    def write(self, _data: bytes) -> None:
+        pass
+
+    async def drain(self) -> None:
+        pass
+
+    def close(self) -> None:
+        self.closed = True
+
+    async def wait_closed(self) -> None:
+        pass
+
+
 class FakeProcess:
     def __init__(self) -> None:
         self.stdout = ControlledOutput()
-        self.stdin = Mock()
-        self.stdin.is_closing.return_value = False
-        self.stdin.drain = AsyncMock()
-        self.stdin.wait_closed = AsyncMock()
+        self.stdin = FakeInput()
         self.returncode = None
         self.exited = asyncio.Event()
 
@@ -62,6 +80,9 @@ class ClaudeStreamingTests(unittest.IsolatedAsyncioTestCase):
             self.events.append(event)
 
         self.server = ClaudeCodeServer(sys.executable, workspace, workspace / "claude.sqlite3", emit)
+        self.usage = LocalUsageStore(workspace / 'usage.sqlite3')
+        self.addCleanup(self.usage.close)
+        self.server._usage_store = self.usage
         self.process = FakeProcess()
         self.spawn = patch("devwisp.claude_code.asyncio.create_subprocess_exec", AsyncMock(return_value=self.process))
         self.spawn.start()
@@ -100,6 +121,16 @@ class ClaudeStreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(history["status"]["type"], "active")
         self.assertEqual(history["turns"][-1]["status"], "inProgress")
         self.assertNotIn("completedAt", history["turns"][-1])
+
+    async def test_cli_usage_is_persisted_before_result_without_browser(self) -> None:
+        await self.process.stdout.send({'type': 'assistant', 'message': {
+            'id': 'billable', 'model': 'actual-model', 'content': [{'type': 'text', 'text': 'Answer'}],
+            'usage': {'input_tokens': 8, 'cache_read_input_tokens': 2, 'output_tokens': 5}}})
+        self.assertEqual(self.usage.query()['totals']['totalTokens'], 15)
+        # Result overlaps the assistant message and must not double-count it.
+        await self.process.stdout.send({'type': 'result', 'uuid': 'result', 'modelUsage': {
+            'actual-model': {'inputTokens': 8, 'cacheReadInputTokens': 2, 'outputTokens': 5}}})
+        self.assertEqual(self.usage.query()['totals']['totalTokens'], 15)
 
     async def test_interrupt_finishes_when_cli_stdout_never_closes(self) -> None:
         self.process.pid = 12345

@@ -1,10 +1,13 @@
+import { parseHarnessTelemetry, type HarnessTelemetry } from './harnessTelemetry'
+import { localUsageQuery, publishLocalUsage, refreshLocalUsage, type LocalUsageFilter, type LocalUsageResponse } from './localUsage'
 import { deleteThreadTransportCache, readThreadTransportCache, writeThreadTransportCache, type ThreadTransportSnapshot } from './threadTransportCache'
 import { eventTimestamp } from './turnTiming'
 import { parseStructuredAssistantQuestions, type MessageChoiceGroup } from './messageChoices'
+import { readWorkspaceOperation, type WorkspaceOperationProgress } from './workspaceOperationStream'
 
 export interface CodexThread {
   id: string
-  engine?: 'codex' | 'claude-code'
+  engine?: 'codex' | 'claude-code' | 'deepseek-harness'
   name?: string | null
   preview?: string
   cwd?: string
@@ -13,6 +16,8 @@ export interface CodexThread {
   createdAt?: number | string
   status?: { type?: string }
   canInterrupt?: boolean
+  deepseekAgentPreset?: DeepSeekAgentPreset
+  deepseekAgentPresetLocked?: boolean
 }
 
 export interface MCPApprovalScope {
@@ -52,6 +57,7 @@ export interface SshMcpSettings {
   profiles: SshMcpProfile[]
   available: boolean
   configured: boolean
+  deepseekSupported?: boolean
   claudeSupported: boolean
 }
 
@@ -174,6 +180,79 @@ export interface CodexThreadDetails extends CodexThread {
 
 export type ClaudeCodePermissionMode = 'default' | 'manual' | 'acceptEdits' | 'auto' | 'bypassPermissions' | 'dontAsk' | 'plan'
 
+export type DeepSeekAgentPreset = 'standard' | 'ptc' | 'minimal' | 'cordis' | 'legacy'
+export const deepSeekAgentPresets: DeepSeekAgentPreset[] = ['standard', 'ptc', 'minimal', 'cordis']
+
+export type DeepSeekPermissionMode = 'read-only' | 'workspace-write' | 'full-access-ask' | 'danger-full-access' | 'plan'
+export const deepSeekPermissionModes: DeepSeekPermissionMode[] = ['read-only', 'workspace-write', 'full-access-ask', 'danger-full-access', 'plan']
+export interface HarnessQuestion {
+  id: string
+  question: string
+  header?: string
+  detail?: string
+  options?: { label: string; description?: string }[]
+  multiSelect?: boolean
+  intent?: { kind: string; approve?: string; reject?: string; always?: string }
+}
+export interface HarnessQuestionRequest {
+  threadId: string
+  turnId: string
+  questionId: string
+  questions: HarnessQuestion[]
+}
+export type HarnessQuestionResponse = { cancelled: true } | { answers: { id: string; selected: string[]; custom?: string }[] }
+
+export interface HarnessSetupStatus {
+  installed: boolean
+  sdkVersion: string | null
+  requiredVersion: string
+  python: string
+  executable: string
+  checked: boolean
+  busy: boolean
+  operation: string
+  message: string
+}
+
+export interface DeepSeekStatus {
+  available: boolean
+  error: string | null
+  hasApiKey: boolean
+  model: string
+  baseUrl: string
+  home: string
+  profile: string
+  protocol: NativeEngineProtocol
+  agentPresets?: DeepSeekAgentPreset[]
+  reasoningEffortsByModel?: Record<string, string[]>
+}
+
+export interface DeepSeekProfile {
+  id: string
+  name: string
+  model: string
+  baseUrl: string
+  protocol: NativeEngineProtocol
+  hasKey: boolean
+}
+export interface DeepSeekConfig extends DeepSeekStatus {
+  activeProfileModified: boolean
+  profilesRevision: string
+  activeProfileId: string
+  profiles: DeepSeekProfile[]
+}
+export interface DeepSeekProfileInput {
+  profileId?: string
+  expectedRevision: string
+  name: string
+  model: string
+  baseUrl: string
+  protocol: NativeEngineProtocol
+  apiKey: string
+  clearKey: boolean
+  apply?: boolean
+}
+
 export interface ClaudePermissionRequest {
   threadId: string
   permissionId: string
@@ -210,6 +289,7 @@ export interface CodexMessageDocument extends CodexDocumentAttachment {
 }
 
 export interface CodexMessage {
+  harness?: HarnessTelemetry
   id: string
   sourceItemId?: string
   role: 'user' | 'assistant'
@@ -250,7 +330,10 @@ export interface CodexQueuedMessage {
   createdAt: string
   scheduledAt?: string
   model?: string
+  collaborationSettings?: Partial<Record<CollaborationEngine, CollaborationEngineSettings>>
+  collaborationRecipientIds?: string[]
   effort?: string
+  deepseekAgentPreset?: DeepSeekAgentPreset
   approvalPolicy?: CodexApprovalPolicy
   claudeModel?: string
   claudeEffort?: string
@@ -423,7 +506,7 @@ async function request<T>(
   token: string,
   path: string,
   init?: RequestInit,
-  options: { networkRetries?: number; timeoutMs?: number } = {},
+  options: { networkRetries?: number; timeoutMs?: number; readResponse?: (response: Response, onActivity: () => void) => Promise<T> } = {},
 ): Promise<T> {
   const method = (init?.method ?? 'GET').toUpperCase()
   const networkRetries = options.networkRetries ?? (method === 'GET' ? 3 : 0)
@@ -434,10 +517,15 @@ async function request<T>(
     const abort = () => controller.abort(init?.signal?.reason)
     if (init?.signal?.aborted) abort()
     else init?.signal?.addEventListener('abort', abort, { once: true })
-    const timer = globalThis.setTimeout(() => {
-      timedOut = true
-      controller.abort()
-    }, options.timeoutMs ?? (method === 'GET' ? 30_000 : 120_000))
+    let timer: ReturnType<typeof globalThis.setTimeout> | undefined
+    const onActivity = () => {
+      globalThis.clearTimeout(timer)
+      timer = globalThis.setTimeout(() => {
+        timedOut = true
+        controller.abort()
+      }, options.timeoutMs ?? (method === 'GET' ? 30_000 : 120_000))
+    }
+    onActivity()
     try {
       const response = await fetch(path, {
         ...init,
@@ -450,11 +538,14 @@ async function request<T>(
       })
       if (!response.ok) {
         const body = await response.json().catch(() => null)
+        if (response.status === 404 && path.startsWith('/api/v1/collaboration/') && body?.detail === 'Not Found') {
+          throw new RemoteApiError('后台尚未加载协同功能，请在当前任务结束后重启 Dev Wisp 服务，再点重试。', 404)
+        }
         throw responseApiError(response.status, body, response.headers.get('Retry-After'))
       }
       // Reading the body can fail after fetch has already received headers.
       // Await it here so those failures use the same safe retry path.
-      return await response.json() as T
+      return options.readResponse ? await options.readResponse(response, onActivity) : await response.json() as T
     } catch (reason) {
       if (init?.signal?.aborted) throw reason
       if (timedOut) {
@@ -624,6 +715,7 @@ export function messagesFromThread(thread: CodexThreadDetails): CodexMessage[] {
     const replyDurationMs = turnStartedAt && turnCompletedAt
       ? Math.max(0, Date.parse(turnCompletedAt) - Date.parse(turnStartedAt))
       : undefined
+    const harness = parseHarnessTelemetry([...turn.items].reverse().find((item) => item && typeof item === 'object' && (item as Record<string, unknown>).type === 'harnessTelemetry'))
     let assistantMessage: CodexMessage | null = null
     for (const itemValue of turn.items) {
       if (!itemValue || typeof itemValue !== 'object') continue
@@ -644,7 +736,7 @@ export function messagesFromThread(thread: CodexThreadDetails): CodexMessage[] {
       const text = textDocumentAttachments.text
       const documents = [...originalPdfAttachments.documents, ...textDocumentAttachments.documents]
       const images = itemType === 'usermessage' ? imagesFromContent(item.content) : []
-      if (!text && images.length === 0 && documents.length === 0) continue
+      if (!text && images.length === 0 && documents.length === 0 && !(itemType === 'agentmessage' && harness)) continue
       const itemCreatedAt = parsedTimestampFromFields(
         item,
         'createdAt', 'created_at', 'sentAt', 'sent_at', 'timestamp', 'timestampMs', 'timestamp_ms',
@@ -681,6 +773,7 @@ export function messagesFromThread(thread: CodexThreadDetails): CodexMessage[] {
         id: typeof item.id === 'string' ? item.id : `${String(turn.id ?? 'turn')}-${messages.length}`,
         role: itemType === 'usermessage' ? 'user' : 'assistant',
         text,
+        ...(itemType === 'agentmessage' && harness ? { harness } : {}),
         ...(itemType === 'agentmessage' && itemModel ? { model: itemModel } : {}),
         ...(itemType === 'agentmessage' && itemEffort ? { effort: itemEffort } : {}),
         ...(itemType === 'agentmessage' && typeof item.error === 'string' && item.error ? { replyError: item.error } : {}),
@@ -703,6 +796,10 @@ export function messagesFromThread(thread: CodexThreadDetails): CodexMessage[] {
         } : {}),
       })
       assistantMessage = itemType === 'agentmessage' ? messages.at(-1)! : null
+    }
+    if (harness && !messages.some((message) => message.role === 'assistant' && message.turnId === turnId)) {
+      messages.push({ id: `harness-${turnId}`, role: 'assistant', text: '', turnId, harness,
+        createdAt: turnStartedAt ?? timestamp(turn.startedAt), streaming: turn.status === 'inProgress' })
     }
   }
   return messages
@@ -872,7 +969,69 @@ function shareRequest<T>(requests: Map<string, Promise<T>>, key: string, read: (
   return pending
 }
 
+export type CollaborationEngine = 'codex' | 'claude-code' | 'deepseek-harness'
+export interface CollaborationEngineSettings {
+  model?: string; effort?: string; approvalPolicy?: CodexApprovalPolicy
+  claudePermissionMode?: ClaudeCodePermissionMode
+  deepseekPermissionMode?: DeepSeekPermissionMode; deepseekAgentPreset?: DeepSeekAgentPreset
+}
+export interface CollaborationMember { name?: string; engine: CollaborationEngine; model: string; threadId: string | null; cwd?: string }
+export interface CollaborationEvent { id: number; role: string; text: string; createdAt: string; images?: CodexImageAttachment[]; documents?: CodexDocumentAttachment[] }
+export interface CollaborationTask {
+  id: string; title: string; goal: string; cwd: string; kind?: 'group'
+  status: 'idle' | 'running' | 'waiting' | 'paused' | 'failed' | 'completed'
+  phase: string; round: number; maxRounds: number
+  members: Record<string, CollaborationMember>
+  workerMembers?: Record<string, CollaborationMember>
+  activeMemberThreads?: Record<string, string>
+  workflowPhase?: 'discussion' | 'planning' | 'developing' | 'summarizing' | ''
+  departedMembers?: Record<string, CollaborationMember>
+  reason: string; createdAt: string; updatedAt: string; limitReached?: boolean
+  events?: CollaborationEvent[]
+}
+export interface CollaborationInput {
+  requestId: string; title: string; goal: string; cwd: string; maxRounds: number
+  coder: { engine: CollaborationEngine; model: string; threadId?: string }
+  reviewer: { engine: CollaborationEngine; model: string; threadId?: string }
+}
+
 export const devwispClient = {
+  createCollaborationGroup(token: string, input: { requestId: string; cwd?: string; member?: { engine: CollaborationEngine; model?: string; threadId: string } }) {
+    return request<CollaborationTask>(token, '/api/v1/collaboration/groups', { method: 'POST', body: JSON.stringify(input) })
+  },
+  addCollaborationMember(token: string, id: string, input: { requestId: string; engine: CollaborationEngine; model?: string; threadId?: string }) {
+    return request<CollaborationTask>(token, `/api/v1/collaboration/groups/${encodeURIComponent(id)}/members`, { method: 'POST', body: JSON.stringify(input) })
+  },
+  removeCollaborationMember(token: string, id: string, memberId: string) {
+    return request<CollaborationTask>(token, `/api/v1/collaboration/groups/${encodeURIComponent(id)}/members/${encodeURIComponent(memberId)}`, { method: 'DELETE' })
+  },
+  sendCollaborationMessage(token: string, id: string, input: { requestId: string; text: string }) {
+    return request<CollaborationTask>(token, `/api/v1/collaboration/groups/${encodeURIComponent(id)}/messages`, { method: 'POST', body: JSON.stringify(input) })
+  },
+  collaborationTasks(token: string, signal?: AbortSignal) {
+    return request<{ tasks: CollaborationTask[] }>(token, '/api/v1/collaboration/tasks', { signal })
+  },
+  collaborationTask(token: string, id: string, signal?: AbortSignal) {
+    return request<CollaborationTask>(token, `/api/v1/collaboration/tasks/${encodeURIComponent(id)}`, { signal })
+  },
+  renameCollaboration(token: string, id: string, name: string) {
+    return request<CollaborationTask>(token, `/api/v1/collaboration/tasks/${encodeURIComponent(id)}/name`, { method: 'PUT', body: JSON.stringify({ name }) })
+  },
+  dissolveCollaboration(token: string, id: string) {
+    return request<{ ok: boolean }>(token, `/api/v1/collaboration/tasks/${encodeURIComponent(id)}`, { method: 'DELETE' })
+  },
+  createCollaboration(token: string, input: CollaborationInput) {
+    return request<CollaborationTask>(token, '/api/v1/collaboration/tasks', { method: 'POST', body: JSON.stringify(input) })
+  },
+  controlCollaboration(token: string, id: string, action: 'pause' | 'resume') {
+    return request<CollaborationTask>(token, `/api/v1/collaboration/tasks/${encodeURIComponent(id)}/control/${action}`, { method: 'POST' })
+  },
+  noteCollaboration(token: string, id: string, text: string) {
+    return request<CollaborationTask>(token, `/api/v1/collaboration/tasks/${encodeURIComponent(id)}/notes`, { method: 'POST', body: JSON.stringify({ text }) })
+  },
+  localUsage(token: string, filter: LocalUsageFilter, signal?: AbortSignal) {
+    return request<LocalUsageResponse>(token, `/api/v1/codex/usage/local?${localUsageQuery(filter)}`, { signal })
+  },
   pauseHistorySync(token: string) {
     syncSignal(token)
     syncControllers.get(token)?.abort()
@@ -903,6 +1062,47 @@ export const devwispClient = {
   },
   status(token: string) {
     return request<CodexRuntime>(token, '/api/v1/codex/status', undefined, { timeoutMs: 10_000, networkRetries: 0 })
+  },
+  deepseekStatus(token: string) {
+    return request<DeepSeekStatus>(token, '/api/v1/deepseek/status', undefined, { timeoutMs: 10_000, networkRetries: 0 })
+  },
+  deepseekRuntime(token: string) {
+    return request<HarnessSetupStatus>(token, '/api/v1/deepseek/runtime', { cache: 'no-store' }, { networkRetries: 0 })
+  },
+  manageDeepseekRuntime(token: string, operation: 'install' | 'check') {
+    return request<HarnessSetupStatus>(token, '/api/v1/deepseek/runtime/' + operation, { method: 'POST' }, { networkRetries: 0 })
+  },
+  saveDeepseekRuntime(token: string, executable: string) {
+    return request<HarnessSetupStatus>(token, '/api/v1/deepseek/runtime', { method: 'PUT', body: JSON.stringify({ executable }) }, { timeoutMs: 35_000, networkRetries: 0 })
+  },
+  deepseekQuestions(token: string) {
+    return request<{ requests: HarnessQuestionRequest[] }>(token, '/api/v1/deepseek/questions', { cache: 'no-store' }, { networkRetries: 0 })
+  },
+  answerDeepSeekQuestion(token: string, threadId: string, questionId: string, response: HarnessQuestionResponse) {
+    return request<{ answered: boolean }>(token, `/api/v1/deepseek/threads/${encodeURIComponent(threadId)}/questions/${encodeURIComponent(questionId)}`, {
+      method: 'POST', body: JSON.stringify(response),
+    }, { networkRetries: 0 })
+  },
+  saveDeepSeekSettings(token: string, input: { model: string; base_url: string; api_key?: string; clear_key?: boolean; protocol: NativeEngineProtocol }) {
+    return request<DeepSeekStatus>(token, '/api/v1/deepseek/settings', { method: 'PUT', body: JSON.stringify(input) })
+  },
+  deepseekProfiles(token: string, signal?: AbortSignal) {
+    return request<DeepSeekConfig>(token, '/api/v1/deepseek/profiles', { cache: 'no-store', signal }, { networkRetries: 0 })
+  },
+  saveDeepSeekProfile(token: string, input: DeepSeekProfileInput) {
+    return request<{ profileId: string; applied: boolean; config: DeepSeekConfig }>(token, '/api/v1/deepseek/profiles', {
+      method: 'POST', cache: 'no-store', body: JSON.stringify(input),
+    }, { networkRetries: 0 })
+  },
+  deleteDeepSeekProfile(token: string, profileId: string, expectedRevision: string) {
+    return request<DeepSeekConfig>(token, `/api/v1/deepseek/profiles/${encodeURIComponent(profileId)}`, {
+      method: 'DELETE', cache: 'no-store', body: JSON.stringify({ expectedRevision }),
+    }, { networkRetries: 0 })
+  },
+  testDeepSeekProfile(token: string, input: DeepSeekProfileInput, signal?: AbortSignal) {
+    return request<NativeEngineConnectionResult>(token, '/api/v1/deepseek/test', {
+      method: 'POST', cache: 'no-store', body: JSON.stringify(input), signal,
+    }, { networkRetries: 0, timeoutMs: 80_000 })
   },
   claudeStatus(token: string) {
     return request<{ available: boolean; error: string | null }>(token, '/api/v1/claude/status', undefined, { timeoutMs: 10_000, networkRetries: 0 })
@@ -1033,18 +1233,18 @@ export const devwispClient = {
     if (cwd) query.set('cwd', cwd)
     return request<CodexWorkspaceFile>(token, `/api/v1/codex/workspace/file?${query.toString()}`)
   },
-  searchWorkspace(token: string, cwd: string, query: string, matchCase: boolean, signal?: AbortSignal) {
+  searchWorkspace(token: string, cwd: string, query: string, matchCase: boolean, signal?: AbortSignal, onProgress?: (progress: WorkspaceOperationProgress) => void) {
     return request<WorkspaceSearchResult>(token, '/api/v1/codex/workspace/search', {
-      method: 'POST', body: JSON.stringify({ cwd, query, matchCase }), signal,
-    }, { timeoutMs: 30_000, networkRetries: 0 })
+      method: 'POST', body: JSON.stringify({ cwd, query, matchCase }), signal, headers: { Accept: 'application/x-ndjson' },
+    }, { timeoutMs: 30_000, networkRetries: 0, readResponse: (response, activity) => readWorkspaceOperation<WorkspaceSearchResult>(response, activity, onProgress, (status, detail) => responseApiError(status, { detail }, null)) })
   },
-  replaceWorkspace(token: string, cwd: string, query: string, replacement: string, matchCase: boolean, files?: WorkspaceSearchFile[]) {
+  replaceWorkspace(token: string, cwd: string, query: string, replacement: string, matchCase: boolean, files?: WorkspaceSearchFile[], onProgress?: (progress: WorkspaceOperationProgress) => void) {
     return request<WorkspaceReplaceResult>(token, '/api/v1/codex/workspace/replace', {
-      method: 'POST', body: JSON.stringify({
+      method: 'POST', headers: { Accept: 'application/x-ndjson' }, body: JSON.stringify({
         cwd, query, replacement, matchCase, allMatches: files === undefined,
         files: files?.map(({ path, revision, matchCount }) => ({ path, revision, matchCount })) ?? [],
       }),
-    }, { timeoutMs: 60_000, networkRetries: 0 })
+    }, { timeoutMs: 60_000, networkRetries: 0, readResponse: (response, activity) => readWorkspaceOperation<WorkspaceReplaceResult>(response, activity, onProgress, (status, detail) => responseApiError(status, { detail }, null)) })
   },
   prepareWorkspaceDownload(token: string, cwd: string | undefined, path: string) {
     return request<{ url: string }>(token, '/api/v1/codex/workspace/download', {
@@ -1291,7 +1491,7 @@ export const devwispClient = {
   reclaimForRemote(token: string) {
     return request<CodexRuntime>(token, '/api/v1/codex/reclaim', { method: 'POST' })
   },
-  createThread(token: string, model: string | undefined, approvalPolicy: CodexApprovalPolicy | undefined, requestId: string, cwd?: string, engine: 'codex' | 'claude-code' = 'codex') {
+  createThread(token: string, model: string | undefined, approvalPolicy: CodexApprovalPolicy | undefined, requestId: string, cwd?: string, engine: 'codex' | 'claude-code' | 'deepseek-harness' = 'codex') {
     return request<CodexThread>(token, '/api/v1/codex/threads', {
       method: 'POST',
       body: JSON.stringify({ engine, model, approval_policy: approvalPolicy, request_id: requestId, cwd }),
@@ -1303,6 +1503,12 @@ export const devwispClient = {
       method: 'POST',
       headers: { 'Content-Type': file.type || 'application/octet-stream' },
       body: file,
+    })
+  },
+  uploadAnswerImages(token: string, images: CodexImageAttachment[]) {
+    return request<{ images: { name: string; path: string }[] }>(token, '/api/v1/codex/answer-images', {
+      method: 'POST',
+      body: JSON.stringify({ images: images.map((image) => ({ name: image.name, media_type: image.mediaType, data: image.data })) }),
     })
   },
   startTurn(token: string, threadId: string, input: {
@@ -1317,6 +1523,8 @@ export const devwispClient = {
     approvalPolicy?: CodexApprovalPolicy
     claudeModel?: string
     claudeEffort?: string
+    deepseekAgentPreset?: DeepSeekAgentPreset
+    deepseekPermissionMode?: DeepSeekPermissionMode
     claudePermissionMode?: ClaudeCodePermissionMode
     requestId: string
   }) {
@@ -1333,6 +1541,8 @@ export const devwispClient = {
         claude_model: input.claudeModel,
         claude_effort: input.claudeEffort,
         claude_permission_mode: input.claudePermissionMode,
+        deepseek_agent_preset: input.deepseekAgentPreset,
+        deepseek_permission_mode: input.deepseekPermissionMode,
         request_id: input.requestId,
         images: input.images.map((image) => ({
           name: image.name,
@@ -1352,6 +1562,10 @@ export const devwispClient = {
     documents?: CodexDocumentAttachment[]
     claudeModel?: string
     claudeEffort?: string
+    deepseekAgentPreset?: DeepSeekAgentPreset
+    deepseekPermissionMode?: DeepSeekPermissionMode
+    model?: string
+    effort?: string
     claudePermissionMode?: string
     requestId: string
   }) {
@@ -1363,9 +1577,13 @@ export const devwispClient = {
         translated_text: input.translatedText,
         direct: input.direct,
         request_id: input.requestId,
+        model: input.model,
+        effort: input.effort,
         claude_model: input.claudeModel,
         claude_effort: input.claudeEffort,
         claude_permission_mode: input.claudePermissionMode,
+        deepseek_agent_preset: input.deepseekAgentPreset,
+        deepseek_permission_mode: input.deepseekPermissionMode,
         images: input.images.map((image) => ({
           name: image.name,
           media_type: image.mediaType,
@@ -1518,6 +1736,7 @@ export const devwispClient = {
           return
         }
         if (event.type === 'connection') {
+          refreshLocalUsage(token)
           if (event.threadSubscriptions && !supportsSubscriptions) {
             supportsSubscriptions = true
             subscribeThread(subscribedThreadId)
@@ -1528,6 +1747,10 @@ export const devwispClient = {
           connectionTimeout = undefined
           scheduleHeartbeat()
           onState(event.connected ? 'connected' : event.available ? 'disconnected' : 'unavailable')
+        }
+        if (event.type === 'notification' && event.method === 'usage/local/updated') {
+          if (event.params) publishLocalUsage(token, event.params)
+          return
         }
         onEvent(event)
       } catch {

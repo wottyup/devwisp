@@ -2,7 +2,7 @@
 setlocal
 
 cd /d "%~dp0"
-title DevWisp - 4173
+title DevWisp - 26546
 
 set "PNPM_CMD="
 for /f "delims=" %%P in ('where pnpm.cmd 2^>nul') do if not defined PNPM_CMD set "PNPM_CMD=%%P"
@@ -23,7 +23,7 @@ if not exist "package.json" (
 )
 
 echo Starting DevWisp...
-echo Web: http://localhost:4173
+echo Web: http://localhost:26546
 echo Close this window to stop the service.
 echo.
 
